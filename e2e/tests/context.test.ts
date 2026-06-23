@@ -1,7 +1,7 @@
 // What the model is given from Slack. slackbotv2 brings a thread's earlier
-// messages into the first turn it is mentioned in, carries replies it was not
-// mentioned in into its next turn, leaves the rest of the channel out, and runs
-// a DM as one conversation whose session acts for the DM's user.
+// messages into the first turn it is mentioned in, runs a reply in a thread it
+// is subscribed to as a turn without a mention, leaves the rest of the channel
+// out, and runs a DM as one conversation whose session acts for the DM's user.
 import { expect, test } from 'bun:test'
 import {
   EXTERNAL_TEAM,
@@ -28,11 +28,10 @@ test.concurrent('a first mention mid-thread brings the thread so far', async () 
   }
 }, 2 * turnTimeoutMs)
 
-test.concurrent('replies the bot was not mentioned in reach its next turn', async () => {
+test.concurrent('a reply without a mention in a subscribed thread starts its own turn', async () => {
   const thread = await slack.mention('--codex Start here.', model.says('Started.'))
   await thread.nextTurn()
-  await thread.post('A detail added without a mention.', { as: USER_B })
-  await thread.mention('Now use it.', model.says('Used.'))
+  await thread.reply('A detail added without a mention.', model.says('Used.'), { as: USER_B })
   const second = await thread.nextTurn()
 
   expect(second.reply).toBe('Used.')
