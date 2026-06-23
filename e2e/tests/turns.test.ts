@@ -3,9 +3,9 @@
 // with no text. A mention during a turn steers it on every harness, carrying
 // its sender's identity, with a reaction on each follow-up until the turn
 // answers it within the same reply, and the
-// turn shows its status again after Slack hides it for the follow-up; replies
-// without a mention neither steer nor stop it. A mentioned stop ends the turn
-// silently: it posts no reply, not even an interruption notice.
+// turn shows its status again after Slack hides it for the follow-up; a reply
+// without a mention steers it too. A stop ends the turn silently: it posts no
+// reply, not even an interruption notice.
 import { expect, test } from 'bun:test'
 import { USER_B, eventually, model, releaseSandboxesAfterAll, slack, turnTimeoutMs, type Channel } from '../lib'
 
@@ -29,19 +29,16 @@ test.concurrent('a provider failure shows in the reply', async () => {
   expect(turn.reply).toContain('e2e scripted provider failure')
 }, 2 * turnTimeoutMs)
 
-test.concurrent('replies without a mention neither steer nor stop a running turn', async () => {
-  const answer = model.says('Done anyway.', { delayMs: 5_000 })
-  const thread = await slack.mention('--codex Work on this.', answer)
+test.concurrent('a reply without a mention steers a running turn', async () => {
+  const thread = await slack.mention('--codex Work on this.', model.says('First part.', { delayMs: 5_000 }))
   await thread.inFlight()
-  await thread.post('One more constraint, no mention.')
-  await thread.post('stop')
+  const steer = model.says('Steered answer.')
+  await thread.interject('One more constraint, no mention.', steer, { mention: false })
   const turn = await thread.nextTurn()
 
-  expect(turn.execution.status).toBe('completed')
-  expect(turn.reply).toBe('Done anyway.')
-  for (const request of await model.requests(answer)) {
-    expect(request.prompt).not.toContain('One more constraint, no mention.')
-  }
+  expect(turn.reply).toContain('Steered answer.')
+  const [steered] = await model.requests(steer)
+  expect(steered?.userMessage).toContain('One more constraint, no mention.')
 }, 2 * turnTimeoutMs)
 
 test.concurrent('a mentioned stop ends the turn without posting a reply', async () => {

@@ -30,15 +30,17 @@ lifecycle, harness formatting, and durable execution state belong in `api-rs`.
   message, block, attachment, and rate limits, including fallback text.
 - Avoid serializing raw webhook bodies on the hot path or in normal logs. Never
   log bot tokens, signing secrets, private file URLs, or user file contents.
-- Preserve mentioned stop commands, harness/model overrides, late-file repair,
-  initial thread context, and mention-gated subscribed-message semantics when
-  refactoring the main callback flow. Unmentioned replies must not be appended
-  to or interrupt an active execution; collect them when the next mention
-  refreshes the Slack thread context. The only exception is proactivity: an
-  unmentioned message the classifier accepts, in a thread a mention or
-  proactive reply made eligible or anywhere in a channel with proactivity
-  rules, is handled like a mentioned follow-up: it starts an execution or
-  steers the active one, but never stops it; only a mention can. Only one proactive handoff per thread may start an
+- Preserve stop commands, harness/model overrides, late-file repair, initial
+  thread context, and ambient subscribed-message semantics when refactoring the
+  main callback flow. Without proactivity rules, every allowed reply in a
+  subscribed thread executes (or durably appends while an execution is active)
+  without requiring a mention; new top-level messages still require one.
+  Bot-authored messages must stay excluded outside the trigger-bot allowlist so
+  bots cannot loop. With proactivity configured, an unmentioned message the
+  classifier accepts, in a thread a mention or proactive reply made eligible or
+  anywhere in a channel with proactivity rules, is handled like a mentioned
+  follow-up: it starts an execution or steers the active one, but never stops
+  it; only a mention can. Only one proactive handoff per thread may start an
   execution at a time. A failed or timed-out classifier decision means no
   reply. With a debounce, an idle thread classifies only the last message
   of a burst, judging the burst together; an active turn is never debounced. A matched rule's context rides only on the first execution it starts
