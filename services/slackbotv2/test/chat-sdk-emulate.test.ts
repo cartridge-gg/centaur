@@ -436,7 +436,7 @@ describe('slackbotv2', () => {
     expect(codexApi.workflowEvents).toHaveLength(1)
   })
 
-  it('collects ignored subscribed messages when the bot is next mentioned', async () => {
+  it('executes unmentioned subscribed messages as ambient thread replies', async () => {
     const parent = await postUserMessage('The deploy context is above.')
     const firstMention = await postUserMessage(
       `<@${BOT_USER_ID}> run with this screenshot`,
@@ -498,8 +498,8 @@ describe('slackbotv2', () => {
 
     expect(followUpResponse.status).toBe(200)
     await Promise.all(followUpWaits)
-    expect(codexApi.appends).toHaveLength(1)
-    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.appends).toHaveLength(2)
+    expect(codexApi.executes).toHaveLength(2)
 
     const secondMention = await postUserMessage(`<@${BOT_USER_ID}> now execute with the latest`, parent.ts)
     const secondMentionWaits: Promise<unknown>[] = []
@@ -524,12 +524,13 @@ describe('slackbotv2', () => {
     expect(secondMentionResponse.status).toBe(200)
     await Promise.all(secondMentionWaits)
 
-    expect(codexApi.appends).toHaveLength(2)
+    expect(codexApi.appends).toHaveLength(3)
     expect(codexApi.creates.map(create => create.threadKey)).toEqual([
+      threadKey(parent.ts),
       threadKey(parent.ts),
       threadKey(parent.ts)
     ])
-    expect(codexApi.executes).toHaveLength(2)
+    expect(codexApi.executes).toHaveLength(3)
 
     const firstAppend = codexApi.appends[0]!
     expect(firstAppend.threadKey).toBe(threadKey(parent.ts))
@@ -582,26 +583,36 @@ describe('slackbotv2', () => {
     )
     expect(JSON.stringify(firstInputLine)).not.toContain('data:image/png;base64')
 
-    const secondMentionAppend = codexApi.appends[1]!
-    expect(secondMentionAppend.threadKey).toBe(threadKey(parent.ts))
-    expect(secondMentionAppend.body.messages.map(message => message.client_message_id)).toEqual([
-      followUp.ts,
-      secondMention.ts
+    const followUpAppend = codexApi.appends[1]!
+    expect(followUpAppend.threadKey).toBe(threadKey(parent.ts))
+    expect(followUpAppend.body.messages.map(message => message.client_message_id)).toEqual([
+      followUp.ts
     ])
-    expect(sessionMessageTexts(secondMentionAppend.body.messages)[0]).toBe(
+    expect(sessionMessageTexts(followUpAppend.body.messages)).toEqual([
+      'Additional detail for the subscribed thread.'
+    ])
+    const followUpExecute = codexApi.executes[1]!
+    expect(followUpExecute.body.idempotency_key).toBe(followUp.ts)
+    expect(JSON.stringify(JSON.parse(followUpExecute.body.input_lines[0]!))).toContain(
       'Additional detail for the subscribed thread.'
     )
-    expect(sessionMessageTexts(secondMentionAppend.body.messages)[1]).toContain(
+
+    const secondMentionAppend = codexApi.appends[2]!
+    expect(secondMentionAppend.threadKey).toBe(threadKey(parent.ts))
+    expect(secondMentionAppend.body.messages.map(message => message.client_message_id)).toEqual([
+      secondMention.ts
+    ])
+    expect(sessionMessageTexts(secondMentionAppend.body.messages)[0]).toContain(
       'now execute with the latest'
     )
-    const secondExecute = codexApi.executes[1]!
+    const secondExecute = codexApi.executes[2]!
     expect(secondExecute.body.idempotency_key).toBe(secondMention.ts)
     expect(JSON.stringify(JSON.parse(secondExecute.body.input_lines[0]!))).toContain(
       'now execute with the latest'
     )
 
     expectSlackPlanStreamShape(slackApi.calls, {
-      answers: ['Executed request 1.', 'Executed request 2.'],
+      answers: ['Executed request 1.', 'Executed request 2.', 'Executed request 3.'],
       parentTs: parent.ts
     })
     const assistantStatuses = slackApi.calls
@@ -609,8 +620,8 @@ describe('slackbotv2', () => {
       .map(call => stringField(call.body.status))
     expect(assistantStatuses[0]).toBe('Thinking...')
     expect(assistantStatuses.at(-1)).toBe('')
-    expect(assistantStatuses.filter(status => status === 'Thinking...').length).toBeGreaterThanOrEqual(2)
-    expect(assistantStatuses.filter(status => status === '').length).toBeGreaterThanOrEqual(2)
+    expect(assistantStatuses.filter(status => status === 'Thinking...').length).toBeGreaterThanOrEqual(3)
+    expect(assistantStatuses.filter(status => status === '').length).toBeGreaterThanOrEqual(3)
     expect(
       slackApi.calls
         .filter(call => call.method === 'assistant.threads.setTitle')
@@ -618,8 +629,10 @@ describe('slackbotv2', () => {
     ).toEqual([
       'run with this screenshot',
       'Codex request 1',
+      'Additional detail for the subscribed thread.',
+      'Codex request 2',
       'now execute with the latest',
-      'Codex request 2'
+      'Codex request 3'
     ])
 
     const text = await threadText(parent.ts)
@@ -633,13 +646,15 @@ describe('slackbotv2', () => {
     expect(text).not.toContain('tests passed')
     expect(text).toContain('Executed request 1.')
     expect(text).toContain('Executed request 2.')
+    expect(text).toContain('Executed request 3.')
 
     const renderedReplies = (await threadTexts(parent.ts)).filter(reply =>
       reply.includes('Executed request')
     )
-    expect(renderedReplies).toHaveLength(2)
+    expect(renderedReplies).toHaveLength(3)
     expectSlackRenderedReply(renderedReplies[0]!, 'Executed request 1.')
     expectSlackRenderedReply(renderedReplies[1]!, 'Executed request 2.')
+    expectSlackRenderedReply(renderedReplies[2]!, 'Executed request 3.')
   })
 
   // The paragraph break (`\n\n`) after the model value is deliberate: the
@@ -2331,7 +2346,7 @@ describe('slackbotv2', () => {
     )
   })
 
-  it('ignores unmentioned subscribed messages during a stream, including stop', async () => {
+  it('appends unmentioned subscribed messages during a stream and honors an unmentioned stop', async () => {
     codexApi.autoRespond = false
 
     const parent = await postUserMessage('Context before the long run.')
@@ -2381,6 +2396,10 @@ describe('slackbotv2', () => {
 
     expect(followUpResponse.status).toBe(200)
     await Promise.all(followUpWaits)
+    // The unmentioned reply is durably appended while the stream is active, but
+    // does not start a second execution.
+    await waitFor(() => codexApi.appends.length === 2)
+    expect(codexApi.executes).toHaveLength(1)
 
     const stop = await postUserMessage('stop', parent.ts)
     const stopWaits: Promise<unknown>[] = []
@@ -2404,8 +2423,12 @@ describe('slackbotv2', () => {
 
     expect(stopResponse.status).toBe(200)
     await Promise.all(stopWaits)
-    expect(codexApi.creates).toHaveLength(1)
-    expect(codexApi.appends).toHaveLength(1)
+    // The unmentioned stop interrupts the active execution instead of being
+    // appended or executed.
+    expect(codexApi.interrupts).toHaveLength(1)
+    expect(codexApi.interrupts[0]!.threadKey).toBe(threadKey(parent.ts))
+    expect(codexApi.interrupts[0]!.body.reason).toContain(USER_ID)
+    expect(codexApi.appends).toHaveLength(2)
     expect(codexApi.executes).toHaveLength(1)
 
     codexApi.closeStreams()
@@ -5899,6 +5922,7 @@ type MockSessionApi = {
   close(): Promise<void>
   closeStreams(): void
   creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[]
+  interrupts: MockSessionRequest<{ reason: string }>[]
   emitOutputLine(threadKey: string, line: string, executionId?: string): void
   emitOutputLines(threadKey: string, lines: string[], executionId?: string): void
   emitSessionEvent(threadKey: string, event: string, data: unknown, executionId?: string): void
@@ -5920,6 +5944,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   const eventRequests: MockSessionEventRequest[] = []
   const events: MockSessionEvent[] = []
   const executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[] = []
+  const interrupts: MockSessionRequest<{ reason: string }>[] = []
   const idempotentExecutions = new Map<string, string>()
   const streams = new Set<ServerResponse>()
   const workflowEvents: MockWorkflowEventRequest[] = []
@@ -5942,6 +5967,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       events,
       eventRequests,
       executes,
+      interrupts,
       get autoRespond() {
         return autoRespond
       },
@@ -5986,12 +6012,14 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     creates,
     eventRequests,
     executes,
+    interrupts,
     reset() {
       appends.length = 0
       creates.length = 0
       eventRequests.length = 0
       events.length = 0
       executes.length = 0
+      interrupts.length = 0
       idempotentExecutions.clear()
       executeHoldRelease?.()
       executeHold = null
@@ -6090,6 +6118,7 @@ async function handleMockCodexRequest(
     eventRequests: MockSessionEventRequest[]
     executeHold: Promise<void> | null
     executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[]
+    interrupts: MockSessionRequest<{ reason: string }>[]
     failNextExecuteAfterAccept: boolean
     failNextEvents: boolean
     failNextExecute: boolean
@@ -6110,7 +6139,7 @@ async function handleMockCodexRequest(
     await sendWebResponse(res, Response.json({ ok: true }))
     return
   }
-  const match = /^\/api\/session\/([^/]+)(?:\/(messages|execute|events))?$/.exec(url.pathname)
+  const match = /^\/api\/session\/([^/]+)(?:\/(messages|execute|events|interrupt))?$/.exec(url.pathname)
   if (!match?.[1]) {
     await sendWebResponse(res, new Response('not found', { status: 404 }))
     return
@@ -6169,6 +6198,12 @@ async function handleMockCodexRequest(
   }
 
   const request = await nodeRequestToWebRequest(req, url)
+  if (endpoint === 'interrupt') {
+    const body = (await request.json()) as { reason: string }
+    input.interrupts.push({ threadKey, body })
+    await sendWebResponse(res, Response.json({ execution_id: 'exe-interrupted', interrupted: true }))
+    return
+  }
   if (endpoint === 'messages') {
     const body = (await request.json()) as SlackbotV2AppendMessagesRequest
     input.appends.push({ threadKey, body })
