@@ -2473,6 +2473,11 @@ async function renderPlainTextExecutionStream(
     for await (const _chunk of chatStream) {
       void _chunk
     }
+    const rawText = fallback.text()
+    if (!rawText.trim() && !fallback.isInterrupted()) {
+      traceLog(options, 'slackbotv2_render_plain_text_empty_suppressed', trace)
+      return
+    }
     const text = truncateSlackText(
       fallback.textOrDefault(),
       SLACK_FALLBACK_TEXT_MAX_CHARS,

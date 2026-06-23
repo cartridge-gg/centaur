@@ -2283,7 +2283,7 @@ describe('slackbotv2', () => {
     )
   })
 
-  it('renders successful completions with no final answer as visible Slack text', async () => {
+  it('suppresses successful completions with no final answer', async () => {
     codexApi.autoRespond = false
 
     const parent = await postUserMessage('Context before an empty completion.')
@@ -2312,31 +2312,6 @@ describe('slackbotv2', () => {
     await waitFor(() => codexApi.eventRequests.length === 1)
     await waitFor(() => codexApi.streamCount === 1)
 
-    codexApi.emitOutputLine(
-      threadKey(parent.ts),
-      JSON.stringify({
-        type: 'item.started',
-        item: {
-          id: 'cmd-1',
-          type: 'commandExecution',
-          command: 'true',
-          status: 'inProgress'
-        }
-      })
-    )
-    codexApi.emitOutputLine(
-      threadKey(parent.ts),
-      JSON.stringify({
-        type: 'item.completed',
-        item: {
-          id: 'cmd-1',
-          type: 'commandExecution',
-          command: 'true',
-          status: 'completed',
-          aggregatedOutput: ''
-        }
-      })
-    )
     codexApi.emitSessionEvent(threadKey(parent.ts), 'session.execution_completed', {
       execution_id: 'exe-empty',
       status: 'completed'
@@ -2344,18 +2319,9 @@ describe('slackbotv2', () => {
 
     await Promise.all(waits)
     const transcripts = slackStreamTranscripts(slackApi.calls)
-    expect(transcripts).toHaveLength(1)
-    const markdownChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
-    expect(markdownChunks).toEqual([
-      {
-        type: 'markdown_text',
-        text: 'Execution completed, but no final text was captured.'
-      }
-    ])
-    const renderedText = transcripts[0]!.chunks.map(chunkText).filter(Boolean).join('\n')
-    expect(renderedText).toContain('Command execution')
-    expect(renderedText.trim().endsWith('Execution completed, but no final text was captured.')).toBe(
-      true
+    expect(transcripts).toHaveLength(0)
+    expect(await threadText(parent.ts)).not.toContain(
+      'Execution completed, but no final text was captured.'
     )
   })
 
