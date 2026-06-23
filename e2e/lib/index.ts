@@ -264,7 +264,7 @@ export const slack = {
     const user = options.as ?? USER
     const { channel } = await slackApi<{ channel: { id: string } }>(user, 'conversations.open', { users: user.id })
     const dm = { id: channel.id, name: `dm-${user.name}` }
-    const ts = await postMention(dm, user, text, script, undefined, { dm: true })
+    const ts = await postMention(dm, user, text, script, undefined, { mention: false })
     return new Thread(dm, ts, script, { dm: true })
   },
   /** A message as Slack holds it, with its reactions. */
@@ -394,8 +394,14 @@ export class Thread {
    * Mentions the bot while a turn is running. The running turn takes the
    * message (as steering, or a stop), so it starts no turn of its own.
    */
-  async interject(text: string, script?: Script, options: { as?: SlackUser } = {}): Promise<string> {
-    return this.send(text, script, options.as)
+  async interject(text: string, script?: Script, options: { as?: SlackUser; mention?: boolean } = {}): Promise<string> {
+    return this.send(text, script, options.as, { mention: options.mention })
+  }
+
+  /** Replies without mentioning the bot; in a thread the bot is subscribed to, the reply starts a turn. */
+  async reply(text: string, script?: Script, options: { as?: SlackUser } = {}): Promise<void> {
+    this.triggers.push(await this.send(text, script, options.as, { mention: false }))
+    this.scripts.push(script?.token)
   }
 
   /** Posts a reply that does not mention the bot. */
@@ -419,8 +425,15 @@ export class Thread {
     return status
   }
 
-  private async send(text: string, script: Script | undefined, as: SlackUser = USER): Promise<string> {
-    return postMention(this.channel, as, text, script, this.dm ? undefined : this.ts, { dm: this.dm })
+  private async send(
+    text: string,
+    script: Script | undefined,
+    as: SlackUser = USER,
+    options: { mention?: boolean } = {}
+  ): Promise<string> {
+    return postMention(this.channel, as, text, script, this.dm ? undefined : this.ts, {
+      mention: !this.dm && options.mention !== false
+    })
   }
 
   /**
@@ -510,12 +523,12 @@ async function postMention(
   text: string,
   script: Script | undefined,
   threadTs?: string,
-  options: { dm?: boolean } = {}
+  options: { mention?: boolean } = {}
 ): Promise<string> {
   if (script) await registerScript(script)
   const posted = await slackApi<{ ts: string }>(user, 'chat.postMessage', {
     channel: channel.id,
-    text: `${options.dm ? '' : `<@${BOT.userId}> `}${text}${script ? ` ${script.token}` : ''}`,
+    text: `${options.mention === false ? '' : `<@${BOT.userId}> `}${text}${script ? ` ${script.token}` : ''}`,
     ...(threadTs ? { thread_ts: threadTs } : {})
   })
   return posted.ts

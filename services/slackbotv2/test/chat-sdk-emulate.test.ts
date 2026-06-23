@@ -712,6 +712,28 @@ describe('slackbotv2', () => {
     expectSlackRenderedReply(renderedReplies[0]!, 'Executed request 1.')
   })
 
+  it('executes an unmentioned reply in a subscribed thread as its own turn', async () => {
+    const parent = await postUserMessage('The deploy context is above.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> start here`, { threadTs: parent.ts })
+    await mention.finished()
+
+    const followUp = await sendMessage('Additional detail for the subscribed thread.', { threadTs: parent.ts })
+    expect(followUp.response.status).toBe(200)
+    await followUp.finished()
+
+    expect(codexApi.executes).toHaveLength(2)
+    expect(codexApi.creates.map(create => create.threadKey)).toEqual([
+      threadKey(parent.ts),
+      threadKey(parent.ts)
+    ])
+    const followUpAppend = codexApi.appends[1]!
+    expect(followUpAppend.body.messages.map(message => message.client_message_id)).toEqual([followUp.ts])
+    expect(sessionMessageTexts(followUpAppend.body.messages)).toEqual([
+      'Additional detail for the subscribed thread.'
+    ])
+    expect(codexApi.executes[1]!.body.idempotency_key).toBe(followUp.ts)
+  })
+
   // The paragraph break (`\n\n`) after the model value is deliberate: the
   // unpatched chat SDK dropped it, gluing the value to the next word
   // (`fablefirst`); this exercises the patched extractPlainText end to end.
