@@ -416,7 +416,7 @@ describe("discordbot", () => {
     );
   });
 
-  it("renders successful completions with no final answer as visible text", async () => {
+  it("suppresses successful completions with no final answer", async () => {
     codexApi.autoRespond = false;
 
     const threadId = discordApi.nextId();
@@ -450,9 +450,7 @@ describe("discordbot", () => {
     });
 
     await waitForSettle(threadId, mentionId);
-    expect(answerPostsIn(threadId).join("\n")).toContain(
-      "Execution completed, but no final text was captured.",
-    );
+    expect(answerPostsIn(threadId)).toEqual([]);
   });
 
   it("renders api-rs completion result text when no final answer delta streamed", async () => {

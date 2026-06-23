@@ -39,8 +39,6 @@ export type ChatSDKSessionClosed = {
 
 export type ChatSDKOutput = ChatSDKMessageUpsert | ChatSDKSessionClosed | ChatSDKStreamAppend
 
-export const EMPTY_FINAL_ANSWER_TEXT = 'Execution completed, but no final text was captured.'
-
 const MAX_TASK_BODY_CHARS = 3000
 
 export class ChatSDKRenderer implements RendererInterface<ChatSDKOutput> {
