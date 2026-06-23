@@ -1,7 +1,6 @@
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import {
   ChatSDKRenderer,
-  EMPTY_FINAL_ANSWER_TEXT,
   type ChatSDKOutput,
   type ChatSDKStreamChunk
 } from './chat-sdk'
@@ -124,7 +123,6 @@ export class CodexAppServerRendererEventMapper
     const out: RendererEvent[] = []
     completeOpenTasks(this.state)
     this.emitActivitySummary(out, { final: true })
-    this.ensureFinalAnswerText()
     this.emitPendingAssistantText(out, { force: true })
     out.push({
       type: 'renderer.done',
@@ -354,12 +352,6 @@ export class CodexAppServerRendererEventMapper
       threadId: this.state.threadId || undefined
     })
     return out
-  }
-
-  private ensureFinalAnswerText(): void {
-    if (this.state.answerText.trim()) return
-    this.state.harnessAnswerText += EMPTY_FINAL_ANSWER_TEXT
-    recomposeBuffers(this.state)
   }
 
   private emitActivitySummary(out: RendererEvent[], opts: { final?: boolean } = {}): void {
