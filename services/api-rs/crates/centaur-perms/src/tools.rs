@@ -8,7 +8,10 @@
 //! into iron-control inputs. Only the secret *schema* is reimplemented here;
 //! the API's loader stays the source of truth for runtime tool loading.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use centaur_iron_control::{GCP_ID_TOKEN_ALLOWED_HEADERS, normalize_gcp_id_token_header};
 use centaur_iron_proxy::{PgDsnSetting, PgDsnSettingValueFrom};
@@ -91,6 +94,7 @@ pub struct FieldSource {
 pub struct HttpSecret {
     pub name: String,
     pub secret_ref: String,
+    pub source: Option<BTreeMap<String, String>>,
     pub mode: SecretMode,
     pub hosts: Vec<String>,
     // replace mode
@@ -427,6 +431,7 @@ pub fn parse_secret(entry: &Value, default_hosts: &[String]) -> Result<ParsedSec
         return Ok(ParsedSecret::Http(HttpSecret {
             name: s.to_owned(),
             secret_ref: s.to_owned(),
+            source: None,
             mode: SecretMode::Replace,
             hosts: default_hosts.to_vec(),
             replacer: s.to_owned(),
@@ -491,6 +496,7 @@ fn parse_http(
     secret_ref: &str,
     default_hosts: &[String],
 ) -> Result<HttpSecret> {
+    let source = string_map(table.get("source"))?;
     let mode = match table
         .get("mode")
         .and_then(Value::as_str)
@@ -537,6 +543,7 @@ fn parse_http(
             Ok(HttpSecret {
                 name: name.to_owned(),
                 secret_ref: secret_ref.to_owned(),
+                source,
                 mode,
                 hosts,
                 replacer,
@@ -573,6 +580,7 @@ fn parse_http(
             Ok(HttpSecret {
                 name: name.to_owned(),
                 secret_ref: secret_ref.to_owned(),
+                source,
                 mode,
                 hosts,
                 replacer: String::new(),
@@ -1052,6 +1060,29 @@ fn non_empty_str_array(value: Option<&Value>) -> Option<Vec<String>> {
         out.push(s.to_owned());
     }
     Some(out)
+}
+
+fn string_map(value: Option<&Value>) -> Result<Option<BTreeMap<String, String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let table = value
+        .as_table()
+        .ok_or_else(|| eyre!("source must be a table of strings"))?;
+    let mut out = BTreeMap::new();
+    for (key, value) in table {
+        let Some(value) = value.as_str().filter(|s| !s.is_empty()) else {
+            bail!("source.{key} must be a non-empty string");
+        };
+        out.insert(key.clone(), value.to_owned());
+    }
+    if out.is_empty() {
+        bail!("source must contain at least one key");
+    }
+    if !out.contains_key("type") {
+        bail!("source must include non-empty string key \"type\"");
+    }
+    Ok(Some(out))
 }
 
 fn validate_gcp_id_token_header(value: String) -> Result<String> {

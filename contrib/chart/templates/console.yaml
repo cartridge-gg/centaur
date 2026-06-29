@@ -199,6 +199,24 @@ spec:
             - name: CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS
               value: {{ join "," . | quote }}
 {{- end }}
+            # GitHub App credentials used by the github_app secret source. The
+            # console mints short-lived installation tokens for per-sandbox
+            # proxies over /proxy/sync; raw tokens still never enter sandboxes.
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretEnv }}
+                  key: {{ printf "%sGITHUB_APP_ID" $prefix }}
+            - name: GITHUB_APP_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretEnv }}
+                  key: {{ printf "%sGITHUB_APP_INSTALLATION_ID" $prefix }}
+            - name: GITHUB_APP_PRIVATE_KEY_B64
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretEnv }}
+                  key: {{ printf "%sGITHUB_APP_PRIVATE_KEY_B64" $prefix }}
 {{- if $console.googleOauth.enabled }}
             # Google OAuth app credentials (sign-in + brokered token refresh).
             # Gated on console.googleOauth.enabled; the keys must exist in the
