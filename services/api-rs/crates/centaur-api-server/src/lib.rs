@@ -3,6 +3,7 @@ mod api_jwt;
 pub mod client;
 mod error;
 mod mcp;
+mod model_proxy;
 mod openai;
 mod routes;
 mod slack_proxy;

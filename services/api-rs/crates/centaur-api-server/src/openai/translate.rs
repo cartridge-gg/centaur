@@ -283,43 +283,142 @@ impl ResponsesTranslator {
                 self.emit_text_delta(&text, out);
             }
         }
-        let text = self.emitted_text.clone();
-        if self.message_open {
-            out.push(self.event(
-                "response.output_text.done",
-                json!({
-                    "type": "response.output_text.done",
-                    "item_id": self.item_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "text": text,
-                }),
-            ));
-            out.push(self.event(
-                "response.content_part.done",
-                json!({
-                    "type": "response.content_part.done",
-                    "item_id": self.item_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": text, "annotations": []},
-                }),
-            ));
-            out.push(self.event(
-                "response.output_item.done",
-                json!({
-                    "type": "response.output_item.done",
-                    "output_index": 0,
-                    "item": self.message_item(),
-                }),
-            ));
-        }
+        let item = self.close_message(out);
         self.completed = true;
-        let output = if self.message_open {
-            vec![self.message_item()]
-        } else {
-            Vec::new()
-        };
+        let output = item.map(|item| vec![item]).unwrap_or_default();
+        out.push(self.event(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": self.response_object("completed", &output),
+            }),
+        ));
+    }
+
+    /// Close the open assistant message, emitting its terminal
+    /// `output_text.done` / `content_part.done` / `output_item.done` events and
+    /// returning the completed message item. No-op (returns `None`) when no
+    /// message is open. Shared by [`Self::finish`] and [`Self::emit_function_call`].
+    fn close_message(&mut self, out: &mut Vec<ResponsesStreamEvent>) -> Option<Value> {
+        if !self.message_open {
+            return None;
+        }
+        let text = self.emitted_text.clone();
+        out.push(self.event(
+            "response.output_text.done",
+            json!({
+                "type": "response.output_text.done",
+                "item_id": self.item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": text,
+            }),
+        ));
+        out.push(self.event(
+            "response.content_part.done",
+            json!({
+                "type": "response.content_part.done",
+                "item_id": self.item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": text, "annotations": []},
+            }),
+        ));
+        let item = self.message_item();
+        out.push(self.event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": item.clone(),
+            }),
+        ));
+        self.message_open = false;
+        Some(item)
+    }
+
+    /// Emit a complete `function_call` output item for the user's local CLI to
+    /// execute, then close the turn with `response.completed`. Used by the
+    /// `/v1/responses` ingress when the sandbox agent's model emits a `local__`
+    /// tool call that must round-trip through the client.
+    ///
+    /// Produces, in order: `response.output_item.added` (function_call, empty
+    /// arguments) -> `response.function_call_arguments.delta` (full arguments) ->
+    /// `response.function_call_arguments.done` -> `response.output_item.done`
+    /// (full arguments) -> `response.completed`. If an assistant message was open
+    /// (the agent narrated before calling the tool) it is closed first and the
+    /// function_call takes the next `output_index`.
+    pub fn emit_function_call(
+        &mut self,
+        name: &str,
+        call_id: &str,
+        arguments: &str,
+        out: &mut Vec<ResponsesStreamEvent>,
+    ) {
+        if self.completed {
+            return;
+        }
+        self.ensure_started(out);
+        let message_item = self.close_message(out);
+        let output_index = if message_item.is_some() { 1 } else { 0 };
+        let item_id = format!("fc_{call_id}");
+
+        out.push(self.event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "name": name,
+                    "call_id": call_id,
+                    "arguments": "",
+                },
+            }),
+        ));
+        out.push(self.event(
+            "response.function_call_arguments.delta",
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "delta": arguments,
+            }),
+        ));
+        out.push(self.event(
+            "response.function_call_arguments.done",
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "arguments": arguments,
+            }),
+        ));
+        let function_item = json!({
+            "id": item_id,
+            "type": "function_call",
+            "status": "completed",
+            "name": name,
+            "call_id": call_id,
+            "arguments": arguments,
+        });
+        out.push(self.event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": function_item.clone(),
+            }),
+        ));
+
+        self.completed = true;
+        let mut output = Vec::new();
+        if let Some(message_item) = message_item {
+            output.push(message_item);
+        }
+        output.push(function_item);
         out.push(self.event(
             "response.completed",
             json!({
@@ -550,6 +649,96 @@ mod tests {
                 .any(|name| name == "response.output_item.added")
         );
         assert!(kinds.iter().any(|name| name == "response.completed"));
+    }
+
+    #[test]
+    fn emit_function_call_event_shape() {
+        let mut translator = ResponsesTranslator::new("resp_test", "gpt-test");
+        let mut out = Vec::new();
+        translator.emit_function_call("exec_command", "call_abc", r#"{"cmd":"ls"}"#, &mut out);
+
+        // Started (created/in_progress) then the function_call lifecycle + completed.
+        assert_eq!(
+            names(&out),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let added = &out[2];
+        assert_eq!(added.data["item"]["type"], json!("function_call"));
+        assert_eq!(added.data["item"]["name"], json!("exec_command"));
+        assert_eq!(added.data["item"]["call_id"], json!("call_abc"));
+        assert_eq!(added.data["item"]["arguments"], json!(""));
+        assert_eq!(added.data["output_index"], json!(0));
+
+        let delta = &out[3];
+        assert_eq!(delta.data["delta"], json!(r#"{"cmd":"ls"}"#));
+
+        let done = &out[5];
+        assert_eq!(done.data["item"]["arguments"], json!(r#"{"cmd":"ls"}"#));
+        assert_eq!(done.data["item"]["status"], json!("completed"));
+
+        let completed = &out[6];
+        assert_eq!(completed.data["response"]["status"], json!("completed"));
+        assert_eq!(
+            completed.data["response"]["output"][0]["type"],
+            json!("function_call")
+        );
+        assert_eq!(
+            completed.data["response"]["output"][0]["call_id"],
+            json!("call_abc")
+        );
+
+        // Sequence numbers are contiguous from 0.
+        let seqs: Vec<u64> = out
+            .iter()
+            .map(|e| e.data["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn emit_function_call_after_text_closes_message_and_bumps_index() {
+        let mut translator = ResponsesTranslator::new("resp_test", "gpt-test");
+        let mut out = Vec::new();
+        // Simulate prior narration text via a normal session event.
+        out.extend(
+            translator.translate_session_event(&event("session.execution_started", json!({}))),
+        );
+        out.extend(translator.translate_session_event(&output(
+            json!({"type":"item.agentMessage.delta","delta":"Working"}),
+        )));
+        translator.emit_function_call("exec_command", "call_1", "{}", &mut out);
+
+        // The open assistant message is closed before the function_call, and the
+        // function_call lands at output_index 1.
+        let kinds = names(&out);
+        assert!(kinds.iter().any(|n| n == "response.output_text.done"));
+        let fc_added = out
+            .iter()
+            .find(|e| {
+                e.name == "response.output_item.added"
+                    && e.data["item"]["type"] == json!("function_call")
+            })
+            .expect("function_call added");
+        assert_eq!(fc_added.data["output_index"], json!(1));
+
+        // Completed carries both the message and the function_call items.
+        let completed = out
+            .iter()
+            .rfind(|e| e.name == "response.completed")
+            .unwrap();
+        let output_items = completed.data["response"]["output"].as_array().unwrap();
+        assert_eq!(output_items.len(), 2);
+        assert_eq!(output_items[0]["type"], json!("message"));
+        assert_eq!(output_items[1]["type"], json!("function_call"));
     }
 
     #[test]
