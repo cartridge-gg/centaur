@@ -307,13 +307,26 @@ fn run_codex_user_turn<W: Write>(
 ) -> Result<()> {
     let (model, model_provider) = model_and_provider;
     if thread_id.is_none() {
-        *thread_id = Some(start_or_resume_thread(
-            codex,
+        let new_thread_id =
+            start_or_resume_thread(codex, stdout, request_id, &model_provider, traceparent)?;
+        // Emit a `centaur/threadStarted` notification so Centaur captures the
+        // codex thread_id. codex sets the model request's `prompt_cache_key` to
+        // this same thread_id (core/src/client.rs: prompt_cache_key =
+        // state.thread_id), so Centaur can index thread_id -> thread_key and
+        // associate the sandbox's model calls back to this session for the
+        // local-tool model proxy. Emitted once, before the first turn (so it's
+        // captured before any model call). This is a Centaur overlay notification
+        // (see is_known_untyped_server_notification): a valid JSON-RPC
+        // notification on the blocks stream, carrying only `threadId`.
+        // Best-effort: a write error here shouldn't fail the turn.
+        let _ = write_value(
             stdout,
-            request_id,
-            &model_provider,
-            traceparent,
-        )?);
+            &json!({
+                "method": "centaur/threadStarted",
+                "params": { "threadId": new_thread_id },
+            }),
+        );
+        *thread_id = Some(new_thread_id);
         *thread_provider = Some(model_provider.clone());
     } else if let (Some(requested), Some(pinned)) =
         (requested_provider.as_deref(), thread_provider.as_deref())

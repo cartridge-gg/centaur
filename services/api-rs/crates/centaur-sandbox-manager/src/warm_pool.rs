@@ -4,7 +4,7 @@ use centaur_sandbox_core::{SandboxError, SandboxId, SandboxSpec, SandboxStatus};
 use centaur_session_sqlx::{PgSessionStore, SessionStoreError};
 use thiserror::Error;
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::SandboxManager;
 
@@ -53,12 +53,55 @@ impl WarmPoolManager {
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
             loop {
+                // First `tick()` fires immediately, so this also runs on startup —
+                // reaping warm sandboxes orphaned by a prior deploy before topping
+                // up the current generation's pool.
                 tick.tick().await;
+                if let Err(error) = self.reconcile_stale_workload().await {
+                    warn!(%error, "session sandbox warm pool stale-workload reconcile failed");
+                }
                 if let Err(error) = self.replenish_once().await {
                     warn!(%error, "session sandbox warm pool replenishment failed");
                 }
             }
         });
+    }
+
+    /// Reap warm sandboxes left behind by previous deploy generations: any
+    /// non-`claimed` warm sandbox whose `workload_key` differs from this
+    /// generation's. A redeploy changes the sandbox image (hence `workload_key`),
+    /// so the new generation otherwise never revisits the old key and those pods
+    /// leak until the max-lifetime sweep. Stops each sandbox and removes its row.
+    /// Returns the number reaped. Idempotent and safe to run repeatedly.
+    pub async fn reconcile_stale_workload(&self) -> Result<usize, WarmPoolError> {
+        let stale = self
+            .store
+            .list_reapable_stale_warm_sandboxes(self.workload_key.as_str())
+            .await?;
+        let mut reaped = 0usize;
+        for sandbox_id in &stale {
+            let id = SandboxId::new(sandbox_id.as_str());
+            match self.manager.stop(&id).await {
+                Ok(()) | Err(SandboxError::NotFound(_)) => {}
+                Err(error) => {
+                    warn!(%sandbox_id, %error, "warm pool: failed to stop stale warm sandbox");
+                    continue;
+                }
+            }
+            if let Err(error) = self.store.delete_warm_sandbox(sandbox_id).await {
+                warn!(%sandbox_id, %error, "warm pool: failed to delete stale warm sandbox row");
+                continue;
+            }
+            reaped += 1;
+        }
+        if reaped > 0 {
+            info!(
+                reaped,
+                current_workload_key = %self.workload_key,
+                "warm pool: reaped stale (previous-deploy) warm sandboxes"
+            );
+        }
+        Ok(reaped)
     }
 
     pub async fn claim(
