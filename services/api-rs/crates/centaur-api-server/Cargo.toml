@@ -48,6 +48,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+time.workspace = true
 tower.workspace = true
 
 [lints]

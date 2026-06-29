@@ -53,9 +53,10 @@ use tracing::Span;
 use uuid::Uuid;
 
 use crate::{
-    ApiError,
+    ApiError, anthropic,
     api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
+    openai,
     slack_proxy::slack_proxy_router,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
@@ -143,7 +144,7 @@ impl AppState {
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))
     }
 
-    fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
+    pub(crate) fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -209,6 +210,14 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/.well-known/oauth-protected-resource/mcp",
             get(mcp_protected_resource_metadata),
+        )
+        .route(
+            "/v1/messages",
+            post(anthropic::anthropic_messages).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/v1/responses",
+            post(openai::create_response).layer(DefaultBodyLimit::disable()),
         )
         .route(
             "/api/session/{thread_key}",
@@ -541,6 +550,8 @@ async fn execute_session(
                 input_lines: request.input_lines,
                 idle_timeout_ms: request.idle_timeout_ms,
                 max_duration_ms: request.max_duration_ms,
+                model: None,
+                system_prompt: None,
             },
         )
         .await?;
