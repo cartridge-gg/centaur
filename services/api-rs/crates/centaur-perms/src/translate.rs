@@ -18,6 +18,7 @@ use centaur_iron_control::{
 };
 use centaur_iron_proxy::SourcePolicy;
 use centaur_iron_proxy::{PgDsnSetting, PgDsnSettingValueFrom};
+use serde_json::json;
 
 use crate::tools::{
     AwsAuthSecret, BrokerTokenSecret, FieldSource, GcpAuthSecret, GcpIdTokenSecret, HmacSignSecret,
@@ -208,9 +209,28 @@ fn static_input(
         labels: labels.clone(),
         inject_config,
         replace_config,
-        source: source_from_placeholder(policy, &http.secret_ref, None),
+        source: http_source(http, policy),
         rules: rules_from_hosts(&http.hosts),
     }
+}
+
+fn http_source(http: &HttpSecret, policy: &SourcePolicy) -> SecretSource {
+    if let Some(source) = &http.source
+        && let Some(source_type) = source.get("type")
+    {
+        let mut config = serde_json::Map::new();
+        for (key, value) in source {
+            if key != "type" {
+                config.insert(key.clone(), json!(value));
+            }
+        }
+        return SecretSource {
+            source_type: source_type.clone(),
+            secret: None,
+            config: serde_json::Value::Object(config),
+        };
+    }
+    source_from_placeholder(policy, &http.secret_ref, None)
 }
 
 fn oauth_input(
