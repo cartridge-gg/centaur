@@ -342,6 +342,8 @@ pub struct ExecuteSessionInput {
     pub input_lines: Vec<String>,
     pub idle_timeout_ms: Option<u64>,
     pub max_duration_ms: Option<u64>,
+    pub model: Option<String>,
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -762,6 +764,7 @@ struct EnsureSessionSandboxRequest<'a> {
     iron_control_principal: Option<&'a str>,
     desired_capabilities: &'a SessionSandboxCapabilities,
     execution_id: &'a str,
+    overrides: SessionSandboxOverrides<'a>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -787,6 +790,21 @@ struct PersonaResolution {
     persona_id: Option<String>,
     context: Option<PersonaContext>,
     defaulted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SessionSandboxOverrides<'a> {
+    model: Option<&'a str>,
+    system_prompt: Option<&'a str>,
+}
+
+impl SessionSandboxOverrides<'_> {
+    fn has_overrides(self) -> bool {
+        self.model.is_some_and(|model| !model.trim().is_empty())
+            || self
+                .system_prompt
+                .is_some_and(|prompt| !prompt.trim().is_empty())
+    }
 }
 
 impl SessionRuntime {
@@ -1020,6 +1038,8 @@ impl SessionRuntime {
                     input_lines: vec![input_line],
                     idle_timeout_ms: None,
                     max_duration_ms: Some(duration_millis_u64(response_timeout)),
+                    model: None,
+                    system_prompt: None,
                 },
             )
             .await?;
@@ -1805,6 +1825,8 @@ impl SessionRuntime {
             input_lines,
             idle_timeout_ms,
             max_duration_ms,
+            model,
+            system_prompt,
         } = input;
         let input_line_count = input_lines.len();
         let idempotency_key_present = idempotency_key.is_some();
@@ -1941,6 +1963,10 @@ impl SessionRuntime {
                     iron_control_principal: session.iron_control_principal.as_deref(),
                     desired_capabilities: &desired_capabilities,
                     execution_id: &execution.execution_id,
+                    overrides: SessionSandboxOverrides {
+                        model: model.as_deref(),
+                        system_prompt: system_prompt.as_deref(),
+                    },
                 })
                 .instrument(execution_trace_span.clone())
                 .await
@@ -2317,6 +2343,7 @@ impl SessionRuntime {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn ensure_session_sandbox(
         &self,
         request: EnsureSessionSandboxRequest<'_>,
@@ -2330,6 +2357,7 @@ impl SessionRuntime {
             iron_control_principal,
             desired_capabilities,
             execution_id,
+            overrides,
         } = request;
         let boot_mode = sandbox_boot_mode_for_thread(thread_key, iron_control_principal);
         let span = info_span!(
@@ -2540,17 +2568,21 @@ impl SessionRuntime {
 
             // Warm sandboxes are pre-booted with the workload's default
             // harness; a session on any other harness needs a cold sandbox.
+            let has_sandbox_overrides = overrides.has_overrides();
             let warm_harness_matches = self
                 .sandbox_runtime
                 .warm_harness
                 .as_ref()
                 .is_none_or(|warm| warm == harness_type);
             let warm_persona_matches = persona_context.is_none();
-            if !warm_harness_matches && self.warm_pool.is_some() {
-                record_sandbox_warm_pool_claim("harness_mismatch");
-            }
-            if !warm_persona_matches && self.warm_pool.is_some() {
-                record_sandbox_warm_pool_claim("persona_specific");
+            if self.warm_pool.is_some() {
+                if has_sandbox_overrides {
+                    record_sandbox_warm_pool_claim("request_overrides");
+                } else if !warm_harness_matches {
+                    record_sandbox_warm_pool_claim("harness_mismatch");
+                } else if !warm_persona_matches {
+                    record_sandbox_warm_pool_claim("persona_specific");
+                }
             }
             if !desired_capabilities.is_default_enabled() && self.warm_pool.is_some() {
                 record_sandbox_warm_pool_claim("capabilities_non_default");
@@ -2563,6 +2595,7 @@ impl SessionRuntime {
                         && warm_harness_matches
                         && warm_persona_matches
                         && desired_capabilities.is_default_enabled()
+                        && !has_sandbox_overrides
                 })
             {
                 match warm_pool
@@ -2632,6 +2665,7 @@ impl SessionRuntime {
                 harness_type,
                 persona_context.as_ref(),
             );
+            apply_session_sandbox_overrides(&mut spec, harness_type, overrides);
             if let Some(principal) = iron_control_principal {
                 spec.iron_control_principal = Some(principal.to_owned());
             }
@@ -3701,6 +3735,38 @@ fn harness_server_subcommand(harness: &HarnessType) -> &'static str {
         HarnessType::ClaudeCode => "claude-code",
         HarnessType::Amp => "amp",
     }
+}
+
+fn apply_session_sandbox_overrides(
+    spec: &mut SandboxSpec,
+    harness: &HarnessType,
+    overrides: SessionSandboxOverrides<'_>,
+) {
+    // PR A intentionally scopes request model/system to ClaudeCode. Codex and
+    // Amp request-level model/system handling need separate harness semantics.
+    if !matches!(harness, HarnessType::ClaudeCode) {
+        return;
+    }
+    if let Some(model) = overrides.model.and_then(non_empty_str) {
+        upsert_env(spec, "CLAUDE_MODEL", model);
+    }
+    if let Some(system_prompt) = overrides.system_prompt.and_then(non_empty_str) {
+        upsert_env(spec, "CENTAUR_EXTRA_SYSTEM_PROMPT", system_prompt);
+    }
+}
+
+fn upsert_env(spec: &mut SandboxSpec, name: &str, value: &str) {
+    if let Some(existing) = spec.env.iter_mut().find(|env| env.name == name) {
+        existing.value = value.to_owned();
+    } else {
+        spec.env
+            .push(centaur_sandbox_core::EnvVar::new(name, value));
+    }
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 fn sandbox_spec_key(spec: &SandboxSpec) -> String {
@@ -4939,7 +5005,7 @@ fn tool_labels_from_item(item: &Value) -> Option<ToolCallLabels> {
             name: string_at_path(item, &["tool"]).unwrap_or_else(|| "agent".to_owned()),
             method: "call".to_owned(),
         }),
-        _ => None,
+        _ => centaur_call_labels_from_command_item(item),
     }
 }
 
@@ -5008,7 +5074,8 @@ fn progress_item_id(value: &Value) -> Option<String> {
     .next()
 }
 
-fn anthropic_tool_uses(value: &Value) -> Vec<&Value> {
+/// Extract Anthropic tool_use blocks; reused by api-server Anthropic translator.
+pub fn anthropic_tool_uses(value: &Value) -> Vec<&Value> {
     if value.get("type").and_then(Value::as_str) != Some("assistant") {
         return Vec::new();
     }
@@ -5018,7 +5085,8 @@ fn anthropic_tool_uses(value: &Value) -> Vec<&Value> {
         .collect()
 }
 
-fn anthropic_tool_results(value: &Value) -> Vec<&Value> {
+/// Extract Anthropic tool_result blocks; reused by api-server Anthropic translator.
+pub fn anthropic_tool_results(value: &Value) -> Vec<&Value> {
     if !matches!(
         value.get("type").and_then(Value::as_str),
         Some("user" | "tool")
@@ -5034,7 +5102,8 @@ fn anthropic_tool_results(value: &Value) -> Vec<&Value> {
         .collect()
 }
 
-fn content_blocks(value: &Value) -> Vec<&Value> {
+/// Extract Anthropic content blocks; reused by api-server Anthropic translator.
+pub fn content_blocks(value: &Value) -> Vec<&Value> {
     value
         .get("content")
         .or_else(|| {
@@ -5047,8 +5116,63 @@ fn content_blocks(value: &Value) -> Vec<&Value> {
         .unwrap_or_default()
 }
 
+fn centaur_call_labels_from_command_item(item: &Value) -> Option<ToolCallLabels> {
+    let command = string_at_path(item, &["command"])?;
+    let (name, method) = parse_centaur_call_command(&command)?;
+    Some(ToolCallLabels {
+        kind: "centaur_call".to_owned(),
+        name,
+        method,
+    })
+}
+
+fn parse_centaur_call_command(command: &str) -> Option<(String, String)> {
+    let call_start = command
+        .match_indices("call")
+        .find_map(|(index, _)| is_call_command_token(command, index).then_some(index))?;
+    let after_call = command[call_start + "call".len()..]
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\'' || ch == '"');
+    let mut parts = after_call
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '\'' | '"' | ';'))
+        .filter(|part| !part.is_empty());
+    let first = parts.next()?;
+    match first {
+        "tools" => Some(("tools".to_owned(), "list".to_owned())),
+        "discover" => Some((
+            parts.next().unwrap_or("unknown").to_owned(),
+            "discover".to_owned(),
+        )),
+        "agent" => Some((
+            "agent".to_owned(),
+            parts.next().unwrap_or("unknown").to_owned(),
+        )),
+        tool => Some((
+            tool.to_owned(),
+            parts.next().unwrap_or("unknown").to_owned(),
+        )),
+    }
+}
+
+fn is_call_command_token(command: &str, index: usize) -> bool {
+    let before = command[..index].chars().next_back();
+    let after = command[index + "call".len()..].chars().next();
+
+    let before_is_boundary = before.is_none_or(|ch| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '\'' | '"' | '`' | ';' | '&' | '|' | '(' | ')' | '{' | '}' | '/'
+            )
+    });
+    let after_is_boundary =
+        after.is_some_and(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | ';'));
+
+    before_is_boundary && after_is_boundary
+}
+
+/// Parsed terminal harness output; reused by api-server Anthropic translator.
 #[derive(Debug, Eq, PartialEq)]
-enum TerminalOutput {
+pub enum TerminalOutput {
     Completed {
         reason: &'static str,
         result_text: Option<String>,
@@ -5728,7 +5852,8 @@ fn is_event_stream_attach_race(error: &SessionRuntimeError) -> bool {
     )
 }
 
-fn terminal_output(value: &Value, prior_final_answer_text: &str) -> Option<TerminalOutput> {
+/// Parse terminal harness output; reused by api-server Anthropic translator.
+pub fn terminal_output(value: &Value, prior_final_answer_text: &str) -> Option<TerminalOutput> {
     let method = value.get("method").and_then(Value::as_str);
     let event_type = value.get("type").and_then(Value::as_str);
 
@@ -5826,12 +5951,15 @@ fn turn_completion_status(value: &Value) -> Option<String> {
     .next()
 }
 
-enum FinalAnswerTextUpdate {
+/// Parsed final-answer text update; reused by api-server Anthropic translator.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FinalAnswerTextUpdate {
     Append(String),
     Replace(String),
 }
 
-fn output_line_final_answer_text(value: &Value) -> Option<FinalAnswerTextUpdate> {
+/// Parse final-answer text updates; reused by api-server Anthropic translator.
+pub fn output_line_final_answer_text(value: &Value) -> Option<FinalAnswerTextUpdate> {
     let method = value.get("method").and_then(Value::as_str);
     let event_type = value.get("type").and_then(Value::as_str);
     if matches!(method, Some("item/agentMessage/delta"))
@@ -5891,7 +6019,8 @@ fn item_ids(value: &Value) -> Vec<String> {
     .collect()
 }
 
-fn string_at_path(value: &Value, path: &[&str]) -> Option<String> {
+/// Read a non-empty string at a nested object path; reused by api-server Anthropic translator.
+pub fn string_at_path(value: &Value, path: &[&str]) -> Option<String> {
     let mut current = value;
     for key in path {
         current = current.get(*key)?;
@@ -5921,7 +6050,8 @@ fn terminal_error_text(value: &Value) -> String {
         .if_empty("terminal harness output reported failure")
 }
 
-fn terminal_payload_text(value: &Value) -> String {
+/// Extract text from common terminal payload shapes; reused by api-server Anthropic translator.
+pub fn terminal_payload_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Array(values) => values

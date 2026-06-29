@@ -1,7 +1,7 @@
-use std::env;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
+use std::{env, fs};
 
 use codex_app_server_protocol::UserInput;
 use serde_json::json;
@@ -243,8 +243,13 @@ impl HarnessServer for ClaudeCodeHarness {
         if !state.model.is_empty() {
             command.args(["--model", &state.model]);
         }
-        if PathBuf::from("AGENTS.md").is_file() {
+        if state.cwd.join("AGENTS.md").is_file() {
             command.args(["--append-system-prompt-file", "AGENTS.md"]);
+        }
+        if let Some(extra_system_prompt_file) = extra_system_prompt_file(state) {
+            command
+                .arg("--append-system-prompt-file")
+                .arg(extra_system_prompt_file);
         }
         if let Some(session_id) = &state.harness_session_id {
             command.args(["--resume", session_id]);
@@ -300,14 +305,32 @@ impl HarnessServer for ClaudeCodeHarness {
     }
 }
 
+fn extra_system_prompt_file(state: &ThreadState) -> Option<PathBuf> {
+    let prompt = env::var("CENTAUR_EXTRA_SYSTEM_PROMPT").ok()?;
+    if prompt.trim().is_empty() {
+        return None;
+    }
+    let path = state.cwd.join(".centaur-extra-system-prompt.md");
+    if let Err(error) = fs::write(&path, prompt) {
+        eprintln!("failed to write CENTAUR_EXTRA_SYSTEM_PROMPT file: {error}");
+        return None;
+    }
+    Some(path)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
     use codex_app_server_protocol::UserInput;
     use serde_json::{Value, json};
 
-    use crate::{HarnessServer, NormalizedContent, NormalizedEvent};
+    use crate::{HarnessServer, NormalizedContent, NormalizedEvent, ThreadState};
 
     use super::{ClaudeCodeHarness, ClaudeEventNormalizer};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn normalize(normalizer: &mut ClaudeEventNormalizer, event: Value) -> Vec<NormalizedEvent> {
         normalizer.normalize(serde_json::from_value(event).unwrap())
@@ -334,6 +357,64 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn test_thread_state(cwd: PathBuf) -> ThreadState {
+        ThreadState {
+            id: "thread-test".to_owned(),
+            cwd,
+            model: "claude-opus-4-test".to_owned(),
+            model_provider: "anthropic".to_owned(),
+            service_tier: None,
+            harness_session_id: None,
+            completed_turns: Vec::new(),
+            process: None,
+            thread_started_sent: false,
+        }
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "centaur-claude-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn command_appends_extra_system_prompt_file_after_agents_md() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cwd = unique_temp_dir();
+        std::fs::write(cwd.join("AGENTS.md"), "internal persona").unwrap();
+        unsafe {
+            std::env::set_var("CENTAUR_EXTRA_SYSTEM_PROMPT", "caller guidance");
+        }
+        let command = ClaudeCodeHarness.command_for_turn(&test_thread_state(cwd.clone()));
+        unsafe {
+            std::env::remove_var("CENTAUR_EXTRA_SYSTEM_PROMPT");
+        }
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let prompt_files = args
+            .windows(2)
+            .filter(|window| window[0] == "--append-system-prompt-file")
+            .map(|window| window[1].clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(prompt_files.len(), 2);
+        assert_eq!(prompt_files[0], "AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(&prompt_files[1]).unwrap(),
+            "caller guidance"
+        );
+        assert_eq!(
+            PathBuf::from(&prompt_files[1]),
+            cwd.join(".centaur-extra-system-prompt.md")
+        );
     }
 
     #[test]

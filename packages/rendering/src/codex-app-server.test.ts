@@ -185,7 +185,7 @@ describe('CodexAppServerRendererEventMapper', () => {
       type: 'item.reasoning.summaryTextDelta',
       itemId: 'reasoning-1',
       summaryIndex: 1,
-      delta: 'Second section.'
+      delta: 'Now committing.'
     })
     expect(events).toEqual([])
   })
