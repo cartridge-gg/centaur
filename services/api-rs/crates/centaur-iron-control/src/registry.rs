@@ -355,6 +355,30 @@ fn token_broker_source(
     Ok(Some(SecretSource::token_broker(credential_id, namespace)))
 }
 
+/// Pass through a typed secret source (any `source` table with a `type`, e.g.
+/// `github_app`): `type` becomes the `source_type` and the remaining string
+/// fields become `config`. Mirrors `centaur_perms::translate::http_source`.
+/// Returns `None` when `source` has no `type` key.
+fn typed_source(source: &YamlValue) -> Option<SecretSource> {
+    let source_type = yaml_str(source, "type")?.to_owned();
+    let mut config = serde_json::Map::new();
+    if let Some(mapping) = source.as_mapping() {
+        for (key, value) in mapping {
+            let (Some(key), Some(value)) = (key.as_str(), value.as_str()) else {
+                continue;
+            };
+            if key != "type" {
+                config.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+            }
+        }
+    }
+    Some(SecretSource {
+        source_type,
+        secret: None,
+        config: serde_json::Value::Object(config),
+    })
+}
+
 fn source_from_secret(
     namespace: &str,
     role: &str,
@@ -372,9 +396,17 @@ fn source_from_secret(
                 yaml_str(source, "json_key"),
             ));
         }
+        // A typed source (e.g. `type = "github_app"`): pass it through verbatim so
+        // iron-control's resolver handles it. Mirrors
+        // `centaur_perms::translate::http_source`, so the api-rs startup reconcile
+        // accepts the same tool-secret shapes the perms CLI registers (without
+        // this, a `github_app` source crashes api-rs at startup).
+        if let Some(typed) = typed_source(source) {
+            return Ok(typed);
+        }
         return Err(malformed(
             role,
-            "secret source must be a placeholder or token_broker reference",
+            "secret source must be a placeholder, token_broker, or typed (type=...) reference",
         ));
     }
     if let Some(proxy_value) = replace_proxy_value(secret) {
@@ -1042,6 +1074,43 @@ transforms:
         assert_eq!(inject.header.as_deref(), Some("Authorization"));
         assert_eq!(inject.formatter.as_deref(), Some("Bearer {{.Value}}"));
         assert!(input.replace_config.is_none());
+    }
+
+    #[test]
+    fn translates_typed_github_app_secret() {
+        // Regression: a `github_app` typed source must register (passed through to
+        // the resolver) rather than crash the api-rs startup reconcile.
+        let fragment = load_fragment_str(
+            r#"
+transforms:
+  - name: secrets
+    config:
+      secrets:
+        - name: GITHUB_TOKEN_BEARER
+          source:
+            type: github_app
+            app_id_env: GITHUB_APP_ID
+            installation_id_env: GITHUB_APP_INSTALLATION_ID
+            private_key_b64_env: GITHUB_APP_PRIVATE_KEY_B64
+          replace: { proxy_value: "Bearer GITHUB_TOKEN", match_headers: [Authorization] }
+          rules: [{ host: github.com }]
+"#,
+        )
+        .unwrap();
+        let inputs =
+            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+        let SecretInput::Static(input) = &inputs[0] else {
+            panic!("expected a static secret");
+        };
+        assert_eq!(input.source.source_type, "github_app");
+        assert_eq!(
+            input.source.config,
+            json!({
+                "app_id_env": "GITHUB_APP_ID",
+                "installation_id_env": "GITHUB_APP_INSTALLATION_ID",
+                "private_key_b64_env": "GITHUB_APP_PRIVATE_KEY_B64",
+            })
+        );
     }
 
     #[test]

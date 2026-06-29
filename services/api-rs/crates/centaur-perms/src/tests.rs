@@ -451,6 +451,41 @@ fn translates_http_replace_to_static_input() {
 }
 
 #[test]
+fn translates_http_source_table_to_static_input() {
+    let secrets = vec![
+        tools::parse_secret(
+            &entry(r#"{type = "http", name = "GITHUB_TOKEN_BEARER", source = {type = "github_app", app_id_env = "GITHUB_APP_ID", installation_id_env = "GITHUB_APP_INSTALLATION_ID", private_key_b64_env = "GITHUB_APP_PRIVATE_KEY_B64"}, replacer = "Bearer GITHUB_TOKEN", match_headers = ["Authorization"], hosts = ["github.com"]}"#),
+            &[],
+        )
+        .unwrap(),
+    ];
+    let ParsedSecret::Http(http) = &secrets[0] else {
+        panic!("expected http")
+    };
+    assert_eq!(
+        http.source
+            .as_ref()
+            .and_then(|s| s.get("type"))
+            .map(String::as_str),
+        Some("github_app")
+    );
+
+    let out = translate::translate("default", "tool-github", &secrets, &SourcePolicy::env());
+    let SecretInput::Static(input) = &out.inputs[0] else {
+        panic!("expected static")
+    };
+    assert_eq!(input.source.source_type, "github_app");
+    assert_eq!(
+        input.source.config,
+        serde_json::json!({
+            "app_id_env": "GITHUB_APP_ID",
+            "installation_id_env": "GITHUB_APP_INSTALLATION_ID",
+            "private_key_b64_env": "GITHUB_APP_PRIVATE_KEY_B64",
+        })
+    );
+}
+
+#[test]
 fn translates_gcp_auth_defaults_scopes_when_unset() {
     let secrets = vec![
         tools::parse_secret(
