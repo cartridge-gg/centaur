@@ -39,11 +39,25 @@ use axum::{
 use centaur_session_core::{
     HarnessType, MessageRole, SessionEvent, SessionMessageInput, ThreadKey, empty_object,
 };
-use centaur_session_runtime::{ExecuteSessionInput, HarnessConflictPolicy};
-use futures_util::{StreamExt, stream};
+use centaur_session_runtime::{
+    ExecuteSessionInput, HarnessConflictPolicy, PendingLocalCall, ResumeState, SessionRuntime,
+    SessionRuntimeError,
+};
+use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// Env flag gating the real local-tool round-trip bridge. Unset/empty leaves the
+/// `/v1/responses` ingress behavior byte-for-byte unchanged.
+const LOCAL_TOOLS_FLAG: &str = "CENTAUR_SANDBOX_LOCAL_TOOLS";
+
+fn local_tools_enabled() -> bool {
+    std::env::var(LOCAL_TOOLS_FLAG)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
 
 use crate::{ApiError, error::error_chain, routes::AppState};
 use translate::{ResponsesTranslator, usage_object};
@@ -158,6 +172,61 @@ pub(crate) async fn create_response(
     // Centaur's. Honoring them via a Codex harness mapping is a follow-up.
     let _decorative = (&request.model, &request.instructions, &request.tools);
     let runtime = state.runtime()?;
+
+    // Local-tool bridge (gated). Record the client's advertised tools so the
+    // sandbox model proxy can inject them, and detect a RESUME: a request whose
+    // input carries `function_call_output`(s) the bridge is still blocked on. In
+    // that case we steer the result back into the suspended proxy sub-loop and
+    // continue streaming the same execution from where it left off, rather than
+    // starting a new turn.
+    if local_tools_enabled() {
+        let tool_count = request
+            .tools
+            .as_ref()
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        tracing::info!(
+            thread_key = %thread_key,
+            local_tool_count = tool_count,
+            "local-tool bridge: recording client tools"
+        );
+        runtime.bridge_set_local_tools(thread_key.as_str(), request.tools.clone());
+        let outputs = function_call_outputs(&request.input);
+        let mut resolved_any = false;
+        for (call_id, output) in &outputs {
+            let matched =
+                runtime.bridge_resolve_result(thread_key.as_str(), call_id, output.clone());
+            tracing::info!(
+                thread_key = %thread_key,
+                call_id = %call_id,
+                matched,
+                "local-tool bridge: resolve function_call_output"
+            );
+            if matched {
+                resolved_any = true;
+            }
+        }
+        if resolved_any
+            && request.stream
+            && let Some(resume) = runtime.bridge_take_exec(thread_key.as_str())
+        {
+            let events = runtime
+                .stream_events(&thread_key, resume.next_offset, Some(&resume.execution_id))
+                .await
+                .map_err(ResponsesHttpError::internal)?;
+            let response_id = format!("resp_{}", Uuid::new_v4());
+            let translator = ResponsesTranslator::new(response_id, request.model.clone());
+            return Ok(bridge_stream_response(
+                events,
+                translator,
+                runtime,
+                thread_key,
+                resume.execution_id,
+            ));
+        }
+    }
+
     let _outcome = runtime
         .create_or_get_session(
             &thread_key,
@@ -211,6 +280,20 @@ pub(crate) async fn create_response(
 
     let response_id = format!("resp_{}", Uuid::new_v4());
     if request.stream {
+        // Flag on: merge the execution event stream with the bridge's outbound
+        // local-tool calls so a `local__` call suspends the turn as a
+        // `function_call` for the client to execute. Flag off: the original
+        // text-only translator unfold below, byte-for-byte unchanged.
+        if local_tools_enabled() {
+            let translator = ResponsesTranslator::new(response_id, request.model.clone());
+            return Ok(bridge_stream_response(
+                events,
+                translator,
+                runtime,
+                thread_key,
+                execution.execution_id,
+            ));
+        }
         let thread_key_for_log = thread_key.clone();
         let translator = Arc::new(Mutex::new(ResponsesTranslator::new(
             response_id,
@@ -422,6 +505,172 @@ fn is_terminal_session_event(event: &SessionEvent) -> bool {
     )
 }
 
+/// Extract `(call_id, output)` pairs from any `function_call_output` items in the
+/// request input. These are the results the client computed for `function_call`s
+/// the bridge previously surfaced. A bare-string input never carries them.
+fn function_call_outputs(input: &ResponsesInput) -> Vec<(String, String)> {
+    let ResponsesInput::Items(items) = input else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .filter_map(|item| {
+            let call_id = item.get("call_id").and_then(Value::as_str)?.to_owned();
+            let output = match item.get("output") {
+                Some(Value::String(text)) => text.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            };
+            Some((call_id, output))
+        })
+        .collect()
+}
+
+/// Streaming state for the local-tool bridge path: it merges the suspendable
+/// execution event stream with the bridge's outbound local-tool calls.
+struct BridgeStreamState {
+    events: std::pin::Pin<Box<dyn Stream<Item = Result<SessionEvent, SessionRuntimeError>> + Send>>,
+    outbound: Option<mpsc::UnboundedReceiver<PendingLocalCall>>,
+    translator: ResponsesTranslator,
+    runtime: SessionRuntime,
+    thread_key: ThreadKey,
+    execution_id: String,
+    last_event_id: i64,
+    done: bool,
+}
+
+/// Await the next outbound local call, or block forever when the receiver has
+/// been taken/closed (so the `biased` select falls through to the event stream).
+async fn recv_outbound(
+    outbound: &mut Option<mpsc::UnboundedReceiver<PendingLocalCall>>,
+) -> Option<PendingLocalCall> {
+    match outbound {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Stream a (possibly suspendable) execution to the client, merging the bridge's
+/// outbound local-tool calls. When a local call arrives it is emitted as a
+/// `function_call` and the turn ends; the execution stays blocked in the proxy
+/// sub-loop and a `ResumeState` is recorded so the client's follow-up request
+/// (carrying the `function_call_output`) resumes streaming from the same offset.
+fn bridge_stream_response(
+    events: impl Stream<Item = Result<SessionEvent, SessionRuntimeError>> + Send + 'static,
+    translator: ResponsesTranslator,
+    runtime: SessionRuntime,
+    thread_key: ThreadKey,
+    execution_id: String,
+) -> Response {
+    let outbound = runtime.bridge_take_outbound(thread_key.as_str());
+    let state = BridgeStreamState {
+        events: Box::pin(events),
+        outbound,
+        translator,
+        runtime,
+        thread_key,
+        execution_id,
+        last_event_id: 0,
+        done: false,
+    };
+
+    let stream = stream::unfold(state, |mut state| async move {
+        if state.done {
+            return None;
+        }
+        let events_out: Vec<Result<Event, Infallible>> = loop {
+            tokio::select! {
+                biased;
+                maybe_event = state.events.next() => {
+                    match maybe_event {
+                        Some(Ok(event)) => {
+                            state.last_event_id = state.last_event_id.max(event.event_id);
+                            let terminal = is_terminal_session_event(&event);
+                            let translated = state
+                                .translator
+                                .translate_session_event(&event)
+                                .into_iter()
+                                .map(|event| Ok(event.into_sse_event()))
+                                .collect::<Vec<_>>();
+                            if terminal {
+                                // Execution finished without a pending local call;
+                                // the bridge for this turn is done.
+                                state.runtime.bridge_clear(state.thread_key.as_str());
+                                state.done = true;
+                            }
+                            break translated;
+                        }
+                        Some(Err(error)) => {
+                            tracing::error!(
+                                thread_key = %state.thread_key,
+                                error = %error_chain(&error),
+                                "session event stream failed"
+                            );
+                            state.done = true;
+                            break vec![Ok(
+                                translate::stream_error_event("event stream failed").into_sse_event(),
+                            )];
+                        }
+                        None => return None,
+                    }
+                }
+                maybe_call = recv_outbound(&mut state.outbound) => {
+                    match maybe_call {
+                        Some(call) => {
+                            tracing::info!(
+                                thread_key = %state.thread_key,
+                                call_id = %call.call_id,
+                                name = %call.name,
+                                "local-tool bridge: emitting local tool_use to client (suspend)"
+                            );
+                            let mut buf = Vec::new();
+                            state.translator.emit_function_call(
+                                &call.name,
+                                &call.call_id,
+                                &call.arguments,
+                                &mut buf,
+                            );
+                            // Record where to resume and hand the outbound receiver
+                            // back so the client's follow-up request can keep merging
+                            // further calls from the same execution.
+                            state.runtime.bridge_set_exec(
+                                state.thread_key.as_str(),
+                                ResumeState {
+                                    execution_id: state.execution_id.clone(),
+                                    next_offset: state.last_event_id,
+                                },
+                            );
+                            if let Some(rx) = state.outbound.take() {
+                                state
+                                    .runtime
+                                    .bridge_restore_outbound(state.thread_key.as_str(), rx);
+                            }
+                            state.done = true;
+                            break buf
+                                .into_iter()
+                                .map(|event| Ok(event.into_sse_event()))
+                                .collect::<Vec<_>>();
+                        }
+                        None => {
+                            // Outbound channel closed: stop selecting it and await
+                            // only execution events from here on.
+                            state.outbound = None;
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+        Some((events_out, state))
+    })
+    .flat_map(stream::iter);
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderMap;
@@ -452,6 +701,27 @@ mod tests {
     fn falls_back_to_prompt_cache_key() {
         let key = thread_key_from_request(&HeaderMap::new(), &req(Some("pck-1"))).unwrap();
         assert_eq!(key.as_str(), "api:codex:pck-1");
+    }
+
+    #[test]
+    fn function_call_outputs_extracts_call_id_and_string_output() {
+        let input = ResponsesInput::Items(vec![
+            json!({"type": "message", "role": "user", "content": "hi"}),
+            json!({"type": "function_call_output", "call_id": "call_a", "output": "stdout-a"}),
+            json!({"type": "function_call_output", "call_id": "call_b", "output": {"k": 1}}),
+            json!({"type": "function_call", "call_id": "call_a", "name": "exec_command"}),
+        ]);
+        let pairs = function_call_outputs(&input);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("call_a".to_owned(), "stdout-a".to_owned()));
+        // Non-string outputs are serialized.
+        assert_eq!(pairs[1].0, "call_b");
+        assert_eq!(pairs[1].1, r#"{"k":1}"#);
+    }
+
+    #[test]
+    fn function_call_outputs_empty_for_text_input() {
+        assert!(function_call_outputs(&ResponsesInput::Text("hi".to_owned())).is_empty());
     }
 
     #[test]

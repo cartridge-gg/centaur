@@ -1462,6 +1462,39 @@ impl PgSessionStore {
         Ok(())
     }
 
+    /// List warm sandboxes left over from a previous deploy generation: any
+    /// non-`claimed` warm sandbox whose `workload_key` differs from the current
+    /// generation's. On a redeploy the sandbox image (and thus `workload_key`)
+    /// changes, so the new generation never claims/replenishes against the old
+    /// key — its `ready`/`failed` sandboxes would otherwise linger until the
+    /// max-lifetime sweep. `claimed` rows are excluded so active sessions that
+    /// claimed a pre-redeploy sandbox are never reaped.
+    pub async fn list_reapable_stale_warm_sandboxes(
+        &self,
+        current_workload_key: &str,
+    ) -> Result<Vec<String>, SessionStoreError> {
+        let ids = sqlx::query_scalar::<_, String>(
+            r#"
+            select sandbox_id
+            from session_warm_sandboxes
+            where status <> 'claimed' and workload_key <> $1
+            "#,
+        )
+        .bind(current_workload_key)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
+    }
+
+    /// Delete a warm sandbox row (after its sandbox has been stopped).
+    pub async fn delete_warm_sandbox(&self, sandbox_id: &str) -> Result<(), SessionStoreError> {
+        sqlx::query("delete from session_warm_sandboxes where sandbox_id = $1")
+            .bind(sandbox_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn update_harness_thread_id(
         &self,
         thread_key: &ThreadKey,
