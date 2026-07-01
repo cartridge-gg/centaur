@@ -1,7 +1,7 @@
 mod activity_summary;
 mod args;
 
-use centaur_api_server::{AppState, build_router_with_app_state};
+use centaur_api_server::{AppState, SandboxModelAuthMode, build_router_with_app_state};
 use centaur_session_runtime::SessionRuntime;
 use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::{TelemetryConfig, init_telemetry};
@@ -19,13 +19,19 @@ async fn main() -> Result<(), ServerError> {
     let telemetry = init_telemetry(TelemetryConfig::from_env())?;
 
     let args = Args::parse();
+    let api_config = args.api_config();
+    if api_config.sandbox_model_auth == SandboxModelAuthMode::Off {
+        tracing::warn!(
+            "CENTAUR_SANDBOX_MODEL_AUTH=off: sandbox model proxy accepts unauthenticated requests"
+        );
+    }
     let listener = TcpListener::bind(args.server.bind_addr).await?;
     info!(
         bind_addr = %args.server.bind_addr,
         "starting centaur api-rs server"
     );
 
-    let app_state = AppState::unready()
+    let app_state = AppState::unready_with_config(api_config)
         .with_codex_nanocodex_rollout_percent(args.codex_nanocodex_rollout_percent());
     let app = build_router_with_app_state(app_state.clone());
     let shutdown_state = app_state.clone();

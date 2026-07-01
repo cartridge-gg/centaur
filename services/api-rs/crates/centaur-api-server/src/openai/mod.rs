@@ -171,6 +171,7 @@ pub(crate) async fn create_response(
     // requests, and the client instructions are the Codex CLI persona, not
     // Centaur's. Honoring them via a Codex harness mapping is a follow-up.
     let _decorative = (&request.model, &request.instructions, &request.tools);
+    let config = state.config().clone();
     let runtime = state.runtime()?;
 
     // Local-tool bridge (gated). Record the client's advertised tools so the
@@ -265,8 +266,8 @@ pub(crate) async fn create_response(
                 idempotency_key: None,
                 metadata: None,
                 input_lines: vec![input_line],
-                idle_timeout_ms: None,
-                max_duration_ms: None,
+                idle_timeout_ms: Some(config.v1_idle_timeout_ms),
+                max_duration_ms: Some(config.v1_max_duration_ms),
                 model: None,
                 system_prompt: None,
             },
