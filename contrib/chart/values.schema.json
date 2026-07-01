@@ -261,6 +261,15 @@
     "apiRs": {
       "type": "object",
       "properties": {
+        "enabled": { "type": "boolean" },
+        "replicaCount": { "type": "integer" },
+        "allowMultiReplica": { "type": "boolean" },
+        "v1Auth": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        },
         "syncInfraSecrets": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },
