@@ -18,7 +18,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response, Sse,
@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
@@ -73,6 +74,7 @@ use crate::{
 pub struct AppState {
     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
     metrics: PrometheusHandle,
+    config: Arc<ApiServerConfig>,
 }
 
 #[derive(Clone)]
@@ -82,11 +84,45 @@ struct AppRuntimeState {
     pool: Option<PgPool>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiServerConfig {
+    pub v1_api_key: Option<String>,
+    pub v1_allow_unauthenticated: bool,
+    pub v1_idle_timeout_ms: u64,
+    pub v1_max_duration_ms: u64,
+    pub sandbox_model_auth: SandboxModelAuthMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxModelAuthMode {
+    Required,
+    Off,
+}
+
+impl Default for ApiServerConfig {
+    fn default() -> Self {
+        Self {
+            v1_api_key: None,
+            v1_allow_unauthenticated: false,
+            // Matches centaur-workflows DEFAULT_AGENT_IDLE_TIMEOUT_MS.
+            v1_idle_timeout_ms: 60_000,
+            // Matches centaur-workflows DEFAULT_AGENT_MAX_DURATION_MS.
+            v1_max_duration_ms: 1_800_000,
+            sandbox_model_auth: SandboxModelAuthMode::Required,
+        }
+    }
+}
+
 impl AppState {
     pub fn unready() -> Self {
+        Self::unready_with_config(ApiServerConfig::default())
+    }
+
+    pub fn unready_with_config(config: ApiServerConfig) -> Self {
         Self {
             initialized: Arc::new(RwLock::new(None)),
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
+            config: Arc::new(config),
         }
     }
 
@@ -155,7 +191,7 @@ impl AppState {
             .ok_or_else(|| ApiError::BadRequest("workflow runtime is not enabled".to_owned()))
     }
 
-    fn pool(&self) -> Result<PgPool, ApiError> {
+    pub(crate) fn pool(&self) -> Result<PgPool, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -163,9 +199,14 @@ impl AppState {
             ApiError::BadRequest("database-backed admin routes are not enabled".to_owned())
         })
     }
+
+    pub(crate) fn config(&self) -> &ApiServerConfig {
+        &self.config
+    }
 }
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_V1_BODY_BYTES: usize = 32 * 1024 * 1024;
 const REDACTED_WEBHOOK_HEADERS: &[&str] = &[
     "authorization",
     "cookie",
@@ -215,18 +256,22 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         )
         .route(
             "/v1/messages",
-            post(anthropic::anthropic_messages).layer(DefaultBodyLimit::disable()),
+            post(anthropic::anthropic_messages)
+                .layer(DefaultBodyLimit::max(MAX_V1_BODY_BYTES))
+                .layer(middleware::from_fn_with_state(state.clone(), v1_auth)),
         )
         .route(
             "/v1/responses",
-            post(openai::create_response).layer(DefaultBodyLimit::disable()),
+            post(openai::create_response)
+                .layer(DefaultBodyLimit::max(MAX_V1_BODY_BYTES))
+                .layer(middleware::from_fn_with_state(state.clone(), v1_auth)),
         )
         // Transparent reverse-proxy for the sandbox agent's model calls (step 1
         // of local<->sandbox tool unification). Lets Centaur sit on the
         // sandbox->model path so it can later inject/route client tools.
         .route(
             "/sandbox/model/{*rest}",
-            any(proxy_sandbox_model).layer(DefaultBodyLimit::disable()),
+            any(proxy_sandbox_model).layer(DefaultBodyLimit::max(MAX_V1_BODY_BYTES)),
         )
         // Egress-pivot landing: codex ignores config.toml base_url, so its model
         // calls can only be routed to Centaur at the network layer (CoreDNS
@@ -234,7 +279,8 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         // `/backend-api/...` path. Inert (404) until CENTAUR_HYDRA_PATH_PROXY is set.
         .route(
             "/backend-api/{*rest}",
-            any(crate::model_proxy::proxy_hydra_ingress).layer(DefaultBodyLimit::disable()),
+            any(crate::model_proxy::proxy_hydra_ingress)
+                .layer(DefaultBodyLimit::max(MAX_V1_BODY_BYTES)),
         )
         .route(
             "/api/session/{thread_key}",
@@ -369,6 +415,92 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         )
         .layer(middleware::from_fn(http_metrics))
         .with_state(state)
+}
+
+async fn v1_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_owned();
+    match verify_v1_auth(state.config(), req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(error) => v1_auth_error_response(&path, error),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum V1AuthError {
+    MissingConfiguration,
+    InvalidApiKey,
+}
+
+fn verify_v1_auth(config: &ApiServerConfig, headers: &HeaderMap) -> Result<(), V1AuthError> {
+    let Some(expected) = config
+        .v1_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return if config.v1_allow_unauthenticated {
+            Ok(())
+        } else {
+            Err(V1AuthError::MissingConfiguration)
+        };
+    };
+
+    let x_api_key = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().strip_prefix("Bearer "))
+        .map(str::trim);
+
+    if x_api_key
+        .into_iter()
+        .chain(bearer)
+        .any(|candidate| v1_constant_time_eq(candidate, expected))
+    {
+        Ok(())
+    } else {
+        Err(V1AuthError::InvalidApiKey)
+    }
+}
+
+fn v1_constant_time_eq(candidate: &str, expected: &str) -> bool {
+    candidate.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
+fn v1_auth_error_response(path: &str, error: V1AuthError) -> Response {
+    let message = match error {
+        V1AuthError::MissingConfiguration => {
+            "CENTAUR_V1_API_KEY is not set; set it or explicitly allow unauthenticated /v1 access"
+        }
+        V1AuthError::InvalidApiKey => "invalid API key",
+    };
+    if path.starts_with("/v1/messages") {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "authentication_error",
+                    "message": message,
+                },
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "code": "invalid_api_key",
+                    "message": message,
+                },
+            })),
+        )
+            .into_response()
+    }
 }
 
 async fn healthz(headers: HeaderMap) -> Json<Value> {
@@ -3732,6 +3864,42 @@ mod slack_archive_import_tests {
 #[cfg(test)]
 mod webhook_tests {
     use super::*;
+
+    #[test]
+    fn v1_auth_fails_closed_without_key_unless_explicitly_allowed() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            verify_v1_auth(&ApiServerConfig::default(), &headers),
+            Err(V1AuthError::MissingConfiguration)
+        );
+
+        let config = ApiServerConfig {
+            v1_allow_unauthenticated: true,
+            ..ApiServerConfig::default()
+        };
+        assert_eq!(verify_v1_auth(&config, &headers), Ok(()));
+    }
+
+    #[test]
+    fn v1_auth_rejects_wrong_key_and_accepts_both_header_forms() {
+        let config = ApiServerConfig {
+            v1_api_key: Some("secret".to_owned()),
+            ..ApiServerConfig::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "wrong".parse().unwrap());
+        assert_eq!(
+            verify_v1_auth(&config, &headers),
+            Err(V1AuthError::InvalidApiKey)
+        );
+
+        headers.insert("x-api-key", "secret".parse().unwrap());
+        assert_eq!(verify_v1_auth(&config, &headers), Ok(()));
+
+        headers.remove("x-api-key");
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+        assert_eq!(verify_v1_auth(&config, &headers), Ok(()));
+    }
 
     #[test]
     fn session_thread_key_from_path_decodes_session_routes() {
