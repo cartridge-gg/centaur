@@ -160,9 +160,9 @@ impl AnthropicTranslator {
                     }
                 }
                 Some("tool_use") => self.emit_tool_use(block, out),
-                Some("tool_result") => self.emit_tool_result(block, out),
+                Some("tool_result") => self.emit_tool_result_text(block, out),
                 _ if block.get("tool_use_id").and_then(Value::as_str).is_some() => {
-                    self.emit_tool_result(block, out);
+                    self.emit_tool_result_text(block, out);
                 }
                 _ => {}
             }
@@ -312,13 +312,12 @@ impl AnthropicTranslator {
         out.push(content_block_stop(index));
     }
 
-    fn emit_tool_result(&mut self, block: &Value, out: &mut Vec<AnthropicStreamEvent>) {
+    fn emit_tool_result_text(&mut self, block: &Value, out: &mut Vec<AnthropicStreamEvent>) {
         self.close_open_block(out);
-        let index = self.next_content_index();
-        let content_block = block.clone();
-        self.content.push(content_block.clone());
-        out.push(content_block_start(index, content_block));
-        out.push(content_block_stop(index));
+        let formatted = formatted_tool_result_text(block);
+        self.open_text_block(out);
+        self.emit_text_delta(&formatted, out);
+        self.close_open_block(out);
     }
 
     fn open_text_block(&mut self, out: &mut Vec<AnthropicStreamEvent>) {
@@ -342,7 +341,7 @@ impl AnthropicTranslator {
         }
         self.close_open_block(out);
         let index = self.next_content_index();
-        let block = json!({"type": "thinking", "thinking": ""});
+        let block = json!({"type": "thinking", "thinking": "", "signature": ""});
         self.content.push(block.clone());
         self.open_block = Some(OpenBlock {
             kind: OpenBlockKind::Thinking,
@@ -353,6 +352,19 @@ impl AnthropicTranslator {
 
     pub fn close_open_block(&mut self, out: &mut Vec<AnthropicStreamEvent>) {
         if let Some(open) = self.open_block.take() {
+            if open.kind == OpenBlockKind::Thinking {
+                out.push(AnthropicStreamEvent {
+                    name: "content_block_delta",
+                    data: json!({
+                        "type": "content_block_delta",
+                        "index": open.index,
+                        // Empty signature is intentional: blocks echoed back to this
+                        // ingress are not verified; they must merely parse in strict
+                        // SDK unions.
+                        "delta": {"type": "signature_delta", "signature": ""},
+                    }),
+                });
+            }
             out.push(content_block_stop(open.index));
         }
     }
@@ -408,6 +420,17 @@ impl AnthropicTranslator {
         });
     }
 
+    pub fn unexpected_stream_end(&mut self) -> Vec<AnthropicStreamEvent> {
+        let mut out = Vec::new();
+        self.close_open_block(&mut out);
+        out.push(error_event(
+            "overloaded_error",
+            "session event stream ended unexpectedly",
+        ));
+        self.message_stop(&mut out);
+        out
+    }
+
     fn next_content_index(&mut self) -> usize {
         let index = self.next_index;
         self.next_index += 1;
@@ -423,6 +446,40 @@ impl AnthropicTranslator {
             *current = json!(format!("{text}{value}"));
         }
     }
+}
+
+fn formatted_tool_result_text(block: &Value) -> String {
+    let tool_use_id =
+        string_at_path(block, &["tool_use_id"]).unwrap_or_else(|| "unknown".to_owned());
+    let mut result_text = match block.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    if block
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        result_text = format!("ERROR: {result_text}");
+    }
+    result_text = truncate_tool_result(&result_text);
+    format!("[tool result: {tool_use_id}]\n{result_text}")
+}
+
+fn truncate_tool_result(text: &str) -> String {
+    const MAX_TOOL_RESULT_CHARS: usize = 4000;
+    if text.chars().count() <= MAX_TOOL_RESULT_CHARS {
+        return text.to_owned();
+    }
+    let mut truncated = text.chars().take(MAX_TOOL_RESULT_CHARS).collect::<String>();
+    truncated.push_str("…[truncated]");
+    truncated
 }
 
 fn content_block_start(index: usize, content_block: Value) -> AnthropicStreamEvent {
@@ -570,13 +627,15 @@ mod tests {
                 "ping",
                 "content_block_start",
                 "content_block_delta",
+                "content_block_delta",
                 "content_block_stop",
                 "content_block_start",
                 "content_block_delta",
             ]
         );
         assert_eq!(out[3].data["delta"]["type"], json!("thinking_delta"));
-        assert_eq!(out[6].data["delta"]["type"], json!("text_delta"));
+        assert_eq!(out[4].data["delta"]["type"], json!("signature_delta"));
+        assert_eq!(out[7].data["delta"]["type"], json!("text_delta"));
     }
 
     #[test]
@@ -610,13 +669,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_tool_result_is_surfaced_as_own_block() {
-        let out = translate(vec![output(json!({
+    fn claude_tool_result_is_surfaced_as_text_block() {
+        let mut translator = AnthropicTranslator::new("msg_test", "claude-test");
+        let out = translator.translate_session_event(&output(json!({
             "type":"user",
             "message":{"content":[
                 {"type":"tool_result","tool_use_id":"toolu_1","content":"done"}
             ]}
-        }))]);
+        })));
 
         assert_eq!(
             names(&out),
@@ -624,10 +684,86 @@ mod tests {
                 "message_start",
                 "ping",
                 "content_block_start",
+                "content_block_delta",
                 "content_block_stop"
             ]
         );
-        assert_eq!(out[2].data["content_block"]["type"], json!("tool_result"));
+        assert_eq!(out[2].data["content_block"]["type"], json!("text"));
+        let text = out[3].data["delta"]["text"].as_str().unwrap();
+        assert_eq!(text, "[tool result: toolu_1]\ndone");
+        assert_eq!(
+            translator.content()[0],
+            json!({"type": "text", "text": "[tool result: toolu_1]\ndone"})
+        );
+    }
+
+    #[test]
+    fn thinking_blocks_emit_signature_delta_and_final_signature() {
+        let mut translator = AnthropicTranslator::new("msg_test", "claude-test");
+        let out = translator.translate_session_event(&output(json!({
+            "type":"assistant",
+            "message":{"content":[{"type":"thinking","thinking":"considering"}]}
+        })));
+        let mut close = Vec::new();
+        translator.close_open_block(&mut close);
+
+        assert_eq!(out[2].data["content_block"]["signature"], json!(""));
+        assert_eq!(close[0].name, "content_block_delta");
+        assert_eq!(close[0].data["delta"]["type"], json!("signature_delta"));
+        assert_eq!(close[0].data["delta"]["signature"], json!(""));
+        assert_eq!(close[1].name, "content_block_stop");
+        assert_eq!(translator.content()[0]["signature"], json!(""));
+    }
+
+    #[test]
+    fn divergent_completed_text_reopens_fresh_block() {
+        let mut translator = AnthropicTranslator::new("msg_test", "claude-test");
+        let mut out = Vec::new();
+        for event in [
+            event("session.execution_started", json!({})),
+            output(json!({"type":"item.agentMessage.delta","delta":"draft"})),
+            output(
+                json!({"type":"item.completed","item":{"type":"agentMessage","text":"replacement","phase":"final_answer"}}),
+            ),
+        ] {
+            out.extend(translator.translate_session_event(&event));
+        }
+
+        let starts = out
+            .iter()
+            .filter(|event| event.name == "content_block_start")
+            .count();
+        assert_eq!(starts, 2);
+        let text = out
+            .iter()
+            .filter(|event| event.name == "content_block_delta")
+            .map(|event| event.data["delta"]["text"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(text, vec!["draft", "replacement"]);
+        assert_eq!(translator.content()[0]["text"], json!("draft"));
+        assert_eq!(translator.content()[1]["text"], json!("replacement"));
+    }
+
+    #[test]
+    fn multi_message_turn_does_not_duplicate() {
+        let out = translate(vec![
+            event("session.execution_started", json!({})),
+            output(json!({"method":"item/agentMessage/delta","params":{"delta":"Checking"}})),
+            output(
+                json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"Checking"}}}),
+            ),
+            output(json!({"method":"item/agentMessage/delta","params":{"delta":"Answer"}})),
+            output(
+                json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"Answer"}}}),
+            ),
+            event("session.execution_completed", json!({})),
+        ]);
+        let text = out
+            .iter()
+            .filter(|event| event.name == "content_block_delta")
+            .map(|event| event.data["delta"]["text"].as_str().unwrap_or(""))
+            .collect::<String>();
+        assert_eq!(text, "Checking\n\nAnswer");
     }
 
     #[test]
