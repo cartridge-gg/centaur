@@ -303,15 +303,24 @@ pub(crate) async fn create_response(
         let events = Box::pin(events);
         let stream = stream::unfold(
             (events, false, translator, thread_key_for_log),
-            |(mut events, done, translator, thread_key_for_log)| async move {
-                if done {
+            |(mut events, terminal_emitted, translator, thread_key_for_log)| async move {
+                if terminal_emitted {
                     return None;
                 }
-                let result = events.as_mut().next().await?;
+                let Some(result) = events.as_mut().next().await else {
+                    let events_out = translator
+                        .lock()
+                        .expect("Responses translator mutex poisoned")
+                        .unexpected_stream_end()
+                        .into_iter()
+                        .map(|event| Ok(event.into_sse_event()))
+                        .collect::<Vec<Result<Event, Infallible>>>();
+                    return Some((events_out, (events, true, translator, thread_key_for_log)));
+                };
                 let thread_key = thread_key_for_log.clone();
-                let (events_out, done) = match result {
+                let (events_out, terminal_emitted) = match result {
                     Ok(event) => {
-                        let done = is_terminal_session_event(&event);
+                        let terminal_emitted = is_terminal_session_event(&event);
                         let events = translator
                             .lock()
                             .expect("Responses translator mutex poisoned")
@@ -319,7 +328,7 @@ pub(crate) async fn create_response(
                             .into_iter()
                             .map(|event| Ok(event.into_sse_event()))
                             .collect::<Vec<Result<Event, Infallible>>>();
-                        (events, done)
+                        (events, terminal_emitted)
                     }
                     Err(error) => {
                         tracing::error!(
@@ -334,7 +343,10 @@ pub(crate) async fn create_response(
                         )
                     }
                 };
-                Some((events_out, (events, done, translator, thread_key_for_log)))
+                Some((
+                    events_out,
+                    (events, terminal_emitted, translator, thread_key_for_log),
+                ))
             },
         )
         .flat_map(stream::iter);
@@ -613,7 +625,15 @@ fn bridge_stream_response(
                                 translate::stream_error_event("event stream failed").into_sse_event(),
                             )];
                         }
-                        None => return None,
+                        None => {
+                            state.done = true;
+                            break state
+                                .translator
+                                .unexpected_stream_end()
+                                .into_iter()
+                                .map(|event| Ok(event.into_sse_event()))
+                                .collect::<Vec<_>>();
+                        }
                     }
                 }
                 maybe_call = recv_outbound(&mut state.outbound) => {
