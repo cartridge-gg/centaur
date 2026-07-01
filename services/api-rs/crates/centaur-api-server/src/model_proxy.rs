@@ -1,6 +1,11 @@
 //! Reverse-proxy for the sandbox agent's model calls, with optional injection
 //! and routing of "local" tools.
 //!
+//! This module and `centaur_session_runtime::local_tool_bridge` share in-process
+//! bridge state. api-rs must run as a single replica (or behind sticky routing);
+//! otherwise the sandbox proxy request can land on one replica while the
+//! `/v1/responses` oneshot resolver lands on another, timing out as a 504.
+//!
 //! Step 1 (transparent pass-through): `/sandbox/model/<rest>` ->
 //! `CENTAUR_SANDBOX_MODEL_UPSTREAM`/<rest> (default hydra's `backend-api/codex`).
 //! Replaces the incoming `Authorization` with the real `HYDRA_API_KEY` (the
@@ -18,13 +23,18 @@ use std::{env, time::Duration};
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use centaur_session_runtime::{PendingLocalCall, SessionRuntime};
+use centaur_session_sqlx::{PgSessionStore, WarmSandboxAuthRecord};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
-use crate::routes::AppState;
+use crate::{
+    SandboxModelAuthMode,
+    routes::{AppState, MAX_V1_BODY_BYTES},
+};
 
 /// Shared client for the sandbox model-proxy.
 static MODEL_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -83,22 +93,32 @@ pub async fn proxy_sandbox_model(State(state): State<AppState>, req: Request) ->
         .unwrap_or(path_and_query);
     // A caller may embed the session's thread_key as a leading
     // `/s/{enc}` path segment. Strip it off so the
-    // upstream path is byte-for-byte what it would be without the segment. For
-    // this increment the extracted thread_key is only logged.
+    // upstream path is byte-for-byte what it would be without the segment.
     let (session_thread_key, forward_path) = parse_session_path(rest);
     if let Some(thread_key) = &session_thread_key {
         tracing::debug!(thread_key = %thread_key, "sandbox model proxy: session-scoped request");
     }
+    let auth_thread_key = match authorize_model_proxy_request(
+        &state,
+        &parts.headers,
+        session_thread_key.as_deref(),
+        "sandbox model proxy",
+    )
+    .await
+    {
+        Ok(thread_key) => thread_key,
+        Err(response) => return response,
+    };
     let upstream = env::var("CENTAUR_SANDBOX_MODEL_UPSTREAM")
         .unwrap_or_else(|_| "https://hydra.64.34.84.225.sslip.io/backend-api/codex".to_string());
     let url = format!("{}{}", upstream.trim_end_matches('/'), forward_path);
 
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_V1_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
             return (
-                StatusCode::BAD_REQUEST,
-                format!("model proxy: bad body: {err}"),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("model proxy: body exceeds {MAX_V1_BODY_BYTES} bytes: {err}"),
             )
                 .into_response();
         }
@@ -115,16 +135,10 @@ pub async fn proxy_sandbox_model(State(state): State<AppState>, req: Request) ->
     let real_enabled = env_flag("CENTAUR_SANDBOX_LOCAL_TOOLS");
     let stub_enabled = env_flag("CENTAUR_SANDBOX_LOCAL_TOOLS_STUB");
 
-    // Real local-tool routing (step 3) takes precedence over the step-2 stub. It
-    // requires a session thread_key (to reach the right bridge) and the live
-    // runtime; if either is missing we fall through to the stub/transparent path.
-    //
-    // Two ways to associate a request to its session:
-    //   1. an explicit `/s/{enc}` path segment (per-session base_url; legacy), or
-    //   2. the generic egress path — read `prompt_cache_key` (== the sandbox codex
-    //      thread_id == the session's `harness_thread_id`) off the Responses body
-    //      and reverse-map it to the thread_key via the runtime. This is the
-    //      warm-pool-safe association used by the generic proxy base_url.
+    // Real local-tool routing (step 3) takes precedence over the step-2 stub.
+    // In required auth mode the session thread_key comes from the warm sandbox
+    // token. In rollback mode (`CENTAUR_SANDBOX_MODEL_AUTH=off`) we preserve the
+    // legacy prompt_cache_key/session-path association.
     if is_responses
         && real_enabled
         && let Ok(runtime) = state.runtime()
@@ -133,9 +147,15 @@ pub async fn proxy_sandbox_model(State(state): State<AppState>, req: Request) ->
         // to the streaming transparent pass-through below.
         && (session_thread_key.is_some() || runtime.any_local_tools_active())
     {
-        let thread_key = match session_thread_key.as_deref() {
-            Some(tk) => Some(tk.to_owned()),
-            None => resolve_thread_key_from_body(&runtime, &body_bytes).await,
+        let thread_key = match auth_thread_key {
+            Some(thread_key) => {
+                warn_if_prompt_cache_key_disagrees(&runtime, &body_bytes, &thread_key);
+                Some(thread_key)
+            }
+            None => match session_thread_key.as_deref() {
+                Some(tk) => Some(tk.to_owned()),
+                None => resolve_thread_key_from_body(&runtime, &body_bytes).await,
+            },
         };
         // Only engage the (buffering, non-streaming) local-tool sub-loop when this
         // session actually advertised local tools. With a generic proxy base_url
@@ -291,7 +311,7 @@ fn build_outbound(
 /// network layer (CoreDNS). This handler is the Centaur-side landing for that.
 /// It is transparent for now; session identification + local-tool bridge
 /// routing on the hydra path are the remaining work.
-pub(crate) async fn proxy_hydra_ingress(req: Request) -> Response {
+pub(crate) async fn proxy_hydra_ingress(State(state): State<AppState>, req: Request) -> Response {
     let enabled = env::var("CENTAUR_HYDRA_PATH_PROXY")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
@@ -304,16 +324,31 @@ pub(crate) async fn proxy_hydra_ingress(req: Request) -> Response {
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
+    let (session_thread_key, _) = parse_session_path(
+        path_and_query
+            .strip_prefix("/backend-api")
+            .unwrap_or(path_and_query),
+    );
+    if let Err(response) = authorize_model_proxy_request(
+        &state,
+        &parts.headers,
+        session_thread_key.as_deref(),
+        "hydra path proxy",
+    )
+    .await
+    {
+        return response;
+    }
     let upstream = env::var("CENTAUR_HYDRA_REAL_UPSTREAM")
         .unwrap_or_else(|_| "http://hydra.centaur".to_string());
     let url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
 
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_V1_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
             return (
-                StatusCode::BAD_REQUEST,
-                format!("hydra proxy: bad body: {err}"),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("hydra proxy: body exceeds {MAX_V1_BODY_BYTES} bytes: {err}"),
             )
                 .into_response();
         }
@@ -348,6 +383,123 @@ pub(crate) async fn proxy_hydra_ingress(req: Request) -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+async fn authorize_model_proxy_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    path_thread_key: Option<&str>,
+    label: &'static str,
+) -> Result<Option<String>, Response> {
+    if state.config().sandbox_model_auth == SandboxModelAuthMode::Off {
+        return Ok(None);
+    }
+    let Some(token) = extract_bearer_token(headers) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!("{label}: missing bearer token"),
+        )
+            .into_response());
+    };
+    let token_hash = bearer_token_hash(token);
+    let store = match state.pool() {
+        Ok(pool) => PgSessionStore::new(pool),
+        Err(error) => {
+            tracing::error!(%error, "{label}: session store unavailable for token auth");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("{label}: token auth store unavailable"),
+            )
+                .into_response());
+        }
+    };
+    let record = match store.find_warm_sandbox_by_token_hash(&token_hash).await {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::error!(%error, "{label}: token lookup failed");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("{label}: token lookup failed"),
+            )
+                .into_response());
+        }
+    };
+    match model_proxy_auth_decision(true, record.as_ref(), path_thread_key) {
+        Ok(thread_key) => Ok(Some(thread_key)),
+        Err(ModelProxyAuthError::Unauthorized) => Err((
+            StatusCode::UNAUTHORIZED,
+            format!("{label}: invalid bearer token"),
+        )
+            .into_response()),
+        Err(ModelProxyAuthError::Forbidden) => Err((
+            StatusCode::FORBIDDEN,
+            format!("{label}: token is not claimed for this session"),
+        )
+            .into_response()),
+    }
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .trim()
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+fn bearer_token_hash(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelProxyAuthError {
+    Unauthorized,
+    Forbidden,
+}
+
+fn model_proxy_auth_decision(
+    token_present: bool,
+    record: Option<&WarmSandboxAuthRecord>,
+    path_thread_key: Option<&str>,
+) -> Result<String, ModelProxyAuthError> {
+    if !token_present {
+        return Err(ModelProxyAuthError::Unauthorized);
+    }
+    let record = record.ok_or(ModelProxyAuthError::Unauthorized)?;
+    let claimed_thread_key = record
+        .claimed_thread_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_key| !thread_key.is_empty())
+        .ok_or(ModelProxyAuthError::Forbidden)?;
+    if record.status != "claimed" {
+        return Err(ModelProxyAuthError::Forbidden);
+    }
+    if let Some(path_thread_key) = path_thread_key
+        && path_thread_key != claimed_thread_key
+    {
+        return Err(ModelProxyAuthError::Forbidden);
+    }
+    Ok(claimed_thread_key.to_owned())
+}
+
+fn warn_if_prompt_cache_key_disagrees(runtime: &SessionRuntime, body: &[u8], thread_key: &str) {
+    let Some(cache_key) = extract_prompt_cache_key(body) else {
+        return;
+    };
+    if let Some(indexed_thread_key) = runtime.thread_key_for_harness_thread_id(&cache_key)
+        && indexed_thread_key != thread_key
+    {
+        tracing::warn!(
+            prompt_cache_key = %cache_key,
+            token_thread_key = %thread_key,
+            indexed_thread_key = %indexed_thread_key,
+            "sandbox model proxy: prompt_cache_key disagrees with token thread_key"
+        );
     }
 }
 
@@ -1099,6 +1251,70 @@ mod tests {
         );
         // Non-JSON body never panics.
         assert_eq!(extract_prompt_cache_key(b"not json"), None);
+    }
+
+    #[test]
+    fn model_proxy_auth_decision_rejects_missing_or_unknown_token() {
+        assert_eq!(
+            model_proxy_auth_decision(false, None, None),
+            Err(ModelProxyAuthError::Unauthorized)
+        );
+        assert_eq!(
+            model_proxy_auth_decision(true, None, None),
+            Err(ModelProxyAuthError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn model_proxy_auth_decision_requires_claimed_warm_sandbox() {
+        let ready = WarmSandboxAuthRecord {
+            sandbox_id: "sbx".to_owned(),
+            status: "ready".to_owned(),
+            claimed_thread_key: Some("thread-a".to_owned()),
+        };
+        assert_eq!(
+            model_proxy_auth_decision(true, Some(&ready), None),
+            Err(ModelProxyAuthError::Forbidden)
+        );
+
+        let missing_thread = WarmSandboxAuthRecord {
+            status: "claimed".to_owned(),
+            claimed_thread_key: None,
+            ..ready
+        };
+        assert_eq!(
+            model_proxy_auth_decision(true, Some(&missing_thread), None),
+            Err(ModelProxyAuthError::Forbidden)
+        );
+    }
+
+    #[test]
+    fn model_proxy_auth_decision_uses_claimed_thread_and_checks_path_thread() {
+        let record = WarmSandboxAuthRecord {
+            sandbox_id: "sbx".to_owned(),
+            status: "claimed".to_owned(),
+            claimed_thread_key: Some("thread-a".to_owned()),
+        };
+        assert_eq!(
+            model_proxy_auth_decision(true, Some(&record), None).as_deref(),
+            Ok("thread-a")
+        );
+        assert_eq!(
+            model_proxy_auth_decision(true, Some(&record), Some("thread-a")).as_deref(),
+            Ok("thread-a")
+        );
+        assert_eq!(
+            model_proxy_auth_decision(true, Some(&record), Some("thread-b")),
+            Err(ModelProxyAuthError::Forbidden)
+        );
+    }
+
+    #[test]
+    fn bearer_token_hash_is_sha256_hex() {
+        assert_eq!(
+            bearer_token_hash("token"),
+            "3c469e9d6c5875d37a43f353d4f88e61fcf812c66eee3457465a40b0da4153e0"
+        );
     }
 
     #[test]

@@ -8793,7 +8793,7 @@ mod adoption_tests {
             .to_owned();
         let warm_sandbox_id = format!("warm-sbx-{}", uuid::Uuid::new_v4());
         store
-            .insert_ready_warm_sandbox(&warm_sandbox_id, &workload_key)
+            .insert_ready_warm_sandbox(&warm_sandbox_id, &workload_key, None)
             .await
             .expect("insert warm sandbox");
 
@@ -9037,7 +9037,7 @@ mod adoption_tests {
             .await
             .expect("set sandbox id");
         store
-            .insert_ready_warm_sandbox("sbx-owned", "test-workload")
+            .insert_ready_warm_sandbox("sbx-owned", "test-workload", None)
             .await
             .expect("insert warm sandbox");
         assert_eq!(

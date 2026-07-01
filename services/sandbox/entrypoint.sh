@@ -270,6 +270,28 @@ if overlay_raw:
     else:
         text = tomli_w.dumps(merged)
 
+# Per-sandbox model-proxy auth: any Codex model provider pointed at the api-rs
+# model proxy must read the warm-pool minted bearer token so Codex sends
+# `Authorization: Bearer <token>` to `/sandbox/model/*`.
+try:
+    import tomllib
+    import tomli_w
+
+    config = tomllib.loads(text)
+except tomllib.TOMLDecodeError as exc:
+    print(f"ignoring sandbox model token provider patch: {exc}", file=sys.stderr)
+else:
+    changed = False
+    for provider in config.get("model_providers", {}).values():
+        if not isinstance(provider, dict):
+            continue
+        base_url = str(provider.get("base_url", ""))
+        if "/sandbox/model" in base_url or "CENTAUR_SANDBOX_MODEL_UPSTREAM" in base_url:
+            provider["env_key"] = "CENTAUR_SANDBOX_MODEL_TOKEN"
+            changed = True
+    if changed:
+        text = tomli_w.dumps(config)
+
 path.write_text(text)
 PYEOF
 else
