@@ -176,6 +176,7 @@ pub(crate) async fn anthropic_messages(
     let model = non_empty_string(&request.model);
     let system_prompt = flatten_system_prompt(request.system.as_ref());
     let _decorative = (request.max_tokens, &request.tools);
+    let config = state.config().clone();
     let runtime = state.runtime()?;
     let _outcome = runtime
         .create_or_get_session(
@@ -216,8 +217,8 @@ pub(crate) async fn anthropic_messages(
                 idempotency_key: None,
                 metadata: None,
                 input_lines: vec![input_line],
-                idle_timeout_ms: None,
-                max_duration_ms: None,
+                idle_timeout_ms: Some(config.v1_idle_timeout_ms),
+                max_duration_ms: Some(config.v1_max_duration_ms),
                 model,
                 system_prompt,
             },
