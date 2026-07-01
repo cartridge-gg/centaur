@@ -33,15 +33,18 @@ pub struct ResponsesTranslator {
     response_id: String,
     model: String,
     item_id: String,
+    output_index: usize,
     sequence: u64,
     started: bool,
     message_open: bool,
     emitted_text: String,
+    message_text: String,
     /// Text streamed for the current agentMessage item only, so an `item.completed`
     /// dedups against its own deltas rather than the global accumulator.
     item_text: String,
     final_answer_text: String,
     terminal_result_text: Option<String>,
+    completed_items: Vec<Value>,
     completed: bool,
 }
 
@@ -53,13 +56,16 @@ impl ResponsesTranslator {
             response_id,
             model: model.into(),
             item_id,
+            output_index: 0,
             sequence: 0,
             started: false,
             message_open: false,
             emitted_text: String::new(),
+            message_text: String::new(),
             item_text: String::new(),
             final_answer_text: String::new(),
             terminal_result_text: None,
+            completed_items: Vec::new(),
             completed: false,
         }
     }
@@ -184,11 +190,18 @@ impl ResponsesTranslator {
         // fail the prefix check and re-emit its whole message -> duplicated output.
         let suffix = full_text
             .strip_prefix(self.item_text.as_str())
-            .unwrap_or(full_text)
-            .to_owned();
-        if !suffix.is_empty() {
-            self.separate_new_message(out);
-            self.emit_text_delta(&suffix, out);
+            .map(str::to_owned);
+        match suffix {
+            Some(suffix) if !suffix.is_empty() => {
+                self.separate_new_message(out);
+                self.emit_text_delta(&suffix, out);
+            }
+            Some(_) => {}
+            None => {
+                self.close_message(out);
+                self.prepare_next_message_item();
+                self.emit_text_delta(full_text, out);
+            }
         }
         self.item_text.clear();
     }
@@ -205,12 +218,13 @@ impl ResponsesTranslator {
     fn emit_text_delta(&mut self, text: &str, out: &mut Vec<ResponsesStreamEvent>) {
         self.ensure_message_open(out);
         self.emitted_text.push_str(text);
+        self.message_text.push_str(text);
         out.push(self.event(
             "response.output_text.delta",
             json!({
                 "type": "response.output_text.delta",
                 "item_id": self.item_id,
-                "output_index": 0,
+                "output_index": self.output_index,
                 "content_index": 0,
                 "delta": text,
             }),
@@ -247,7 +261,7 @@ impl ResponsesTranslator {
             "response.output_item.added",
             json!({
                 "type": "response.output_item.added",
-                "output_index": 0,
+                "output_index": self.output_index,
                 "item": {
                     "id": self.item_id,
                     "type": "message",
@@ -262,7 +276,7 @@ impl ResponsesTranslator {
             json!({
                 "type": "response.content_part.added",
                 "item_id": self.item_id,
-                "output_index": 0,
+                "output_index": self.output_index,
                 "content_index": 0,
                 "part": {"type": "output_text", "text": "", "annotations": []},
             }),
@@ -283,9 +297,9 @@ impl ResponsesTranslator {
                 self.emit_text_delta(&text, out);
             }
         }
-        let item = self.close_message(out);
+        self.close_message(out);
         self.completed = true;
-        let output = item.map(|item| vec![item]).unwrap_or_default();
+        let output = self.completed_items.clone();
         out.push(self.event(
             "response.completed",
             json!({
@@ -303,13 +317,13 @@ impl ResponsesTranslator {
         if !self.message_open {
             return None;
         }
-        let text = self.emitted_text.clone();
+        let text = self.message_text.clone();
         out.push(self.event(
             "response.output_text.done",
             json!({
                 "type": "response.output_text.done",
                 "item_id": self.item_id,
-                "output_index": 0,
+                "output_index": self.output_index,
                 "content_index": 0,
                 "text": text,
             }),
@@ -319,22 +333,29 @@ impl ResponsesTranslator {
             json!({
                 "type": "response.content_part.done",
                 "item_id": self.item_id,
-                "output_index": 0,
+                "output_index": self.output_index,
                 "content_index": 0,
                 "part": {"type": "output_text", "text": text, "annotations": []},
             }),
         ));
-        let item = self.message_item();
+        let item = message_item(&self.item_id, &text);
         out.push(self.event(
             "response.output_item.done",
             json!({
                 "type": "response.output_item.done",
-                "output_index": 0,
+                "output_index": self.output_index,
                 "item": item.clone(),
             }),
         ));
         self.message_open = false;
+        self.message_text.clear();
+        self.completed_items.push(item.clone());
         Some(item)
+    }
+
+    fn prepare_next_message_item(&mut self) {
+        self.output_index = self.completed_items.len();
+        self.item_id = format!("msg_{}_{}", self.response_id, self.output_index);
     }
 
     /// Emit a complete `function_call` output item for the user's local CLI to
@@ -359,8 +380,8 @@ impl ResponsesTranslator {
             return;
         }
         self.ensure_started(out);
-        let message_item = self.close_message(out);
-        let output_index = if message_item.is_some() { 1 } else { 0 };
+        self.close_message(out);
+        let output_index = self.completed_items.len();
         let item_id = format!("fc_{call_id}");
 
         out.push(self.event(
@@ -414,10 +435,7 @@ impl ResponsesTranslator {
         ));
 
         self.completed = true;
-        let mut output = Vec::new();
-        if let Some(message_item) = message_item {
-            output.push(message_item);
-        }
+        let mut output = self.completed_items.clone();
         output.push(function_item);
         out.push(self.event(
             "response.completed",
@@ -446,18 +464,10 @@ impl ResponsesTranslator {
         ));
     }
 
-    fn message_item(&self) -> Value {
-        json!({
-            "id": self.item_id,
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": self.emitted_text,
-                "annotations": [],
-            }],
-        })
+    pub fn unexpected_stream_end(&mut self) -> Vec<ResponsesStreamEvent> {
+        let mut out = Vec::new();
+        self.fail("session event stream ended unexpectedly", &mut out);
+        out
     }
 
     fn response_object(&self, status: &str, output: &[Value]) -> Value {
@@ -485,6 +495,20 @@ impl ResponsesTranslator {
             data,
         }
     }
+}
+
+fn message_item(item_id: &str, text: &str) -> Value {
+    json!({
+        "id": item_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": text,
+            "annotations": [],
+        }],
+    })
 }
 
 /// A transport-level error event, emitted when the session event stream itself
@@ -616,6 +640,51 @@ mod tests {
     }
 
     #[test]
+    fn divergent_completed_text_opens_replacement_item() {
+        let out = translate(vec![
+            event("session.execution_started", json!({})),
+            output(json!({"method":"item/agentMessage/delta","params":{"delta":"draft"}})),
+            output(
+                json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"replacement","phase":"final_answer"}}}),
+            ),
+            event("session.execution_completed", json!({})),
+        ]);
+
+        assert_eq!(streamed_text(&out), "draftreplacement");
+        let done_texts = out
+            .iter()
+            .filter(|event| event.name == "response.output_text.done")
+            .map(|event| event.data["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(done_texts, vec!["draft", "replacement"]);
+        let added_indices = out
+            .iter()
+            .filter(|event| event.name == "response.output_item.added")
+            .map(|event| event.data["output_index"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(added_indices, vec![0, 1]);
+        let completed = out
+            .iter()
+            .find(|event| event.name == "response.completed")
+            .unwrap();
+        assert_eq!(
+            completed.data["response"]["output"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            completed.data["response"]["output"][0]["content"][0]["text"],
+            json!("draft")
+        );
+        assert_eq!(
+            completed.data["response"]["output"][1]["content"][0]["text"],
+            json!("replacement")
+        );
+    }
+
+    #[test]
     fn dotted_codex_text() {
         let out = translate(vec![
             event("session.execution_started", json!({})),
@@ -649,6 +718,27 @@ mod tests {
                 .any(|name| name == "response.output_item.added")
         );
         assert!(kinds.iter().any(|name| name == "response.completed"));
+    }
+
+    #[test]
+    fn stream_exhaustion_synthesizes_response_failed() {
+        let mut translator = ResponsesTranslator::new("resp_test", "gpt-test");
+        let mut out =
+            translator.translate_session_event(&event("session.execution_started", json!({})));
+        out.extend(translator.unexpected_stream_end());
+
+        let failed = out
+            .iter()
+            .find(|event| event.name == "response.failed")
+            .expect("response.failed emitted");
+        assert_eq!(failed.data["response"]["status"], json!("failed"));
+        assert_eq!(
+            failed.data["response"]["error"],
+            json!({
+                "code": "server_error",
+                "message": "session event stream ended unexpectedly"
+            })
+        );
     }
 
     #[test]
