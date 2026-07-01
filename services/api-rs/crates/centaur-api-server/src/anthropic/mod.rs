@@ -240,15 +240,24 @@ pub(crate) async fn anthropic_messages(
         let events = Box::pin(events);
         let stream = stream::unfold(
             (events, false, translator, thread_key_for_log),
-            |(mut events, done, translator, thread_key_for_log)| async move {
-                if done {
+            |(mut events, terminal_emitted, translator, thread_key_for_log)| async move {
+                if terminal_emitted {
                     return None;
                 }
-                let result = events.as_mut().next().await?;
+                let Some(result) = events.as_mut().next().await else {
+                    let events_out = translator
+                        .lock()
+                        .expect("Anthropic translator mutex poisoned")
+                        .unexpected_stream_end()
+                        .into_iter()
+                        .map(|event| Ok(event.into_sse_event()))
+                        .collect::<Vec<Result<Event, Infallible>>>();
+                    return Some((events_out, (events, true, translator, thread_key_for_log)));
+                };
                 let thread_key = thread_key_for_log.clone();
-                let (events_out, done) = match result {
+                let (events_out, terminal_emitted) = match result {
                     Ok(event) => {
-                        let done = is_terminal_session_event(&event);
+                        let terminal_emitted = is_terminal_session_event(&event);
                         let events = translator
                             .lock()
                             .expect("Anthropic translator mutex poisoned")
@@ -256,7 +265,7 @@ pub(crate) async fn anthropic_messages(
                             .into_iter()
                             .map(|event| Ok(event.into_sse_event()))
                             .collect::<Vec<Result<Event, Infallible>>>();
-                        (events, done)
+                        (events, terminal_emitted)
                     }
                     Err(error) => {
                         tracing::error!(
@@ -272,7 +281,10 @@ pub(crate) async fn anthropic_messages(
                         )
                     }
                 };
-                Some((events_out, (events, done, translator, thread_key_for_log)))
+                Some((
+                    events_out,
+                    (events, terminal_emitted, translator, thread_key_for_log),
+                ))
             },
         )
         .flat_map(stream::iter);
@@ -424,8 +436,20 @@ fn is_terminal_session_event(event: &SessionEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderMap;
+    use time::OffsetDateTime;
 
     use super::*;
+
+    fn session_event(event_type: &str, payload: Value) -> SessionEvent {
+        SessionEvent {
+            event_id: 1,
+            thread_key: ThreadKey::parse("test:anthropic").unwrap(),
+            execution_id: Some("exe_1".to_owned()),
+            event_type: event_type.to_owned(),
+            payload,
+            created_at: OffsetDateTime::now_utc(),
+        }
+    }
 
     #[test]
     fn keys_thread_on_claude_session_id() {
@@ -441,5 +465,59 @@ mod tests {
         let key = thread_key_from_headers(&HeaderMap::new()).unwrap();
         assert!(key.as_str().starts_with("api:"));
         assert!(!key.as_str().contains("claude"));
+    }
+
+    #[tokio::test]
+    async fn stream_exhaustion_synthesizes_terminal_error_frames() {
+        let events = futures_util::stream::iter(vec![Ok::<
+            _,
+            centaur_session_runtime::SessionRuntimeError,
+        >(session_event(
+            "session.execution_started",
+            json!({}),
+        ))]);
+        futures_util::pin_mut!(events);
+        let mut translator = AnthropicTranslator::new("msg_test", "claude-test");
+        let mut out = Vec::new();
+        let mut terminal_emitted = false;
+
+        while let Some(result) = events.next().await {
+            let event = result.unwrap();
+            terminal_emitted = is_terminal_session_event(&event);
+            out.extend(translator.translate_session_event(&event));
+        }
+        if !terminal_emitted {
+            out.extend(translator.unexpected_stream_end());
+        }
+
+        let tail = &out[out.len() - 2..];
+        assert_eq!(tail[0].name, "error");
+        assert_eq!(tail[0].data["error"]["type"], json!("overloaded_error"));
+        assert_eq!(
+            tail[0].data["error"]["message"],
+            json!("session event stream ended unexpectedly")
+        );
+        assert_eq!(tail[1].name, "message_stop");
+    }
+
+    #[tokio::test]
+    async fn non_streaming_uses_terminal_result_text_when_content_empty() {
+        let events = futures_util::stream::iter(vec![Ok::<
+            _,
+            centaur_session_runtime::SessionRuntimeError,
+        >(session_event(
+            "session.execution_completed",
+            json!({"result_text":"DONE"}),
+        ))]);
+
+        let message =
+            collect_non_streaming_message(events, "msg_test".to_owned(), "claude-test".to_owned())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            message.content,
+            vec![json!({"type": "text", "text": "DONE"})]
+        );
     }
 }
