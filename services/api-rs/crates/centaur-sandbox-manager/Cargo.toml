@@ -6,9 +6,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 centaur-sandbox-core.workspace = true
 centaur-session-sqlx.workspace = true
 centaur-telemetry.workspace = true
+hex.workspace = true
+rand.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
