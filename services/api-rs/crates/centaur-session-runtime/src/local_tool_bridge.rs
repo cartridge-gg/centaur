@@ -19,6 +19,11 @@
 //! All state is guarded by `std::sync::Mutex` (the critical sections never hold a
 //! lock across an `.await`), so every method here is synchronous except the
 //! `recv` on the receiver the caller owns directly.
+//!
+//! Because this bridge is in-process state, api-rs must run as a single replica
+//! or behind sticky routing. With multiple non-sticky replicas the model proxy
+//! can forward a local tool call on one replica while `/v1/responses` resolves
+//! the oneshot on another, so the proxy side waits until its 504 timeout.
 
 use std::{
     collections::HashMap,

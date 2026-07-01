@@ -1,4 +1,9 @@
 {{- if .Values.apiRs.enabled }}
+{{- if gt (int .Values.apiRs.replicaCount) 1 }}
+{{- if not .Values.apiRs.allowMultiReplica }}
+{{- fail "apiRs.replicaCount > 1: the /v1 local-tool bridge holds in-process state and requires a single replica (or sticky routing). Set apiRs.allowMultiReplica=true to override." }}
+{{- end }}
+{{- end }}
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- $mcpPublicUrl := default .Values.slackbotv2.mcpPublicUrl .Values.apiRs.mcpPublicUrl -}}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
@@ -237,6 +242,13 @@ spec:
               value: {{ .Values.apiRs.codexNanocodexRolloutPercent | quote }}
             - name: IRON_CONTROL_SYNC_INFRA_SECRETS
               value: {{ .Values.apiRs.syncInfraSecrets | quote }}
+{{- if .Values.apiRs.v1Auth.enabled }}
+            - name: CENTAUR_V1_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sCENTAUR_V1_API_KEY" .Values.secretManager.envPrefix }}
+{{- end }}
             - name: RUST_LOG
               value: info
             - name: TOOL_DIRS
