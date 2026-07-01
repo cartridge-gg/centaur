@@ -345,6 +345,15 @@ agentSandbox:
 apiRs:
   enabled: true
   replicaCount: 1
+  # api-rs currently holds the /v1 local-tool bridge in process. Keep one
+  # replica unless routing is sticky for all /v1 and sandbox model-proxy calls.
+  allowMultiReplica: false
+  # When enabled, api-rs reads CENTAUR_V1_API_KEY from the shared infra Secret
+  # (key: <secretManager.envPrefix>CENTAUR_V1_API_KEY). Set enabled=false only
+  # during rollout if the secret has not been provisioned yet; /v1 still fails
+  # closed unless CENTAUR_V1_ALLOW_UNAUTHENTICATED is explicitly configured.
+  v1Auth:
+    enabled: true
   image:
     repository: centaur-api-rs
     tag: latest
