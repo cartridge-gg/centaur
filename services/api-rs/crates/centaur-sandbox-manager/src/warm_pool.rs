@@ -1,7 +1,10 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use centaur_sandbox_core::{SandboxError, SandboxId, SandboxSpec, SandboxStatus};
 use centaur_session_sqlx::{PgSessionStore, SessionStoreError};
+use rand::random;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
@@ -10,6 +13,7 @@ use crate::SandboxManager;
 
 pub type WarmSandboxSpecFactory = Arc<dyn Fn() -> SandboxSpec + Send + Sync>;
 const STALE_EVICTING_WARM_SANDBOX_AGE: Duration = Duration::from_secs(300);
+pub const SANDBOX_MODEL_TOKEN_ENV: &str = "CENTAUR_SANDBOX_MODEL_TOKEN";
 
 pub struct WarmPoolConfig {
     pub target_size: usize,
@@ -177,10 +181,17 @@ impl WarmPoolManager {
             if let Some(principal_id) = &self.config.bootstrap_iron_control_principal {
                 spec.iron_control_principal = Some(principal_id.clone());
             }
+            let token = mint_sandbox_model_token();
+            let token_hash = sandbox_model_token_hash(&token);
+            spec = spec.env(SANDBOX_MODEL_TOKEN_ENV, token);
             let handle = self.manager.create_running(spec).await?;
             if let Err(error) = self
                 .store
-                .insert_ready_warm_sandbox(handle.id.as_str(), self.workload_key.as_str())
+                .insert_ready_warm_sandbox(
+                    handle.id.as_str(),
+                    self.workload_key.as_str(),
+                    Some(&token_hash),
+                )
                 .await
             {
                 let _ = self.manager.stop(&handle.id).await;
@@ -272,6 +283,15 @@ fn status_consumes_running_slot(status: &SandboxStatus) -> bool {
     )
 }
 
+fn mint_sandbox_model_token() -> String {
+    let bytes: [u8; 32] = random();
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub fn sandbox_model_token_hash(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
 #[derive(Debug, Error)]
 pub enum WarmPoolError {
     #[error(transparent)]
@@ -297,6 +317,113 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn replenish_injects_model_token_and_stores_hash() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let backend = Arc::new(FakeBackend::default());
+        let manager = Arc::new(SandboxManager::new(backend.clone()));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workload_key = format!("test-workload-{}-{nonce}", std::process::id());
+        let warm_pool = WarmPoolManager::new(
+            manager,
+            store.clone(),
+            Arc::new(|| SandboxSpec::new("mock")),
+            workload_key,
+            WarmPoolConfig {
+                target_size: 1,
+                replenish_interval: Duration::from_secs(60),
+                bootstrap_iron_control_principal: None,
+                max_running_sandboxes: None,
+            },
+        );
+
+        warm_pool.replenish_once().await.expect("replenish");
+
+        let specs = backend.created_specs();
+        assert_eq!(specs.len(), 1);
+        let token = specs[0]
+            .env
+            .iter()
+            .find(|env| env.name == SANDBOX_MODEL_TOKEN_ENV)
+            .map(|env| env.value.as_str())
+            .expect("model token env");
+        assert!(!token.is_empty());
+        let record = store
+            .find_warm_sandbox_by_token_hash(&sandbox_model_token_hash(token))
+            .await
+            .expect("lookup token hash")
+            .expect("warm sandbox row");
+        assert_eq!(record.sandbox_id, "fake-sbx-1");
+        assert_eq!(record.status, "ready");
+    }
+
+    #[derive(Default)]
+    struct FakeBackend {
+        created: Mutex<Vec<SandboxSpec>>,
+    }
+
+    impl FakeBackend {
+        fn created_specs(&self) -> Vec<SandboxSpec> {
+            self.created.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl SandboxBackend for FakeBackend {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+            let mut created = self.created.lock().unwrap();
+            created.push(spec);
+            Ok(SandboxHandle::new(
+                format!("fake-sbx-{}", created.len()),
+                self.name(),
+            ))
+        }
+
+        async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+            Err(SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "open_io",
+            })
+        }
+
+        async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
+            Ok(SandboxStatus::Running)
+        }
+
+        async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
+            Ok(ObservedSandbox::new(
+                id.as_str(),
+                self.name(),
+                SandboxStatus::Running,
+            ))
+        }
+
+        async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
+            Ok(Vec::new())
+        }
+
+        async fn stop(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn pause(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn resume(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
     async fn replenisher_prunes_missing_ready_rows_before_counting() {
         let Some(store) = test_store().await else {
             return;
@@ -309,11 +436,11 @@ mod tests {
         let fresh_sandbox = format!("fresh-{suffix}");
 
         store
-            .insert_ready_warm_sandbox(&stale_sandbox, &workload_key)
+            .insert_ready_warm_sandbox(&stale_sandbox, &workload_key, None)
             .await
             .expect("insert stale warm sandbox row");
         store
-            .insert_ready_warm_sandbox(&old_stale_sandbox, &old_workload_key)
+            .insert_ready_warm_sandbox(&old_stale_sandbox, &old_workload_key, None)
             .await
             .expect("insert stale warm sandbox row for old workload");
         assert_eq!(
@@ -381,7 +508,7 @@ mod tests {
         let stale_sandbox = format!("stale-evicting-{suffix}");
 
         store
-            .insert_ready_warm_sandbox(&stale_sandbox, &workload_key)
+            .insert_ready_warm_sandbox(&stale_sandbox, &workload_key, None)
             .await
             .expect("insert stale evicting warm sandbox row");
         sqlx::query(

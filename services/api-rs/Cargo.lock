@@ -1015,9 +1015,13 @@ name = "centaur-sandbox-manager"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.0",
  "centaur-sandbox-core",
  "centaur-session-sqlx",
  "centaur-telemetry",
+ "hex",
+ "rand 0.9.4",
+ "sha2 0.11.0",
  "sqlx",
  "thiserror 2.0.19",
  "tokio",
