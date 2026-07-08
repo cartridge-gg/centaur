@@ -936,6 +936,16 @@ impl SandboxArgs {
         "/opt/centaur/workflows".to_owned()
     }
 
+    /// The org overlay checkout under the repos mount, derived from the last
+    /// (highest-priority) overlay source. The sandbox entrypoint appends
+    /// `$CENTAUR_OVERLAY_DIR/services/sandbox/SYSTEM_PROMPT.md` to the harness
+    /// prompt (see services/sandbox/entrypoint.sh), so this is how the org
+    /// system prompt reaches sandboxes under repo-cache overlay delivery.
+    fn overlay_dir_in_repo_cache(&self) -> Option<String> {
+        let repo = self.tools_source.source_repos().pop()?;
+        Some(format!("{SANDBOX_REPOS_MOUNT_PATH}/{repo}"))
+    }
+
     fn default_workflow_host_path(&self) -> String {
         match self.backend {
             SandboxBackendKind::Local => default_workflow_host_path(),
@@ -1088,6 +1098,18 @@ impl SandboxArgs {
                     envs.push((name.to_owned(), value));
                 }
             }
+        }
+
+        // Org overlay prompt via repo-cache: point the sandbox's
+        // CENTAUR_OVERLAY_DIR at the last (highest-priority) overlay source's
+        // clone under the repos mount so the entrypoint appends its
+        // services/sandbox/SYSTEM_PROMPT.md to the harness prompt.
+        if let Some(overlay_dir) = self.overlay_dir_in_repo_cache()
+            && !envs
+                .iter()
+                .any(|(existing, _)| existing == "CENTAUR_OVERLAY_DIR")
+        {
+            envs.push(("CENTAUR_OVERLAY_DIR".to_owned(), overlay_dir));
         }
 
         // Operator extra env wins over template defaults (same precedence as
@@ -2499,6 +2521,57 @@ mod tests {
             args.sandbox.agent_k8s_workflow_dirs(),
             "/opt/centaur/workflows"
         );
+    }
+
+    #[test]
+    fn codex_app_server_env_template_points_overlay_dir_at_last_source() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--kubernetes-tools-repo",
+            "paradigmxyz/centaur",
+            "--kubernetes-tools-runner-image",
+            "centaur-agent:test",
+            "--kubernetes-tools-extra-sources",
+            r#"[{"repo":"acme/overlay"},{"repo":"cartridge-gg/agent"}]"#,
+        ])
+        .unwrap();
+
+        // The last overlay source is the highest-priority org overlay; the
+        // sandbox entrypoint appends its services/sandbox/SYSTEM_PROMPT.md.
+        let env = args.sandbox.codex_app_server_env_template().unwrap();
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == "CENTAUR_OVERLAY_DIR")
+                .map(|(_, value)| value.as_str()),
+            Some("/home/agent/github/cartridge-gg/agent")
+        );
+    }
+
+    #[test]
+    fn codex_app_server_env_template_omits_overlay_dir_without_sources() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+        ])
+        .unwrap();
+
+        let env = args.sandbox.codex_app_server_env_template().unwrap();
+        assert!(!env.iter().any(|(name, _)| name == "CENTAUR_OVERLAY_DIR"));
     }
 
     #[test]
