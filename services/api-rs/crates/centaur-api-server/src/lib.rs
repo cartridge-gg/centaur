@@ -49,9 +49,12 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{AppState, build_router_with_app_state, build_router_with_runtime};
+    use super::{
+        ApiServerConfig, AppState, build_router_with_app_state, build_router_with_runtime,
+    };
 
     static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+    const V1_TEST_API_KEY: &str = "v1-test-api-key";
 
     #[tokio::test]
     async fn router_builds() {
@@ -561,6 +564,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/messages")
+                    .header("x-api-key", V1_TEST_API_KEY)
                     .header(header::CONTENT_TYPE, "application/json")
                     .header("X-Claude-Code-Session-Id", thread_key)
                     .body(Body::from(
@@ -615,6 +619,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/messages")
+                    .header("x-api-key", V1_TEST_API_KEY)
                     .header(header::CONTENT_TYPE, "application/json")
                     .header("X-Claude-Code-Session-Id", thread_key)
                     .body(Body::from(
@@ -660,6 +665,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/messages")
+                    .header("x-api-key", V1_TEST_API_KEY)
                     .header(header::CONTENT_TYPE, "application/json")
                     .header("X-Claude-Code-Session-Id", thread_key)
                     .body(Body::from(
@@ -712,6 +718,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/messages")
+                    .header("x-api-key", V1_TEST_API_KEY)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({
@@ -910,10 +917,21 @@ mod tests {
         script: Vec<String>,
     ) -> (axum::Router, Arc<ScriptedStdoutBackend>) {
         let backend = Arc::new(ScriptedStdoutBackend::new(script));
-        let app = build_router_with_runtime(
-            store,
-            SandboxRuntime::backend(backend.clone(), SandboxSpec::new("scripted")),
+        // /v1 requires an API key since the ingress hardening; configure the
+        // test key so requests exercise the same auth path as production.
+        let state = AppState::unready_with_config(ApiServerConfig {
+            v1_api_key: Some(V1_TEST_API_KEY.to_owned()),
+            ..ApiServerConfig::default()
+        });
+        state.mark_ready(
+            centaur_session_runtime::SessionRuntime::new(
+                store,
+                SandboxRuntime::backend(backend.clone(), SandboxSpec::new("scripted")),
+            ),
+            None,
+            None,
         );
+        let app = build_router_with_app_state(state);
         (app, backend)
     }
 
