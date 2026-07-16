@@ -320,13 +320,12 @@ mod tests {
         let Some(store) = test_store().await else {
             return;
         };
-        let backend = Arc::new(FakeBackend::default());
+        // Unique per run so re-runs against a persistent test database do not
+        // collide on the session_warm_sandboxes primary key.
+        let suffix = unique_suffix();
+        let backend = Arc::new(FakeBackend::new(format!("fake-sbx-{suffix}")));
         let manager = Arc::new(SandboxManager::new(backend.clone()));
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let workload_key = format!("test-workload-{}-{nonce}", std::process::id());
+        let workload_key = format!("test-workload-{}-{suffix}", std::process::id());
         let warm_pool = WarmPoolManager::new(
             manager,
             store.clone(),
@@ -356,16 +355,23 @@ mod tests {
             .await
             .expect("lookup token hash")
             .expect("warm sandbox row");
-        assert_eq!(record.sandbox_id, "fake-sbx-1");
+        assert_eq!(record.sandbox_id, format!("fake-sbx-{suffix}-1"));
         assert_eq!(record.status, "ready");
     }
 
-    #[derive(Default)]
     struct FakeBackend {
+        prefix: String,
         created: Mutex<Vec<SandboxSpec>>,
     }
 
     impl FakeBackend {
+        fn new(prefix: String) -> Self {
+            Self {
+                prefix,
+                created: Mutex::new(Vec::new()),
+            }
+        }
+
         fn created_specs(&self) -> Vec<SandboxSpec> {
             self.created.lock().unwrap().clone()
         }
@@ -381,7 +387,7 @@ mod tests {
             let mut created = self.created.lock().unwrap();
             created.push(spec);
             Ok(SandboxHandle::new(
-                format!("fake-sbx-{}", created.len()),
+                format!("{}-{}", self.prefix, created.len()),
                 self.name(),
             ))
         }
