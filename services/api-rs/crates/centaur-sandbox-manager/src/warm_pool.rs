@@ -481,9 +481,19 @@ mod tests {
                 .expect("count ready warm sandboxes"),
             1
         );
+        // claimed_thread_key references sessions(thread_key), so use a real
+        // namespaced session instead of an arbitrary test-only string.
+        let claim_thread_key = format!("test:warm-claim-{suffix}");
+        sqlx::query(
+            "insert into sessions (thread_key, harness_type, status) values ($1, 'codex', 'idle')",
+        )
+        .bind(&claim_thread_key)
+        .execute(store.pool())
+        .await
+        .expect("insert claiming session");
         assert_eq!(
             store
-                .claim_ready_warm_sandbox(&workload_key, "test-thread")
+                .claim_ready_warm_sandbox(&workload_key, &claim_thread_key)
                 .await
                 .expect("claim ready warm sandbox"),
             Some(fresh_sandbox)
