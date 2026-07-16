@@ -9,12 +9,10 @@
 //! it is absent a fresh `api:<uuid-v4>` thread is generated and validated through
 //! [`centaur_session_core::ThreadKey`]. The endpoint defaults to
 //! `HarnessType::Codex` (the Codex wrapper speaks the same wire format the
-//! client expects and uses the deployment's configured Codex model backend).
-//! Centaur owns the harness, model, persona and tools, so request `model`,
-//! `instructions` and `tools` are accepted and the `model` is echoed back, but
-//! none are threaded into the harness — the harness uses its configured model.
-//! Honoring a client-selected model/instructions is a follow-up. The streamed
-//! output is a single assistant `message` item carrying `output_text`.
+//! client expects). Centaur owns the harness, persona and tools; request `model`
+//! is forwarded to the Codex blocks protocol as the authoritative model for the
+//! turn, while `instructions` remain decorative. The streamed output is a
+//! single assistant `message` item carrying `output_text`.
 //! v1 drives the turn off the last `user` message in `input`; reasoning items,
 //! client-side tool calls, full-history replay, usage accounting and auth are
 //! follow-ups. The route is unauthenticated and network-gated like
@@ -165,12 +163,10 @@ pub(crate) async fn create_response(
     Json(request): Json<OpenAIResponsesRequest>,
 ) -> Result<Response, ResponsesHttpError> {
     let thread_key = thread_key_from_request(&headers, &request)?;
-    // Centaur owns the harness, model and persona. The client's `model` and
-    // `instructions` are echoed back but NOT threaded into the harness: the
-    // default ClaudeCode harness cannot run the gpt-* models a Codex client
-    // requests, and the client instructions are the Codex CLI persona, not
-    // Centaur's. Honoring them via a Codex harness mapping is a follow-up.
-    let _decorative = (&request.model, &request.instructions, &request.tools);
+    // Centaur owns the harness and persona. The client's `model` selects the
+    // Codex model for this turn; `instructions` remain decorative because they
+    // describe the Codex CLI persona rather than Centaur's system prompt.
+    let _decorative = (&request.instructions, &request.tools);
     let config = state.config().clone();
     let runtime = state.runtime()?;
 
@@ -251,14 +247,8 @@ pub(crate) async fn create_response(
         .await
         .map_err(ResponsesHttpError::internal)?;
 
-    let input_line = serde_json::to_string(&json!({
-        "type": "user",
-        "message": {
-            "role": "user",
-            "content": parts,
-        },
-    }))
-    .map_err(ResponsesHttpError::internal)?;
+    let input_line =
+        blocks_user_input_line(parts, &request.model).map_err(ResponsesHttpError::internal)?;
     let execution = runtime
         .execute_session(
             &thread_key,
@@ -268,7 +258,7 @@ pub(crate) async fn create_response(
                 input_lines: vec![input_line],
                 idle_timeout_ms: Some(config.v1_idle_timeout_ms),
                 max_duration_ms: Some(config.v1_max_duration_ms),
-                model: None,
+                model: Some(request.model.clone()),
                 system_prompt: None,
             },
         )
@@ -357,6 +347,19 @@ pub(crate) async fn create_response(
 
     let response = collect_non_streaming_response(events, response_id, request.model).await?;
     Ok(Json(response).into_response())
+}
+
+/// Build the blocks-protocol user command consumed by harness-server. Codex
+/// reads the top-level `model` field and forwards it as `turn/start.model`.
+fn blocks_user_input_line(parts: Vec<Value>, model: &str) -> serde_json::Result<String> {
+    serde_json::to_string(&json!({
+        "type": "user",
+        "model": model,
+        "message": {
+            "role": "user",
+            "content": parts,
+        },
+    }))
 }
 
 /// Derive the Centaur thread key from Codex's session id so a resumed CLI
@@ -743,6 +746,27 @@ mod tests {
     #[test]
     fn function_call_outputs_empty_for_text_input() {
         assert!(function_call_outputs(&ResponsesInput::Text("hi".to_owned())).is_empty());
+    }
+
+    #[test]
+    fn blocks_user_input_forwards_requested_model() {
+        let line = blocks_user_input_line(
+            vec![json!({"type": "text", "text": "delegate this"})],
+            "gpt-5.6-tera",
+        )
+        .unwrap();
+        let command: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(command["model"], "gpt-5.6-tera");
+        assert_eq!(command["message"]["content"][0]["text"], "delegate this");
+    }
+
+    #[test]
+    fn blocks_user_input_preserves_provider_qualified_model() {
+        let line = blocks_user_input_line(Vec::new(), "anthropic/claude-fable-5").unwrap();
+        let command: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(command["model"], "anthropic/claude-fable-5");
     }
 
     #[test]
