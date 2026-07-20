@@ -67,6 +67,33 @@ class FakePool:
         return self.values.pop(0)
 
 
+class RetentionParityPool(FakePool):
+    """Model the retention predicates while preserving statement order."""
+
+    def __init__(self, message_ages: list[int | None]) -> None:
+        super().__init__([])
+        self.message_ages = list(message_ages)
+
+    async def fetchval(self, sql: str, *args: object) -> int:
+        self.calls.append((sql, args))
+        if "slack_private_sync_messages" in sql and "conversations" not in sql:
+            expired = sum(age is not None and age < 0 for age in self.message_ages)
+            if "DELETE FROM slack_private_sync_messages" in sql:
+                self.message_ages = [age for age in self.message_ages if age is None or age >= 0]
+            return expired
+        if "slack_private_sync_conversations" in sql:
+            if "DELETE FROM slack_private_sync_conversations" in sql:
+                return int(not self.message_ages)
+            retention_aware = "m.occurred_at IS NULL" in sql and "m.occurred_at >= NOW()" in sql
+            retained_message_exists = (
+                any(age is None or age >= 0 for age in self.message_ages)
+                if retention_aware
+                else bool(self.message_ages)
+            )
+            return int(not retained_message_exists)
+        return 0
+
+
 def test_schedule_disabled_without_positive_ttl(monkeypatch):
     monkeypatch.delenv("SLACK_ETL_RETENTION_DAYS", raising=False)
     monkeypatch.delenv("SLACK_DM_RETENTION_DAYS", raising=False)
@@ -129,9 +156,42 @@ def test_prune_slack_dm_dry_run_counts_expected_tables():
     assert "SELECT COUNT(*) FROM slack_private_sync_messages" in sql
     assert "SELECT COUNT(*) FROM slack_private_sync_conversations" in sql
     assert "NOT EXISTS" in sql
+    assert "m.occurred_at IS NULL" in sql
+    assert "m.occurred_at >= NOW() - make_interval(days => $1)" in sql
     assert "SELECT COUNT(*) FROM slack_private_sync_backfill_jobs" in sql
     assert "SELECT COUNT(*) FROM slack_private_sync_runs" in sql
     assert "DELETE FROM" not in sql
+
+
+def test_prune_slack_dm_dry_run_matches_delete_order_for_conversation_scenarios():
+    retention = _load_retention()
+    scenarios = {
+        "no messages": ([], 1),
+        "only expired messages": ([-2, -1], 1),
+        "at least one retained message": ([-1, 1], 0),
+        "message exactly at cutoff": ([-1, 0], 0),
+        "message without occurred_at": ([-1, None], 0),
+    }
+
+    for scenario, (message_ages, expected_conversations) in scenarios.items():
+        dry_run_pool = RetentionParityPool(message_ages)
+        delete_pool = RetentionParityPool(message_ages)
+
+        dry_run_counts = asyncio.run(
+            retention.prune_slack_dm(dry_run_pool, retention_days=7, dry_run=True)
+        )
+        delete_counts = asyncio.run(
+            retention.prune_slack_dm(delete_pool, retention_days=7, dry_run=False)
+        )
+
+        assert dry_run_counts == delete_counts, scenario
+        assert dry_run_counts["conversations"] == expected_conversations, scenario
+        for (sql, _args), table in zip(
+            dry_run_pool.calls,
+            ("messages", "conversations", "backfill_jobs", "runs"),
+            strict=True,
+        ):
+            assert f"FROM slack_private_sync_{table}" in sql, scenario
 
 
 def test_handler_records_metrics_for_non_dry_run():
