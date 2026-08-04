@@ -1,0 +1,118 @@
+name: Promote main to release
+
+# `main` is the canonical branch of this fork. `release/c7e-centaur-overlay` is
+# the deploy branch: publish-images.yml dispatches `base-images-published` to
+# cartridge-gg/agent on pushes there, which rolls the new base images out.
+#
+# Promotion therefore always goes through a pull request, never a direct push,
+# so a human gates every deploy. This workflow only opens or refreshes that PR.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: Release branch to promote into
+        required: false
+        default: release/c7e-centaur-overlay
+      draft:
+        description: Open the promotion PR as a draft
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: promote-to-release-${{ inputs.release_branch || 'release/c7e-centaur-overlay' }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Open promotion PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve branches
+        id: resolve
+        env:
+          RELEASE_BRANCH: ${{ inputs.release_branch || 'release/c7e-centaur-overlay' }}
+        run: |
+          set -euo pipefail
+          if ! git show-ref --verify --quiet "refs/remotes/origin/${RELEASE_BRANCH}"; then
+            echo "::error::release branch '${RELEASE_BRANCH}' does not exist on origin"
+            exit 1
+          fi
+          echo "release_branch=${RELEASE_BRANCH}" >> "$GITHUB_OUTPUT"
+
+          ahead=$(git rev-list --count "origin/${RELEASE_BRANCH}..origin/main")
+          behind=$(git rev-list --count "origin/main..origin/${RELEASE_BRANCH}")
+          echo "ahead=${ahead}" >> "$GITHUB_OUTPUT"
+          echo "behind=${behind}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Promotion status"
+            echo
+            echo "- \`main\` is **${ahead}** commit(s) ahead of \`${RELEASE_BRANCH}\`"
+            echo "- \`${RELEASE_BRANCH}\` has **${behind}** commit(s) not on \`main\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop early when there is nothing to promote
+        if: steps.resolve.outputs.ahead == '0'
+        run: |
+          echo "::notice::${{ steps.resolve.outputs.release_branch }} already contains every commit on main; nothing to promote."
+          echo "Nothing to promote." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Warn when the release branch has diverged
+        if: steps.resolve.outputs.ahead != '0' && steps.resolve.outputs.behind != '0'
+        run: |
+          echo "::warning::${{ steps.resolve.outputs.release_branch }} has ${{ steps.resolve.outputs.behind }} commit(s) absent from main. The promotion PR may conflict, and anything only on the release branch will be left behind unless it is landed on main first."
+
+      - name: Create or refresh the promotion PR
+        if: steps.resolve.outputs.ahead != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_BRANCH: ${{ steps.resolve.outputs.release_branch }}
+          AHEAD: ${{ steps.resolve.outputs.ahead }}
+          BEHIND: ${{ steps.resolve.outputs.behind }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+
+          existing=$(gh pr list --base "${RELEASE_BRANCH}" --head main --state open \
+            --json number --jq '.[0].number // empty')
+
+          {
+            echo "Promotes \`main\` into \`${RELEASE_BRANCH}\`."
+            echo
+            echo "\`main\` is **${AHEAD}** commit(s) ahead. Merging this PR pushes \`${RELEASE_BRANCH}\`, which triggers \`publish-images.yml\` to publish base images and dispatch \`base-images-published\` to \`cartridge-gg/agent\` — i.e. **merging deploys**."
+            if [ "${BEHIND}" != "0" ]; then
+              echo
+              echo "> [!WARNING]"
+              echo "> \`${RELEASE_BRANCH}\` has **${BEHIND}** commit(s) that are not on \`main\`. Land them on \`main\` first, or they will be left behind."
+            fi
+            echo
+            echo "Opened by \`.github/workflows/promote-to-release.yml\`."
+          } > /tmp/promotion-body.md
+
+          if [ -n "${existing}" ]; then
+            gh pr edit "${existing}" --body-file /tmp/promotion-body.md
+            url=$(gh pr view "${existing}" --json url --jq .url)
+            echo "::notice::Refreshed existing promotion PR ${url}"
+          else
+            args=(--base "${RELEASE_BRANCH}" --head main
+                  --title "Promote main to ${RELEASE_BRANCH}"
+                  --body-file /tmp/promotion-body.md)
+            if [ "${DRAFT}" = "true" ]; then
+              args+=(--draft)
+            fi
+            url=$(gh pr create "${args[@]}")
+            echo "::notice::Opened promotion PR ${url}"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Promotion PR: ${url}" >> "$GITHUB_STEP_SUMMARY"
