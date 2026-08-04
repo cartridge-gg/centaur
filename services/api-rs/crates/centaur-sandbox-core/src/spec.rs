@@ -118,8 +118,20 @@ impl SandboxSpec {
         self
     }
 
+    /// Set an env var, replacing the value in place when the name is already
+    /// present. Duplicate names must never reach a backend: the
+    /// agents.x-k8s.io Sandbox CRD rejects them outright (FieldValueDuplicate),
+    /// unlike plain Pod specs. Replacement is in place (not remove + push) so
+    /// entry order — and therefore the serialized spec bytes that feed the
+    /// warm-pool workload key — stays stable.
     pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.push(EnvVar::new(name, value));
+        let name = name.into();
+        let value = value.into();
+        if let Some(existing) = self.env.iter_mut().find(|env| env.name == name) {
+            existing.value = value;
+        } else {
+            self.env.push(EnvVar::new(name, value));
+        }
         self
     }
 
@@ -219,5 +231,57 @@ impl ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_pairs(spec: &SandboxSpec) -> Vec<(&str, &str)> {
+        spec.env
+            .iter()
+            .map(|env| (env.name.as_str(), env.value.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn env_appends_new_names_in_order() {
+        let spec = SandboxSpec::new("image")
+            .env("A", "1")
+            .env("B", "2")
+            .env("C", "3");
+
+        assert_eq!(env_pairs(&spec), [("A", "1"), ("B", "2"), ("C", "3")]);
+    }
+
+    #[test]
+    fn env_replaces_existing_name_in_place() {
+        // In-place replacement (index preserved) matters beyond dedupe: the
+        // warm-pool workload key hashes the serialized spec, so reordering
+        // entries would spuriously roll the pool.
+        let spec = SandboxSpec::new("image")
+            .env("A", "1")
+            .env("B", "2")
+            .env("C", "3")
+            .env("B", "override");
+
+        assert_eq!(
+            env_pairs(&spec),
+            [("A", "1"), ("B", "override"), ("C", "3")]
+        );
+    }
+
+    #[test]
+    fn env_never_yields_duplicate_names() {
+        // The operator env template may pre-seed a placeholder (e.g.
+        // CENTAUR_SANDBOX_MODEL_TOKEN) that a later caller overrides with a
+        // real value; the agents.x-k8s.io Sandbox CRD rejects duplicate env
+        // names, so the override must collapse to a single entry.
+        let spec = SandboxSpec::new("image")
+            .env("TOKEN", "placeholder")
+            .env("TOKEN", "minted");
+
+        assert_eq!(env_pairs(&spec), [("TOKEN", "minted")]);
     }
 }

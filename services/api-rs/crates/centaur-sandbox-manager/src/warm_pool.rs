@@ -360,6 +360,57 @@ mod tests {
         assert_eq!(record.status, "ready");
     }
 
+    #[tokio::test]
+    async fn replenish_overrides_operator_placeholder_token_without_duplicate() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let suffix = unique_suffix();
+        let backend = Arc::new(FakeBackend::new(format!("fake-sbx-ph-{suffix}")));
+        let manager = Arc::new(SandboxManager::new(backend.clone()));
+        let workload_key = format!("test-placeholder-{}-{suffix}", std::process::id());
+        // Operator extra env (SESSION_SANDBOX_EXTRA_ENV) may pre-seed a
+        // placeholder token for cold-created workflow-host sandboxes; the warm
+        // pool must override it with the minted token instead of appending a
+        // duplicate name, which the agents.x-k8s.io Sandbox CRD rejects.
+        let warm_pool = WarmPoolManager::new(
+            manager,
+            store.clone(),
+            Arc::new(|| SandboxSpec::new("mock").env(SANDBOX_MODEL_TOKEN_ENV, "placeholder")),
+            workload_key,
+            WarmPoolConfig {
+                target_size: 1,
+                replenish_interval: Duration::from_secs(60),
+                bootstrap_iron_control_principal: None,
+                max_running_sandboxes: None,
+            },
+        );
+
+        warm_pool.replenish_once().await.expect("replenish");
+
+        let specs = backend.created_specs();
+        assert_eq!(specs.len(), 1);
+        let tokens: Vec<&str> = specs[0]
+            .env
+            .iter()
+            .filter(|env| env.name == SANDBOX_MODEL_TOKEN_ENV)
+            .map(|env| env.value.as_str())
+            .collect();
+        assert_eq!(tokens.len(), 1, "model token env must appear exactly once");
+        let token = tokens[0];
+        assert_ne!(
+            token, "placeholder",
+            "minted token must override placeholder"
+        );
+        let record = store
+            .find_warm_sandbox_by_token_hash(&sandbox_model_token_hash(token))
+            .await
+            .expect("lookup token hash")
+            .expect("warm sandbox row");
+        assert_eq!(record.sandbox_id, format!("fake-sbx-ph-{suffix}-1"));
+        assert_eq!(record.status, "ready");
+    }
+
     struct FakeBackend {
         prefix: String,
         created: Mutex<Vec<SandboxSpec>>,
