@@ -35,7 +35,10 @@ jobs:
           git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
 
       - name: Bootstrap gh-pages branch
-        if: github.event_name == 'push'
+        # Upstream only. In forks this would publish a competing chart repo, and
+        # chart-releaser below would mint centaur-<version> tags that collide with
+        # upstream's. Forks version themselves via tag-release.yml (c7e-* tags).
+        if: github.event_name == 'push' && github.repository == 'paradigmxyz/centaur'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -81,7 +84,8 @@ jobs:
           fi
 
       - name: Run chart-releaser
-        if: steps.version.outputs.unreleased == 'true'
+        # Upstream only — this is what mints the centaur-<version> tags and releases.
+        if: steps.version.outputs.unreleased == 'true' && github.repository == 'paradigmxyz/centaur'
         uses: helm/chart-releaser-action@92c6b97fa9f664492a2592e0d1d80bc6bf378957 # v1.9.0
         with:
           skip_existing: true
