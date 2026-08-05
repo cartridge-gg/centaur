@@ -34,7 +34,10 @@ jobs:
           git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
 
       - name: Bootstrap gh-pages branch
-        if: github.event_name == 'push'
+        # Upstream only. In forks this would publish a competing chart repo, and
+        # chart-releaser below would mint centaur-<version> tags that collide with
+        # upstream's. Forks version themselves via tag-release.yml (c7e-* tags).
+        if: github.event_name == 'push' && github.repository == 'paradigmxyz/centaur'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -67,6 +70,10 @@ jobs:
         uses: mikefarah/yq@c14f446382944492701b16c1ddb48bb9dbe683e3 # v4.53.6
 
       - name: Validate chart version bump
+        # Upstream only. Chart.yaml .version is upstream's release number; forcing forks to
+        # bump it would both block overlay PRs that touch contrib/chart and destroy its
+        # meaning as the upstream base that tag-release.yml reads.
+        if: github.repository == 'paradigmxyz/centaur'
         run: |
           set -e
 
@@ -98,7 +105,8 @@ jobs:
           exit 1
 
       - name: Run chart-releaser
-        if: github.event_name == 'push'
+        # Upstream only — this is what mints the centaur-<version> tags and releases.
+        if: github.event_name == 'push' && github.repository == 'paradigmxyz/centaur'
         uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
         with:
           skip_existing: true
