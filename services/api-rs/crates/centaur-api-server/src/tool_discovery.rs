@@ -610,6 +610,7 @@ enum ToolSecret {
 struct HttpSecret {
     name: String,
     secret_ref: String,
+    source: Option<BTreeMap<String, String>>,
     labels: BTreeMap<String, String>,
     mode: HttpSecretMode,
     hosts: Vec<String>,
@@ -730,6 +731,7 @@ fn parse_secret(
         return Ok(ToolSecret::Http(HttpSecret {
             name: name.clone(),
             secret_ref: name.clone(),
+            source: None,
             labels: labels.clone(),
             mode: HttpSecretMode::Replace,
             hosts: default_hosts.to_vec(),
@@ -776,6 +778,7 @@ fn parse_http_secret(
     default_hosts: &[String],
     labels: &BTreeMap<String, String>,
 ) -> Result<ToolSecret, ToolDiscoveryError> {
+    let source = optional_string_map(table.get("source"))?;
     let hosts =
         optional_string_array(table.get("hosts"))?.unwrap_or_else(|| default_hosts.to_vec());
     if hosts.is_empty() || hosts.iter().any(String::is_empty) {
@@ -801,6 +804,7 @@ fn parse_http_secret(
             Ok(ToolSecret::Http(HttpSecret {
                 name,
                 secret_ref,
+                source,
                 labels: labels.clone(),
                 mode: HttpSecretMode::Replace,
                 hosts,
@@ -836,6 +840,7 @@ fn parse_http_secret(
             Ok(ToolSecret::Http(HttpSecret {
                 name,
                 secret_ref,
+                source,
                 labels: labels.clone(),
                 mode: HttpSecretMode::Inject,
                 hosts,
@@ -1107,7 +1112,10 @@ fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, To
         let mut extra = BTreeMap::new();
         let mut entry = Secret {
             id: Some(key.name.clone()),
-            source: Some(yaml_map([("placeholder", yaml_string(&key.secret_ref))])?),
+            source: Some(match key.source {
+                Some(source) => yaml_value(source)?,
+                None => yaml_map([("placeholder", yaml_string(&key.secret_ref))])?,
+            }),
             rules: host_rules(hosts)?,
             ..Default::default()
         };
@@ -1156,6 +1164,7 @@ fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, To
 struct HttpSecretKey {
     name: String,
     secret_ref: String,
+    source: Option<BTreeMap<String, String>>,
     mode: HttpSecretMode,
     replacer: String,
     match_headers: Vec<String>,
@@ -1171,6 +1180,7 @@ impl From<&HttpSecret> for HttpSecretKey {
         Self {
             name: secret.name.clone(),
             secret_ref: secret.secret_ref.clone(),
+            source: secret.source.clone(),
             mode: secret.mode.clone(),
             replacer: secret.replacer.clone(),
             match_headers: secret.match_headers.clone(),
@@ -1551,6 +1561,41 @@ fn optional_string_array(
     Ok(Some(out))
 }
 
+fn optional_string_map(
+    value: Option<&TomlValue>,
+) -> Result<Option<BTreeMap<String, String>>, ToolDiscoveryError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let table = value
+        .as_table()
+        .ok_or_else(|| ToolDiscoveryError::Invalid("expected string map".to_owned()))?;
+    let mut out = BTreeMap::new();
+    for (key, value) in table {
+        let Some(value) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Err(ToolDiscoveryError::Invalid(format!(
+                "source.{key} must be a non-empty string"
+            )));
+        };
+        out.insert(key.clone(), value.to_owned());
+    }
+    if out.is_empty() {
+        return Err(ToolDiscoveryError::Invalid(
+            "source must contain at least one key".to_owned(),
+        ));
+    }
+    if !out.contains_key("type") {
+        return Err(ToolDiscoveryError::Invalid(
+            "source must include non-empty string key \"type\"".to_owned(),
+        ));
+    }
+    Ok(Some(out))
+}
+
 fn optional_bool(table: &toml::Table, key: &str) -> Result<Option<bool>, ToolDiscoveryError> {
     match table.get(key) {
         Some(value) => value
@@ -1795,6 +1840,30 @@ secrets = [
         assert_eq!(tokens[0]["labels"]["centaur-tool"].as_str(), Some("gsuite"));
 
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn http_secret_source_table_is_preserved_in_proxy_fragment() {
+        let toml = r#"
+[
+  {type = "http", name = "GITHUB_TOKEN_BEARER", source = {type = "github_app", app_id_env = "GITHUB_APP_ID", installation_id_env = "GITHUB_APP_INSTALLATION_ID", private_key_b64_env = "GITHUB_APP_PRIVATE_KEY_B64"}, replacer = "Bearer GITHUB_TOKEN", match_headers = ["Authorization"], hosts = ["github.com"]}
+]
+"#;
+        let doc: TomlValue = toml::from_str(&format!("secrets = {}", toml.trim())).unwrap();
+        let secrets = parse_secret_list(Some(&doc["secrets"]), &[], &BTreeMap::new()).unwrap();
+        let transform = http_secret_transform(&secrets).unwrap().unwrap();
+        let source = transform.config.secrets[0].source.as_ref().unwrap();
+
+        assert_eq!(source["type"].as_str(), Some("github_app"));
+        assert_eq!(source["app_id_env"].as_str(), Some("GITHUB_APP_ID"));
+        assert_eq!(
+            source["installation_id_env"].as_str(),
+            Some("GITHUB_APP_INSTALLATION_ID")
+        );
+        assert_eq!(
+            source["private_key_b64_env"].as_str(),
+            Some("GITHUB_APP_PRIVATE_KEY_B64")
+        );
     }
 
     #[test]
