@@ -113,6 +113,37 @@ pub async fn proxy_sandbox_model(State(state): State<AppState>, req: Request) ->
         .unwrap_or_else(|_| "https://hydra.64.34.84.225.sslip.io/backend-api/codex".to_string());
     let url = format!("{}{}", upstream.trim_end_matches('/'), forward_path);
 
+    // Only the Responses wire format on `.../responses` takes a buffering
+    // sub-loop path; everything else is the transparent streaming pass-through
+    // from step 1 (byte-for-byte unchanged).
+    let is_responses = parts
+        .uri
+        .path()
+        .trim_end_matches('/')
+        .ends_with("/responses");
+    let real_enabled = env_flag("CENTAUR_SANDBOX_LOCAL_TOOLS");
+    let stub_enabled = env_flag("CENTAUR_SANDBOX_LOCAL_TOOLS_STUB");
+    let runtime = real_enabled.then(|| state.runtime().ok()).flatten();
+    let known_thread_key = auth_thread_key.as_deref().or(session_thread_key.as_deref());
+    let known_has_local_tools = runtime.as_ref().is_some_and(|runtime| {
+        known_thread_key.is_some_and(|thread_key| has_local_tools(runtime, thread_key))
+    });
+    let needs_legacy_thread_lookup = runtime
+        .as_ref()
+        .is_some_and(|runtime| known_thread_key.is_none() && runtime.any_local_tools_active());
+    let needs_buffer =
+        is_responses && (stub_enabled || known_has_local_tools || needs_legacy_thread_lookup);
+
+    if !needs_buffer {
+        return transparent_passthrough(
+            &parts.method,
+            &url,
+            &parts.headers,
+            reqwest::Body::wrap_stream(body.into_data_stream()),
+        )
+        .await;
+    }
+
     let body_bytes = match axum::body::to_bytes(body, MAX_V1_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -124,24 +155,13 @@ pub async fn proxy_sandbox_model(State(state): State<AppState>, req: Request) ->
         }
     };
 
-    // Only the Responses wire format on `.../responses` takes a buffering
-    // sub-loop path; everything else is the transparent streaming pass-through
-    // from step 1 (byte-for-byte unchanged).
-    let is_responses = parts
-        .uri
-        .path()
-        .trim_end_matches('/')
-        .ends_with("/responses");
-    let real_enabled = env_flag("CENTAUR_SANDBOX_LOCAL_TOOLS");
-    let stub_enabled = env_flag("CENTAUR_SANDBOX_LOCAL_TOOLS_STUB");
-
     // Real local-tool routing (step 3) takes precedence over the step-2 stub.
     // In required auth mode the session thread_key comes from the warm sandbox
     // token. In rollback mode (`CENTAUR_SANDBOX_MODEL_AUTH=off`) we preserve the
     // legacy prompt_cache_key/session-path association.
     if is_responses
         && real_enabled
-        && let Ok(runtime) = state.runtime()
+        && let Some(runtime) = runtime.as_ref()
         // Cheap gate: only pay body-parse + index lookup + race retry when some
         // session is actually running local tools. Otherwise fall straight through
         // to the streaming transparent pass-through below.
@@ -149,12 +169,12 @@ pub async fn proxy_sandbox_model(State(state): State<AppState>, req: Request) ->
     {
         let thread_key = match auth_thread_key {
             Some(thread_key) => {
-                warn_if_prompt_cache_key_disagrees(&runtime, &body_bytes, &thread_key);
+                warn_if_prompt_cache_key_disagrees(runtime, &body_bytes, &thread_key);
                 Some(thread_key)
             }
             None => match session_thread_key.as_deref() {
                 Some(tk) => Some(tk.to_owned()),
-                None => resolve_thread_key_from_body(&runtime, &body_bytes).await,
+                None => resolve_thread_key_from_body(runtime, &body_bytes).await,
             },
         };
         // Only engage the (buffering, non-streaming) local-tool sub-loop when this
@@ -162,10 +182,10 @@ pub async fn proxy_sandbox_model(State(state): State<AppState>, req: Request) ->
         // every sandbox model call lands here; normal sessions (no local CLI tools)
         // must keep the streaming transparent pass-through instead of being buffered.
         if let Some(thread_key) = thread_key
-            && has_local_tools(&runtime, &thread_key)
+            && has_local_tools(runtime, &thread_key)
         {
             return proxy_with_local_bridge(
-                &runtime,
+                runtime,
                 &thread_key,
                 &parts.method,
                 &url,
@@ -278,7 +298,7 @@ fn build_outbound(
     method: &Method,
     url: &str,
     headers: &HeaderMap,
-    body: Vec<u8>,
+    body: impl Into<reqwest::Body>,
 ) -> reqwest::RequestBuilder {
     let client = MODEL_PROXY_CLIENT.get_or_init(reqwest::Client::new);
     let mut outbound = client.request(method.clone(), url).body(body);
@@ -343,47 +363,13 @@ pub(crate) async fn proxy_hydra_ingress(State(state): State<AppState>, req: Requ
         .unwrap_or_else(|_| "http://hydra.centaur".to_string());
     let url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
 
-    let body_bytes = match axum::body::to_bytes(body, MAX_V1_BODY_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("hydra proxy: body exceeds {MAX_V1_BODY_BYTES} bytes: {err}"),
-            )
-                .into_response();
-        }
-    };
-    let outbound = build_outbound(&parts.method, &url, &parts.headers, body_bytes.to_vec());
-    let upstream_resp = match outbound.send().await {
-        Ok(resp) => resp,
-        Err(err) => {
-            tracing::error!(error = %err, url = %url, "hydra path proxy upstream error");
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("hydra upstream error: {err}"),
-            )
-                .into_response();
-        }
-    };
-    let status = upstream_resp.status();
-    let mut builder = Response::builder().status(status.as_u16());
-    for (name, value) in upstream_resp.headers().iter() {
-        match name.as_str() {
-            "content-length" | "transfer-encoding" | "connection" => continue,
-            _ => builder = builder.header(name.clone(), value.clone()),
-        }
-    }
-    match builder.body(Body::from_stream(upstream_resp.bytes_stream())) {
-        Ok(resp) => resp,
-        Err(err) => {
-            tracing::error!(error = %err, "hydra path proxy response build failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "hydra proxy build failed",
-            )
-                .into_response()
-        }
-    }
+    transparent_passthrough(
+        &parts.method,
+        &url,
+        &parts.headers,
+        reqwest::Body::wrap_stream(body.into_data_stream()),
+    )
+    .await
 }
 
 async fn authorize_model_proxy_request(
@@ -509,9 +495,9 @@ async fn transparent_passthrough(
     method: &Method,
     url: &str,
     headers: &HeaderMap,
-    body: Bytes,
+    body: impl Into<reqwest::Body>,
 ) -> Response {
-    let outbound = build_outbound(method, url, headers, body.to_vec());
+    let outbound = build_outbound(method, url, headers, body);
     let upstream_resp = match outbound.send().await {
         Ok(resp) => resp,
         Err(err) => {
@@ -1204,6 +1190,44 @@ pub fn append_followup(body: &mut Value, call: &FunctionCall, output: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transparent_passthrough_streams_body_larger_than_buffer_limit() {
+        let payload_size = MAX_V1_BODY_BYTES + 1;
+        let app = axum::Router::new().route(
+            "/responses",
+            axum::routing::post(move |request: Request| async move {
+                let bytes = axum::body::to_bytes(request.into_body(), payload_size)
+                    .await
+                    .expect("upstream should receive the complete streamed body");
+                bytes.len().to_string()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test upstream");
+        let address = listener.local_addr().expect("test upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test upstream");
+        });
+
+        let response = transparent_passthrough(
+            &Method::POST,
+            &format!("http://{address}/responses"),
+            &HeaderMap::new(),
+            reqwest::Body::wrap_stream(Body::from(vec![b'x'; payload_size]).into_data_stream()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .expect("read proxy response");
+        assert_eq!(body, payload_size.to_string());
+        server.abort();
+    }
 
     #[test]
     fn parse_session_path_extracts_decoded_thread_key_and_upstream_path() {
