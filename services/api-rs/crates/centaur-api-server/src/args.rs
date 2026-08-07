@@ -602,6 +602,16 @@ struct SandboxArgs {
         default_value_t = 259_200
     )]
     sandbox_max_lifetime_secs: u64,
+    /// Stop any sandbox that has been suspended (idle-paused) longer than
+    /// this. Activity resumes the sandbox and clears the suspension
+    /// timestamp, so this is an inactivity TTL; sessions replace reaped
+    /// sandboxes on their next message. 0 disables the max-idle sweep.
+    #[arg(
+        long = "session-sandbox-max-idle-secs",
+        env = "SESSION_SANDBOX_MAX_IDLE_SECS",
+        default_value_t = 0
+    )]
+    sandbox_max_idle_secs: u64,
     #[arg(
         long = "session-sandbox-reap-interval-secs",
         env = "SESSION_SANDBOX_REAP_INTERVAL_SECS",
@@ -1262,6 +1272,7 @@ impl SandboxArgs {
         SandboxReaperConfig {
             interval: Duration::from_secs(self.sandbox_reap_interval_secs),
             max_lifetime: ttl(self.sandbox_max_lifetime_secs),
+            max_idle: ttl(self.sandbox_max_idle_secs),
         }
     }
 
@@ -2227,6 +2238,22 @@ mod tests {
 
         let config = args.sandbox_reaper_config();
         assert_eq!(config.max_lifetime, Some(Duration::from_secs(259_200)));
+        assert_eq!(config.max_idle, None);
+    }
+
+    #[test]
+    fn sandbox_reaper_max_idle_is_configurable() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-max-idle-secs",
+            "172800",
+        ])
+        .unwrap();
+
+        let config = args.sandbox_reaper_config();
+        assert_eq!(config.max_idle, Some(Duration::from_secs(172_800)));
     }
 
     #[test]
