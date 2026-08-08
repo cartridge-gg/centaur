@@ -32,9 +32,14 @@ lifecycle, harness formatting, and durable execution state belong in `api-rs`.
   log bot tokens, signing secrets, private file URLs, or user file contents.
 - Preserve mentioned stop commands, harness/model overrides, late-file repair,
   initial thread context, and mention-gated subscribed-message semantics when
-  refactoring the main callback flow. Unmentioned replies must not be appended
-  to or interrupt an active execution; collect them when the next mention
-  refreshes the Slack thread context.
+  refactoring the main callback flow. By default, unmentioned replies must not
+  be appended to or interrupt an active execution; collect them when the next
+  mention refreshes the Slack thread context. The only exception is a channel
+  opted in via `SLACKBOTV2_CHANNEL_DEFAULTS` `threadFollow: true`: there,
+  unmentioned replies in already-subscribed threads are handled like mentioned
+  subscribed replies (including stop commands and appends during an active
+  execution), under the `thread_follow` trigger label. New top-level messages
+  always require a mention.
 
 ## Validation
 

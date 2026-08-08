@@ -2,7 +2,8 @@ import { describe, expect, test } from 'bun:test'
 import {
   channelIdFromThreadId,
   parseChannelDefaults,
-  resolveChannelDefault
+  resolveChannelDefault,
+  threadFollowEnabled
 } from '../src/channel-defaults'
 
 describe('parseChannelDefaults', () => {
@@ -67,6 +68,41 @@ describe('parseChannelDefaults', () => {
     expect(reasons.some(r => r.includes('C0BAD') && r.includes('no usable'))).toBe(true)
   })
 
+  test('parses threadFollow alongside harness fields', () => {
+    expect(
+      parseChannelDefaults(JSON.stringify({ C0A: { harness: 'claude', threadFollow: true } }))
+    ).toEqual({
+      C0A: { harnessType: 'claudecode', threadFollow: true }
+    })
+  })
+
+  test('allows threadFollow alone, with no harness fields', () => {
+    expect(
+      parseChannelDefaults(
+        JSON.stringify({ C0PAIR: { threadFollow: true }, C0OFF: { threadFollow: false } })
+      )
+    ).toEqual({
+      C0PAIR: { threadFollow: true },
+      C0OFF: { threadFollow: false }
+    })
+  })
+
+  test('reports a non-boolean threadFollow and keeps the rest of the entry', () => {
+    const reasons: string[] = []
+    const parsed = parseChannelDefaults(
+      JSON.stringify({
+        C0BAD: { harness: 'codex', threadFollow: 'yes' },
+        C0ONLYBAD: { threadFollow: 'yes' }
+      }),
+      reason => reasons.push(reason)
+    )
+    expect(parsed).toEqual({ C0BAD: { harnessType: 'codex' } })
+    expect(
+      reasons.some(r => r.includes('C0BAD') && r.includes('threadFollow must be true or false'))
+    ).toBe(true)
+    expect(reasons.some(r => r.includes('C0ONLYBAD') && r.includes('no usable'))).toBe(true)
+  })
+
   test('reports and skips a non-object entry', () => {
     const reasons: string[] = []
     const parsed = parseChannelDefaults(
@@ -119,5 +155,26 @@ describe('resolveChannelDefault', () => {
     expect(resolveChannelDefault(defaults, 'slack:C0OTHER:ts')).toBeUndefined()
     expect(resolveChannelDefault(undefined, 'slack:C0ENG:ts')).toBeUndefined()
     expect(resolveChannelDefault(defaults, 'web:t1')).toBeUndefined()
+  })
+})
+
+describe('threadFollowEnabled', () => {
+  const defaults = {
+    C0PAIR: { threadFollow: true },
+    C0OFF: { threadFollow: false },
+    C0ENG: { harnessType: 'claudecode' }
+  }
+
+  test('is true only for a channel that opted in', () => {
+    expect(threadFollowEnabled(defaults, 'slack:C0PAIR:1700000000.0001')).toBe(true)
+    expect(threadFollowEnabled(defaults, 'slack:T0TEAM:C0PAIR:ts')).toBe(true)
+  })
+
+  test('is false for explicit false, unset, unmapped, or non-slack threads', () => {
+    expect(threadFollowEnabled(defaults, 'slack:C0OFF:ts')).toBe(false)
+    expect(threadFollowEnabled(defaults, 'slack:C0ENG:ts')).toBe(false)
+    expect(threadFollowEnabled(defaults, 'slack:C0OTHER:ts')).toBe(false)
+    expect(threadFollowEnabled(undefined, 'slack:C0PAIR:ts')).toBe(false)
+    expect(threadFollowEnabled(defaults, 'web:t1')).toBe(false)
   })
 })

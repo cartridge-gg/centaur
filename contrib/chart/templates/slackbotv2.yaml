@@ -115,10 +115,11 @@ spec:
 {{- if .Values.slackbotv2.channelDefaults }}
             # Per-channel default harness / model / provider / reasoning, keyed
             # by Slack conversation id (each value an object of harness/model/
-            # provider/reasoning fields, e.g. { harness: claude, model: opus }).
-            # Applied below an explicit/sticky per-thread flag and above the
-            # deployment/baked default, and forwarded onto the harness input line
-            # so it takes effect.
+            # provider/reasoning fields, e.g. { harness: claude, model: opus },
+            # plus an optional threadFollow boolean for unmentioned replies in
+            # subscribed threads). Applied below an explicit/sticky per-thread
+            # flag and above the deployment/baked default, and forwarded onto
+            # the harness input line so it takes effect.
             - name: SLACKBOTV2_CHANNEL_DEFAULTS
               value: {{ .Values.slackbotv2.channelDefaults | toJson | quote }}
 {{- end }}

@@ -1,23 +1,31 @@
 /**
- * Per-channel default harness / model / provider / reasoning. Loaded from the
- * `SLACKBOTV2_CHANNEL_DEFAULTS` env var: JSON keyed by Slack conversation id,
- * each value an object normalized like the inline flags (see
- * `normalizeHarnessOverrides`):
+ * Per-channel default harness / model / provider / reasoning, plus behavioral
+ * channel settings. Loaded from the `SLACKBOTV2_CHANNEL_DEFAULTS` env var: JSON
+ * keyed by Slack conversation id, each value an object normalized like the
+ * inline flags (see `normalizeHarnessOverrides`):
  *
  *   SLACKBOTV2_CHANNEL_DEFAULTS='{
  *     "C0ENG":     {"harness": "claude", "model": "opus", "reasoning": "high"},
  *     "C0TRIAGE":  {"reasoning": "low"},
- *     "C0BEDROCK": {"provider": "bedrock", "model": "gpt-5.2"}
+ *     "C0BEDROCK": {"provider": "bedrock", "model": "gpt-5.2"},
+ *     "C0PAIR":    {"threadFollow": true}
  *   }'
  *
  * Fields are independent. Precedence (in index.ts): per-thread override, then
  * channel default, then deployment default. Setting `harness` restarts a thread
  * onto it like `--claude`/`--codex`; `reasoning` affects Codex and Nanocodex.
+ *
+ * `threadFollow` is a behavioral knob, not a harness one, and defaults to
+ * false: when true, the bot keeps responding to unmentioned replies in threads
+ * it is already subscribed to (i.e., after a first mention). New top-level
+ * messages still require a mention.
  */
 
 import { normalizeHarnessOverrides, type HarnessOverrides } from './overrides'
 
-export type ChannelDefaults = Record<string, HarnessOverrides>
+export type ChannelDefaultEntry = HarnessOverrides & { threadFollow?: boolean }
+
+export type ChannelDefaults = Record<string, ChannelDefaultEntry>
 
 /**
  * Parses `SLACKBOTV2_CHANNEL_DEFAULTS` into a channel→overrides map (empty for
@@ -50,13 +58,31 @@ export function parseChannelDefaults(
       continue
     }
     const overrides = normalizeHarnessOverrides(rawEntry, message => onError?.(`channel ${key}: ${message}`))
-    if (!overrides.harnessType && !overrides.model && !overrides.provider && !overrides.reasoning) {
-      onError?.(`channel ${key}: no usable harness/model/provider/reasoning fields`)
+    const threadFollow = parseThreadFollow(rawEntry.threadFollow, key, onError)
+    if (
+      !overrides.harnessType &&
+      !overrides.model &&
+      !overrides.provider &&
+      !overrides.reasoning &&
+      threadFollow === undefined
+    ) {
+      onError?.(`channel ${key}: no usable harness/model/provider/reasoning/threadFollow fields`)
       continue
     }
-    result[key] = overrides
+    result[key] = { ...overrides, ...(threadFollow === undefined ? {} : { threadFollow }) }
   }
   return result
+}
+
+function parseThreadFollow(
+  value: unknown,
+  channelId: string,
+  onError?: (message: string) => void
+): boolean | undefined {
+  if (value === undefined) return undefined
+  if (typeof value === 'boolean') return value
+  onError?.(`channel ${channelId}: threadFollow must be true or false`)
+  return undefined
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -82,9 +108,17 @@ export function channelIdFromThreadId(threadId: string): string | undefined {
 export function resolveChannelDefault(
   defaults: ChannelDefaults | undefined,
   threadId: string
-): HarnessOverrides | undefined {
+): ChannelDefaultEntry | undefined {
   if (!defaults) return undefined
   const channelId = channelIdFromThreadId(threadId)
   if (!channelId) return undefined
   return defaults[channelId]
+}
+
+/** True when the channel of this thread opts into unmentioned thread-follow replies. */
+export function threadFollowEnabled(
+  defaults: ChannelDefaults | undefined,
+  threadId: string
+): boolean {
+  return resolveChannelDefault(defaults, threadId)?.threadFollow === true
 }

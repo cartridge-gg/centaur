@@ -496,10 +496,18 @@ slackbotv2:
   # channel carries no explicit/sticky per-thread flag, below such a flag and
   # above the deployment/baked harness default, and forwarded onto the harness
   # input line so it takes effect. reasoning only affects the codex harness.
+  # An optional threadFollow boolean (default false) makes the bot keep
+  # responding to unmentioned replies in threads it is already subscribed to
+  # (after a first mention) in that channel, including bare "stop" commands;
+  # new top-level messages still require a mention. If a channel combines
+  # threadFollow with SLACKBOT_TRIGGER_BOT_ALLOWLIST, every reply from an
+  # allowlisted bot in a followed thread triggers an execution — keep the two
+  # disjoint per channel to avoid bot ping-pong.
   # Example:
   #   channelDefaults:
   #     C0ENG: { harness: claude, model: opus, reasoning: high }
   #     C0TRIAGE: { reasoning: low }
+  #     C0PAIR: { threadFollow: true }
   channelDefaults: {}
   # Message overrides strategy for Slack message text. "flags" keeps the legacy
   # deterministic --model/--claude/-rsn strategy. "llm" asks a small model for

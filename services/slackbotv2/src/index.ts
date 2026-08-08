@@ -60,7 +60,7 @@ import {
   reasoningForModel,
   type SlackContextBlock
 } from './console-session-link'
-import { resolveChannelDefault } from './channel-defaults'
+import { resolveChannelDefault, threadFollowEnabled } from './channel-defaults'
 import { extractMessageOverrides, type HarnessOverrides } from './overrides'
 import { createFlagMessageOverridesStrategy } from './message-overrides-strategy'
 import {
@@ -367,7 +367,11 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   chat.onSubscribedMessage(async (thread, message) => {
     if (!(await isAllowedSlackMessage(message, options, logger))) return
     if (slackRichTextMentionsUser(message.raw, options.botUserId)) message.isMention = true
-    if (message.isMention !== true) {
+    // Channels opted in via `threadFollow` keep responding to unmentioned
+    // replies in threads the bot is already subscribed to. Subscription is only
+    // ever created by the mention handlers, so new top-level messages still
+    // require a mention everywhere.
+    if (message.isMention !== true && !threadFollowEnabled(options.channelDefaults, thread.id)) {
       traceLog(
         options,
         'slackbotv2_subscribed_message_without_mention_ignored',
@@ -382,7 +386,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       mode: 'execute',
       options,
       state,
-      trigger: 'subscribed_message'
+      trigger: message.isMention === true ? 'subscribed_message' : 'thread_follow'
     })
   })
 
