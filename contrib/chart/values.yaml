@@ -419,6 +419,10 @@ apiRs:
   # Reaper: stop sandboxes older than the max lifetime, regardless of whether
   # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days
+  # Also stop sandboxes that have sat suspended (idle-paused) longer than this.
+  # Resuming clears the suspension timestamp, so activity extends the deadline.
+  # 0 disables the max-idle sweep.
+  sandboxMaxIdleSecs: 0
   sandboxReapIntervalSecs: 300
   # Cleanup worker: stop unreferenced session/warm-pool sandboxes after two
   # consecutive sweeps and restore idle-pauses lost across api-rs restarts.

@@ -1315,7 +1315,7 @@ impl SessionRuntime {
     }
 
     /// Spawn the background reaper that stops sandboxes whose total lifetime
-    /// expired. No-op when max-lifetime reaping is disabled.
+    /// or suspended-idle budget expired. No-op when both sweeps are disabled.
     pub fn with_sandbox_reaper(self, config: SandboxReaperConfig) -> Self {
         if !config.is_enabled() {
             return self;
