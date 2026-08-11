@@ -201,7 +201,11 @@ async def prune_slack_dm(pool, *, retention_days: int, dry_run: bool = False) ->
                 "  AND NOT EXISTS ("
                 "      SELECT 1 FROM slack_private_sync_messages m "
                 "      WHERE m.home_team_id = c.home_team_id "
-                "        AND m.conversation_id = c.conversation_id"
+                "        AND m.conversation_id = c.conversation_id "
+                "        AND ("
+                "            m.occurred_at IS NULL "
+                "            OR m.occurred_at >= NOW() - make_interval(days => $1)"
+                "        )"
                 "  )"
             ),
             delete_sql=(
