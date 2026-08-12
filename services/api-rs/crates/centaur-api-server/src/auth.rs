@@ -136,6 +136,9 @@ impl ApiAuthConfig {
             if spec.identity == "slackbot" {
                 capabilities.push(Capability::WorkflowsActions);
             }
+            if spec.workflow_runs {
+                capabilities.push(Capability::WorkflowsWrite);
+            }
             callers.push(static_caller(
                 spec.identity,
                 CallerClass::Ingress,
@@ -177,6 +180,7 @@ impl ApiAuthConfig {
                 Capability::SessionsWrite,
                 Capability::WorkflowsEvents,
                 Capability::WorkflowsActions,
+                Capability::WorkflowsWrite,
             ],
             Some(&["slack:"]),
         )];
@@ -310,12 +314,16 @@ const INGRESS_SPECS: &[IngressSpec] = &[
         identity: "slackbot",
         platform_prefixes: &["slack:"],
         workflow_events: true,
+        // c7e fork: slackbotv2's Slack file-event trigger starts workflow runs
+        // (POST /api/workflows/runs), which needs WorkflowsWrite.
+        workflow_runs: true,
     },
     IngressSpec {
         env_var: "DISCORDBOT_API_KEY",
         identity: "discordbot",
         platform_prefixes: &["discord:"],
         workflow_events: false,
+        workflow_runs: false,
     },
     IngressSpec {
         env_var: "GITHUBBOT_API_KEY",
@@ -327,18 +335,21 @@ const INGRESS_SPECS: &[IngressSpec] = &[
             "github-review:",
         ],
         workflow_events: true,
+        workflow_runs: false,
     },
     IngressSpec {
         env_var: "LINEARBOT_API_KEY",
         identity: "linearbot",
         platform_prefixes: &["linear:"],
         workflow_events: false,
+        workflow_runs: false,
     },
     IngressSpec {
         env_var: "TEAMSBOT_API_KEY",
         identity: "teamsbot",
         platform_prefixes: &["teams:"],
         workflow_events: false,
+        workflow_runs: false,
     },
 ];
 
@@ -348,6 +359,8 @@ struct IngressSpec {
     /// Every session thread-key prefix this ingress mints.
     platform_prefixes: &'static [&'static str],
     workflow_events: bool,
+    /// Whether the ingress may start and cancel workflow runs.
+    workflow_runs: bool,
 }
 
 fn static_caller(
@@ -566,6 +579,21 @@ mod tests {
             ]
             .as_slice()
         );
+    }
+
+    #[test]
+    fn only_slackbot_ingress_can_start_workflow_runs() {
+        // services/slackbotv2/src/file-event-trigger.ts POSTs
+        // /api/workflows/runs with SLACKBOT_API_KEY; the other ingresses only
+        // emit workflow events.
+        for spec in INGRESS_SPECS {
+            assert_eq!(
+                spec.workflow_runs,
+                spec.identity == "slackbot",
+                "{} workflow_runs grant drifted",
+                spec.identity
+            );
+        }
     }
 
     #[test]
