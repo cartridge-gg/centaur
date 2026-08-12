@@ -73,6 +73,12 @@ const options: SlackbotV2Options = {
     enabled: booleanEnv('SLACKBOTV2_GENERATIVE_UI_ENABLED', false),
     limits: parseGenerativeUiLimits(optionalEnv('SLACKBOTV2_GENERATIVE_UI_LIMITS'))
   },
+  fileEventWorkflowName: optionalEnv('SLACKBOTV2_FILE_EVENT_WORKFLOW_NAME'),
+  fileEventTypes: commaListEnv('SLACKBOTV2_FILE_EVENT_TYPES'),
+  fileEventChannelAllowlist: commaListEnv('SLACKBOTV2_FILE_EVENT_CHANNELS'),
+  // Comma-separated only: keywords may contain spaces ("huddle notes").
+  fileEventTitleKeywords: commaListEnv('SLACKBOTV2_FILE_EVENT_TITLE_KEYWORDS'),
+  fileEventDedupeSeconds: optionalNumberEnv('SLACKBOTV2_FILE_EVENT_DEDUPE_SECONDS'),
   // Same env vars deployers use to override the sandbox harness model
   // (sandbox.extraEnv); the chart mirrors them here so displayed defaults
   // track the deployment instead of the baked harness config.
@@ -151,6 +157,8 @@ console.log(
     ack_reaction_name: options.ackReactionName,
     steering_reaction_enabled: options.steeringReactionEnabled,
     steering_reaction_name: options.steeringReactionName,
+    file_event_trigger_enabled: Boolean(options.fileEventWorkflowName),
+    file_event_workflow: options.fileEventWorkflowName ?? null,
     port: server.port,
     api_url: apiUrl
   })
@@ -198,6 +206,16 @@ function stringEnv(name: string, fallback: string): string {
 
 function numberEnv(name: string, fallback: number): number {
   return optionalNumberEnv(name) ?? fallback
+}
+
+function commaListEnv(name: string): string[] | undefined {
+  const value = optionalEnv(name)
+  if (!value) return undefined
+  const parts = value
+    .split(',')
+    .map(part => part.trim())
+    .filter(Boolean)
+  return parts.length ? parts : undefined
 }
 
 function booleanEnv(name: string, fallback: boolean): boolean {
