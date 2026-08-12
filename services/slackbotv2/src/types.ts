@@ -163,6 +163,37 @@ export type SlackbotV2Options = {
   defaultHarnessType?: string
   fetch?: SlackbotV2Fetch
   /**
+   * Workflow name to run when a matching Slack file event arrives
+   * (SLACKBOTV2_FILE_EVENT_WORKFLOW_NAME). Unset disables the file-event
+   * trigger entirely. See file-event-trigger.ts.
+   */
+  fileEventWorkflowName?: string
+  /**
+   * Slack event types that trigger the file-event workflow
+   * (SLACKBOTV2_FILE_EVENT_TYPES). Defaults to file_shared + file_change; the
+   * Slack app must be subscribed to each listed bot event.
+   */
+  fileEventTypes?: readonly string[]
+  /**
+   * Channel ids whose file events may trigger the workflow
+   * (SLACKBOTV2_FILE_EVENT_CHANNELS). Only enforced when the event carries a
+   * channel — file_change events do not. Empty/unset allows all channels.
+   */
+  fileEventChannelAllowlist?: readonly string[]
+  /**
+   * Case-insensitive substrings matched against the file's files.info
+   * title/name/pretty_type before dispatching
+   * (SLACKBOTV2_FILE_EVENT_TITLE_KEYWORDS). Empty/unset skips the lookup and
+   * dispatches for every matching file event.
+   */
+  fileEventTitleKeywords?: readonly string[]
+  /**
+   * Time-bucket the dispatch idempotency key in seconds
+   * (SLACKBOTV2_FILE_EVENT_DEDUPE_SECONDS). Unset/0: one run per file, ever
+   * (workflow idempotency keys never expire server-side).
+   */
+  fileEventDedupeSeconds?: number
+  /**
    * Deployment-configured default model per harness wire value (claudecode |
    * codex), from the CLAUDE_MODEL / CODEX_MODEL env vars the chart mirrors
    * out of sandbox.extraEnv. Display/metadata only — never forwarded to the
