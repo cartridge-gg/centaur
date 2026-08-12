@@ -546,6 +546,46 @@ export async function forwardToSessionApi(
   return openSessionEventStream(options, input)
 }
 
+export type SlackbotV2WorkflowRunRequest = {
+  workflow_name: string
+  input: Record<string, unknown>
+  idempotency_key?: string
+}
+
+export type SlackbotV2WorkflowRunResponse = {
+  ok?: boolean
+  run_id?: string
+  task_id?: string
+  status?: string
+  created?: boolean
+}
+
+export async function dispatchWorkflowRun(
+  options: SlackbotV2Options,
+  request: SlackbotV2WorkflowRunRequest
+): Promise<SlackbotV2WorkflowRunResponse> {
+  const action = `dispatch workflow run ${request.workflow_name}`
+  const response = await recordSessionApiOperation(
+    'create_workflow_run',
+    () =>
+      fetchWithTimeout(
+        options.fetch ?? globalThis.fetch,
+        new URL('/api/workflows/runs', ensureTrailingSlash(options.apiUrl)),
+        {
+          body: JSON.stringify(request),
+          headers: apiHeaders(options),
+          method: 'POST'
+        },
+        sessionApiTimeoutMs(options),
+        action
+      ),
+    sessionApiTimeoutMs(options),
+    action
+  )
+  await ensureApiOk(response, action)
+  return (await response.json()) as SlackbotV2WorkflowRunResponse
+}
+
 export async function dispatchSlackBlockAction(
   options: SlackbotV2Options,
   payload: SlackbotV2BlockActionPayload

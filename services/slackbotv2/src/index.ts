@@ -29,6 +29,7 @@ import {
   type RendererEvent
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
+import { triggerFileEventWorkflow } from './file-event-trigger'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import {
   renderSlackDisplayText,
@@ -447,6 +448,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       }
       const lateFileTask = lateSlackFiles.repairFromWebhook(rawBody)
       if (lateFileTask) waitUntil(c, lateFileTask)
+      // The Chat SDK drops file events before any callback, so the file-event
+      // workflow trigger parses the (signature-verified) raw body itself.
+      const fileEventTask = triggerFileEventWorkflow(rawBody, options, {
+        filesInfo: fileId => slackFilesInfo(options, fileId)
+      })
+      if (fileEventTask) waitUntil(c, fileEventTask)
       outcome = response.ok ? 'success' : 'error'
       return new globalThis.Response(await response.text(), {
         headers: response.headers,
