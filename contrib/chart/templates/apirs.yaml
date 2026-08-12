@@ -288,6 +288,10 @@ spec:
             - name: CENTAUR_OVERLAY_DIR
               value: {{ .Values.overlay.mountPath | quote }}
 {{- end }}
+{{- if .Values.overlay.repo }}
+            - name: CENTAUR_OVERLAY_REPO
+              value: {{ .Values.overlay.repo | quote }}
+{{- end }}
             - name: SESSION_SANDBOX_BACKEND
               value: {{ .Values.apiRs.sandboxBackend | quote }}
             - name: SESSION_SANDBOX_WORKLOAD
