@@ -339,7 +339,11 @@ Use the app page to install the bot, copy the Bot User OAuth Token for
    `true` and subscribe to `channel_created`. For Slack agent view, complete the
    [Slack app migration](/quickstart) and set `slackbotv2.agentViewEnabled` to
    `true`. The toggle defaults to `false`. Subscribe to `agent_session_stopped`
-   to show Slack's Stop button, which interrupts the running execution.
+   to show Slack's Stop button, which interrupts the running execution. When the
+   file-event workflow trigger is enabled (`SLACKBOTV2_FILE_EVENT_WORKFLOW_NAME`),
+   also subscribe to the file events it matches — `file_shared` and
+   `file_change` by default — and grant `files:read` if the title-keyword filter
+   is configured.
 8. Enable Interactivity and set its Request URL to the same
    `https://<your-host>/api/webhooks/slack` URL. Block Kit actions are emitted
    to the workflow engine as `slack.block_action.<action_id>` events.
