@@ -159,22 +159,40 @@ def test_default_database_url_does_not_fall_back_to_raw_database_url(monkeypatch
         reset_tool_context(token)
 
 
-def test_postgres_database_name_defaults_to_ai_v2(monkeypatch):
+def test_postgres_database_name_defaults_to_the_declared_upstream(monkeypatch):
     monkeypatch.delenv("COMPANY_CONTEXT_POSTGRES_DATABASE", raising=False)
 
-    assert company_context_client._postgres_database_name() == "ai_v2"
+    assert company_context_client._postgres_database_name() == "centaur"
 
 
 def test_postgres_database_name_can_be_overridden(monkeypatch):
-    monkeypatch.setenv("COMPANY_CONTEXT_POSTGRES_DATABASE", "centaur")
+    monkeypatch.setenv("COMPANY_CONTEXT_POSTGRES_DATABASE", "warehouse")
 
-    assert company_context_client._postgres_database_name() == "centaur"
+    assert company_context_client._postgres_database_name() == "warehouse"
 
 
 def test_postgres_database_name_uses_default_for_blank_override(monkeypatch):
     monkeypatch.setenv("COMPANY_CONTEXT_POSTGRES_DATABASE", " ")
 
-    assert company_context_client._postgres_database_name() == "ai_v2"
+    assert company_context_client._postgres_database_name() == "centaur"
+
+
+def test_default_database_matches_the_declared_pg_dsn_secret():
+    """The default is a routing key, not a physical database: iron-proxy
+    selects the upstream by the database name in the connection request, and
+    api-rs registers that key from this manifest's `database` field. If the two
+    drift, every call fails with `no upstream for database "<name>"` — and
+    because the tool's callers fall back to other sources, that failure is
+    easy to miss."""
+    import tomllib
+
+    manifest = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    )
+    secrets = manifest["tool"]["centaur"]["secrets"]
+    (pg_dsn,) = [secret for secret in secrets if secret["type"] == "pg_dsn"]
+
+    assert pg_dsn["database"] == company_context_client.DEFAULT_POSTGRES_DATABASE
 
 
 @pytest.mark.parametrize("sql", ["", "   "])
