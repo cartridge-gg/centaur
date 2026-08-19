@@ -8,7 +8,9 @@ import {
   interruptSessionExecution,
   openSessionEventStream,
   serializeAttachment,
-  serializeMessage
+  serializeMessage,
+  slackMessagePermalink,
+  slackPermalinkFor
 } from '../src/session-api'
 import { renderSlackDisplayText } from '../src/slack-display-text'
 import type {
@@ -343,6 +345,38 @@ describe('Slack display text fallback', () => {
     expect(context?.text).toContain('thread_key: slack:C1:1700000000.000100')
     expect(context?.text).toContain('slack upload C1 /path/to/file --thread 1700000000.000100')
     expect(context?.text).toContain('Do not recover this destination with Slack search.')
+  })
+
+  test('includes the initiating message permalink in the Slack session context', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage('please PR', { id: '1700000000.000200' }))
+    )
+
+    const context = lineContent(executeLine(requests)).find(part =>
+      typeof part.text === 'string' && part.text.includes('# Slack Session Context')
+    )
+    expect(context?.text).toContain('session_context.slack.message_ts: 1700000000.000200')
+    expect(context?.text).toContain(
+      'session_context.slack.permalink: '
+        + 'https://slack.com/archives/C1/p1700000000000200?thread_ts=1700000000.000100&cid=C1'
+    )
+  })
+
+  test('builds root and reply Slack permalinks', () => {
+    const destination = { channelId: 'C1', threadTs: '1700000000.000100' }
+    expect(slackPermalinkFor(destination, '1700000000.000100')).toBe(
+      'https://slack.com/archives/C1/p1700000000000100'
+    )
+    expect(slackPermalinkFor(destination, '1700000000.000200')).toBe(
+      'https://slack.com/archives/C1/p1700000000000200?thread_ts=1700000000.000100&cid=C1'
+    )
+    expect(slackPermalinkFor(destination, 'not-a-ts')).toBeUndefined()
+    expect(slackMessagePermalink(apiMessage('hi', { threadId: 'not-slack' }))).toBeUndefined()
+    expect(slackMessagePermalink(apiMessage('hi', { threadId: 'slack:T1:C9:1700000000.000100' }))).toBe(
+      'https://slack.com/archives/C9/p1700000000000100'
+    )
   })
 
   test('includes team id for team-qualified Slack thread keys', async () => {
@@ -926,6 +960,9 @@ describe('session principal display name', () => {
     expect(requesterContext?.text).toContain('GitHub handle from Slack profile: @ada-lovelace')
     expect(requesterContext?.text).toContain('Prompted by: @ada-lovelace')
     expect(requesterContext?.text).toContain('Assign the PR to the requester when possible: `ada-lovelace`')
+    expect(requesterContext?.text).toContain(
+      'Slack thread: https://slack.com/archives/C1/p1700000000000100'
+    )
   })
 
   test('uses the requester Slack display name for PR attribution when no GitHub handle exists', async () => {
@@ -964,6 +1001,9 @@ describe('session principal display name', () => {
       'Use the requester\'s Slack display name or username because no verified GitHub handle is available.'
     )
     expect(requesterContext?.text).not.toContain('Omit the `Prompted by` line')
+    expect(requesterContext?.text).toContain(
+      'Slack thread: https://slack.com/archives/C1/p1700000000000100'
+    )
   })
 
   test('channel sessions name the principal after the channel', async () => {

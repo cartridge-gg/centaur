@@ -1491,7 +1491,7 @@ function sessionMessageParts(
   requesterIdentity?: RequesterIdentity
 ): JsonValue[] {
   const parts: JsonValue[] = []
-  const requesterContext = requesterIdentityContext(requesterIdentity)
+  const requesterContext = requesterIdentityContext(requesterIdentity, slackMessagePermalink(message))
   if (requesterContext) {
     parts.push({ type: 'text', text: requesterContext })
   }
@@ -1671,7 +1671,10 @@ function stagedAttachmentInputLines(
   return lines
 }
 
-function requesterIdentityContext(identity: RequesterIdentity | undefined): string | undefined {
+function requesterIdentityContext(
+  identity: RequesterIdentity | undefined,
+  slackPermalink?: string
+): string | undefined {
   if (!identity?.slackUserId && !identity?.slackUserName && !identity?.githubHandle) return undefined
   const slackAttributionName = requesterSlackAttributionName(identity)
 
@@ -1698,7 +1701,8 @@ function requesterIdentityContext(identity: RequesterIdentity | undefined): stri
         + `the PR body MUST contain this standalone line: \`Prompted by: ${identity.githubHandle}\``,
       '- The credited prompter is the requester in this section, not the Slack thread OP/root author.',
       '- This is a GitHub PR body requirement, not a Slack response mention rule.',
-      `- Assign the PR to the requester when possible: \`${githubLogin}\``
+      `- Assign the PR to the requester when possible: \`${githubLogin}\``,
+      ...slackOriginAttributionLines(slackPermalink)
     )
   } else {
     const promptedBy = slackAttributionName ?? 'unknown Slack requester'
@@ -1715,12 +1719,23 @@ function requesterIdentityContext(identity: RequesterIdentity | undefined): stri
         + 'handle is available.',
       '- Do not infer a GitHub username from Slack display name, real name, or email.',
       '- The credited prompter is the requester in this section, not the Slack thread OP/root author.',
-      '- This is a GitHub PR body requirement, not a Slack response mention rule.'
+      '- This is a GitHub PR body requirement, not a Slack response mention rule.',
+      ...slackOriginAttributionLines(slackPermalink)
     )
   }
 
   lines.push('', 'The user message follows in the next content block.', '---')
   return lines.join('\n')
+}
+
+function slackOriginAttributionLines(slackPermalink: string | undefined): string[] {
+  if (!slackPermalink) return []
+  return [
+    '- The PR body MUST also contain this standalone line directly after the `Prompted by:` line: '
+      + `\`Slack thread: ${slackPermalink}\``,
+    '- This links the PR back to the Slack message that requested it. '
+      + 'Use the link exactly as given; do not recover it with Slack search.'
+  ]
 }
 
 function requesterSlackAttributionName(identity: RequesterIdentity): string | undefined {
@@ -1745,11 +1760,11 @@ function codexInputContent(
   contextPreamble?: string
 ): JsonValue[] {
   const content: JsonValue[] = []
-  const slackSessionContext = slackUploadSessionContext(message.threadId)
+  const slackSessionContext = slackUploadSessionContext(message.threadId, message.id)
   if (slackSessionContext) {
     content.push({ type: 'text', text: slackSessionContext })
   }
-  const requesterContext = requesterIdentityContext(requesterIdentity)
+  const requesterContext = requesterIdentityContext(requesterIdentity, slackMessagePermalink(message))
   if (requesterContext) {
     content.push({ type: 'text', text: requesterContext })
   }
@@ -1788,9 +1803,10 @@ type SlackThreadDestination = {
   threadTs: string
 }
 
-function slackUploadSessionContext(threadId: string): string | undefined {
+function slackUploadSessionContext(threadId: string, messageTs?: string): string | undefined {
   const destination = slackThreadDestination(threadId)
   if (!destination) return undefined
+  const permalink = messageTs ? slackPermalinkFor(destination, messageTs) : undefined
 
   const lines = [
     '# Slack Session Context',
@@ -1799,6 +1815,8 @@ function slackUploadSessionContext(threadId: string): string | undefined {
     ...(destination.teamId ? [`- session_context.slack.team_id: ${destination.teamId}`] : []),
     `- session_context.slack.channel_id: ${destination.channelId}`,
     `- session_context.slack.thread_ts: ${destination.threadTs}`,
+    ...(messageTs ? [`- session_context.slack.message_ts: ${messageTs}`] : []),
+    ...(permalink ? [`- session_context.slack.permalink: ${permalink}`] : []),
     `- thread_key: ${threadId}`,
     '',
     'Use these exact IDs for Slack file uploads in this thread.',
@@ -1807,6 +1825,28 @@ function slackUploadSessionContext(threadId: string): string | undefined {
     '---'
   ]
   return lines.join('\n')
+}
+
+/**
+ * Permalink to the Slack message that initiated this turn, in the standard
+ * `https://slack.com/archives/<channel>/p<ts>` form. Thread replies carry the
+ * `?thread_ts=<root>&cid=<channel>` suffix so the link opens inside the thread.
+ */
+export function slackPermalinkFor(
+  destination: SlackThreadDestination,
+  messageTs: string
+): string | undefined {
+  const ts = messageTs.trim()
+  if (!/^\d+\.\d+$/.test(ts)) return undefined
+  const base = `https://slack.com/archives/${destination.channelId}/p${ts.replace('.', '')}`
+  if (ts === destination.threadTs) return base
+  return `${base}?thread_ts=${destination.threadTs}&cid=${destination.channelId}`
+}
+
+export function slackMessagePermalink(message: SlackbotV2ApiMessage): string | undefined {
+  const destination = slackThreadDestination(message.threadId)
+  if (!destination) return undefined
+  return slackPermalinkFor(destination, message.id)
 }
 
 function slackThreadDestination(threadId: string): SlackThreadDestination | undefined {
