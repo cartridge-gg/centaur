@@ -99,6 +99,7 @@
 |Use the [Requester Context] block when present. For Slack, prefer the verified GitHub handle resolved from the requester's Slack profile; otherwise use the exact `Prompted by:` value supplied by the requesting surface.
 |If [Requester Context] provides an exact `Prompted by:` line, copy that line exactly into the PR body.
 |Do not infer a GitHub username from a Slack name, email, or thread history. The credited prompter is the user who prompted the current turn, not necessarily the Slack thread root author.
+|When the requesting surface supplies a `Slack thread: <permalink>` line, copy it exactly into the PR body directly under `Prompted by:` so the PR can be traced back to the Slack message that requested it.
 
 [Python policy — ALWAYS use uv]
 |ALWAYS use `uv run python` for inline Python and scripts. NEVER invoke `python` or `python3` directly.
