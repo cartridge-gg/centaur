@@ -46,14 +46,7 @@ LEGACY_GOOGLE_DRIVE_SOURCE = "google_drive"
 GOOGLE_DOCS_SOURCE_TYPE = "google_doc"
 COMPANY_CONTEXT_DSN_ENV = "CENTAUR_POSTGRES_DSN"
 COMPANY_CONTEXT_DATABASE_ENV = "COMPANY_CONTEXT_POSTGRES_DATABASE"
-# iron-proxy multiplexes every Postgres upstream through one listener and routes
-# by the database name in the connection request, so this name is a routing key
-# — it must match the `database` field of this package's pg_dsn secret in
-# pyproject.toml (which is what api-rs registers with iron-control), not the
-# physical database behind the proxy. CENTAUR_POSTGRES_DSN carries no database
-# path, so whatever is set here is what the proxy sees.
-# test_default_database_matches_the_declared_pg_dsn_secret pins the two together.
-DEFAULT_POSTGRES_DATABASE = "centaur"
+DEFAULT_POSTGRES_DATABASE = "ai_v2"
 COMPANY_CONTEXT_LOOKUP_METRICS_ENABLED_ENV = "COMPANY_CONTEXT_LOOKUP_METRICS_ENABLED"
 VICTORIAMETRICS_PUSH_ENABLED_ENV = "VICTORIAMETRICS_PUSH_ENABLED"
 VICTORIAMETRICS_URL_ENV = "VICTORIAMETRICS_URL"
