@@ -203,6 +203,35 @@ module Api
         assert BrokerCredential.refreshable.exists?(id: created.id)
       end
 
+      test "create app_store_connect grant stores key material and redacts private key" do
+        private_key = OpenSSL::PKey::EC.generate("prime256v1").to_pem
+        body = {
+          data: {
+            namespace: "acme", foreign_id: "app-store-connect",
+            grant: "app_store_connect",
+            client_id: "issuer-id",
+            external_user_key: "KEY123",
+            client_secret: private_key
+          }
+        }
+
+        assert_difference -> { BrokerCredential.count } => 1 do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "app_store_connect", data["grant"]
+        assert_equal "issuer-id", data["client_id"]
+        assert_equal "KEY123", data["external_user_key"]
+        assert_nil data["token_endpoint"]
+        refute data.key?("client_secret")
+        refute data.key?("access_token")
+
+        created = BrokerCredential.find_by_oid(data["id"])
+        assert_equal private_key, created.client_secret
+        assert BrokerCredential.refreshable.exists?(id: created.id)
+      end
+
       test "create rejects a missing client_id" do
         body = {
           data: {

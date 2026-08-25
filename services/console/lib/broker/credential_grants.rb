@@ -5,6 +5,7 @@ module Broker
   module CredentialGrants
     require "base64"
     require "json"
+    require "jwt"
     require "net/http"
     require "openssl"
     require "time"
@@ -12,9 +13,13 @@ module Broker
 
     PREQIN_TOKEN_ENDPOINT = "https://api.preqin.com/connect/token".freeze
     PREQIN_REFRESH_TOKEN_ENDPOINT = "https://api.preqin.com/connect/refresh_token".freeze
+    APP_STORE_CONNECT_AUDIENCE = "appstoreconnect-v1".freeze
+    APP_STORE_CONNECT_TOKEN_TTL = 19.minutes
 
-    GRANTS = %w[refresh_token client_credentials password preqin github_app].freeze
-    REFRESHABLE_WITHOUT_TOKEN_GRANTS = %w[client_credentials password preqin github_app].freeze
+    GRANTS = %w[refresh_token client_credentials password preqin github_app app_store_connect].freeze
+    REFRESHABLE_WITHOUT_TOKEN_GRANTS = %w[
+      client_credentials password preqin github_app app_store_connect
+    ].freeze
 
     Outcome = Data.define(:result, :clear_refresh_token, :dead_reason)
 
@@ -39,6 +44,8 @@ module Broker
           validate_preqin(credential)
         when "github_app"
           validate_github_app(credential)
+        when "app_store_connect"
+          validate_app_store_connect(credential)
         end
       end
 
@@ -52,6 +59,8 @@ module Broker
           refresh_preqin(credential)
         when "github_app"
           refresh_github_app(credential)
+        when "app_store_connect"
+          refresh_app_store_connect(credential)
         else
           refresh_token(credential)
         end
@@ -199,6 +208,41 @@ module Broker
         )
       end
 
+      def refresh_app_store_connect(credential)
+        now = Time.current
+        require_value!("client_id", credential.client_id)
+        require_value!("external_user_key", credential.external_user_key)
+        require_value!("client_secret", credential.client_secret)
+
+        key = OpenSSL::PKey::EC.new(private_key_pem(credential.client_secret))
+        raise OpenSSL::PKey::PKeyError, "private key required" unless key.private?
+
+        token = JWT.encode(
+          {
+            iss: credential.client_id,
+            iat: now.to_i,
+            exp: now.to_i + APP_STORE_CONNECT_TOKEN_TTL.to_i,
+            aud: APP_STORE_CONNECT_AUDIENCE
+          },
+          key,
+          "ES256",
+          { kid: credential.external_user_key, typ: "JWT" }
+        )
+        result = Broker::RefreshClient::Result.new(
+          access_token: token,
+          refresh_token: nil,
+          expires_in: APP_STORE_CONNECT_TOKEN_TTL.to_i
+        )
+        success(result, clear_refresh_token: true)
+      rescue OpenSSL::PKey::PKeyError, OpenSSL::PKey::ECError, JWT::EncodeError, ArgumentError => e
+        raise Broker::RefreshError.new(
+          "App Store Connect private key is invalid: #{e.class}",
+          stage: "config",
+          code: "invalid_private_key",
+          retryable: false
+        )
+      end
+
       def oauth_refresh_token(credential)
         post_token_form(
           credential,
@@ -280,12 +324,12 @@ module Broker
           iss: credential.client_id
         }))
         signing_input = "#{header}.#{payload}"
-        key = OpenSSL::PKey::RSA.new(github_app_private_key_pem(credential.client_secret))
+        key = OpenSSL::PKey::RSA.new(private_key_pem(credential.client_secret))
         signature = key.sign(OpenSSL::Digest.new("SHA256"), signing_input)
         "#{signing_input}.#{base64url(signature)}"
       end
 
-      def github_app_private_key_pem(value)
+      def private_key_pem(value)
         text = value.to_s
         return text if text.include?("-----BEGIN")
 
@@ -352,6 +396,15 @@ module Broker
       def validate_github_app(credential)
         if credential.client_secret.blank?
           credential.errors.add(:client_secret, "can't be blank for the GitHub App broker grant")
+        end
+      end
+
+      def validate_app_store_connect(credential)
+        if credential.external_user_key.blank?
+          credential.errors.add(:external_user_key, "can't be blank for the App Store Connect broker grant")
+        end
+        if credential.client_secret.blank?
+          credential.errors.add(:client_secret, "can't be blank for the App Store Connect broker grant")
         end
       end
 

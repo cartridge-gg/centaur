@@ -79,7 +79,7 @@ class BrokerCredential < ApplicationRecord
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }
   validates :foreign_id, uniqueness: { allow_nil: true },
             format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }, allow_nil: true
-  validates :token_endpoint, presence: true
+  validates :token_endpoint, presence: true, unless: -> { grant == "app_store_connect" }
   # client_id is sourced from the linked OauthApp for flow-minted credentials, so
   # it is only required for standalone grants whose strategy uses it.
   validates :client_id, presence: true, if: -> { Broker::CredentialGrants.client_id_required?(self) }

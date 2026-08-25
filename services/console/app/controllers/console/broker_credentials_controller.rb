@@ -58,12 +58,15 @@ module Console
     # mirror the API controller's handling.
     def assign_form(credential)
       fields = credential_params.permit(:namespace, :foreign_id, :name, :description,
-                                        :grant, :token_endpoint, :client_id,
+                                        :grant, :token_endpoint, :client_id, :external_user_key,
                                         :early_refresh_slack_seconds, :early_refresh_fraction,
                                         :max_refresh_interval_seconds, :refresh_timeout_seconds)
       fields[:namespace] = fields[:namespace].presence || "default"
       fields[:foreign_id] = fields[:foreign_id].presence
       credential.assign_attributes(fields)
+      if credential.grant == "app_store_connect" && credential.will_save_change_to_external_user_key?
+        reset_refresh_state(credential)
+      end
       credential.scopes = scope_params
       credential.token_endpoint_headers = header_params
       credential.labels = label_params
@@ -71,7 +74,9 @@ module Console
       secret = credential_params[:client_secret]
       if secret.present?
         credential.client_secret = secret
-        reset_refresh_state(credential) if credential.grant == "client_credentials"
+        if %w[client_credentials app_store_connect].include?(credential.grant)
+          reset_refresh_state(credential)
+        end
       end
       apply_initial_values(credential)
     end

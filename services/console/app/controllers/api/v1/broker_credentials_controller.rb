@@ -49,7 +49,7 @@ module Api
 
       def assign_and_save!(ref, attrs)
         base = attrs.permit(:namespace, :foreign_id, :name, :description, :token_endpoint,
-                            :grant, :client_id,
+                            :grant, :client_id, :external_user_key,
                             :early_refresh_slack_seconds, :early_refresh_fraction,
                             :max_refresh_interval_seconds, :refresh_timeout_seconds,
                             labels: {}, scopes: [])
@@ -61,6 +61,7 @@ module Api
 
         BrokerCredential.transaction do
           ref.assign_attributes(base)
+          reset_refresh_state(ref) if ref.grant == "app_store_connect" && ref.will_save_change_to_external_user_key?
           apply_client_secret(ref, attrs)
           apply_token_endpoint_headers(ref, attrs)
           apply_initial_values(ref, attrs)
@@ -83,7 +84,7 @@ module Api
         return if secret.blank?
 
         ref.client_secret = secret
-        reset_refresh_state(ref) if ref.grant == "client_credentials"
+        reset_refresh_state(ref) if %w[client_credentials app_store_connect].include?(ref.grant)
       end
 
       # These fields are write-only initial/re-auth values. Supplying any

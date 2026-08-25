@@ -45,6 +45,10 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     @github_private_key ||= OpenSSL::PKey::RSA.generate(2048)
   end
 
+  def app_store_connect_private_key
+    @app_store_connect_private_key ||= OpenSSL::PKey::EC.generate("prime256v1")
+  end
+
   def github_app_response(token: "ghs_installation", expires_at: 1.hour.from_now)
     response = Net::HTTPOK.new("1.1", "200", "OK")
     response.instance_variable_set(
@@ -141,6 +145,34 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     )
     refute bc.valid?
     assert bc.errors[:client_secret].any? { |m| m.include?("GitHub App broker grant") }
+  end
+
+  test "app_store_connect grant is valid without a token endpoint" do
+    bc = build_credential(
+      grant: "app_store_connect",
+      token_endpoint: nil,
+      client_id: "issuer-id",
+      external_user_key: "KEY123",
+      client_secret: app_store_connect_private_key.to_pem,
+      refresh_token: nil
+    )
+
+    assert bc.valid?, bc.errors.full_messages.to_sentence
+  end
+
+  test "app_store_connect grant requires key id and private key" do
+    bc = build_credential(
+      grant: "app_store_connect",
+      token_endpoint: nil,
+      client_id: "issuer-id",
+      external_user_key: nil,
+      client_secret: nil,
+      refresh_token: nil
+    )
+
+    refute bc.valid?
+    assert bc.errors[:external_user_key].any? { |m| m.include?("App Store Connect broker grant") }
+    assert bc.errors[:client_secret].any? { |m| m.include?("App Store Connect broker grant") }
   end
 
   # --- oauth_app provenance (flow-minted credentials) -----------------------
@@ -559,6 +591,73 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     assert_equal "invalid_private_key", bc.dead_reason
   end
 
+  test "app_store_connect grant mints a signed short-lived bearer token" do
+    now = Time.current
+    bc = create_credential(
+      grant: "app_store_connect",
+      token_endpoint: nil,
+      client_id: "issuer-id",
+      external_user_key: "KEY123",
+      client_secret: app_store_connect_private_key.to_pem,
+      refresh_token: nil
+    )
+
+    bc.refresh!(now: now)
+    bc.reload
+
+    payload, header = JWT.decode(
+      bc.access_token,
+      app_store_connect_private_key,
+      true,
+      algorithms: [ "ES256" ],
+      aud: Broker::CredentialGrants::APP_STORE_CONNECT_AUDIENCE,
+      verify_aud: true
+    )
+    assert_equal "issuer-id", payload["iss"]
+    assert_equal Broker::CredentialGrants::APP_STORE_CONNECT_AUDIENCE, payload["aud"]
+    assert_equal "KEY123", header["kid"]
+    assert_equal "ES256", header["alg"]
+    assert_operator payload["exp"] - payload["iat"], :<=, 20.minutes.to_i
+    assert_equal Broker::CredentialGrants::APP_STORE_CONNECT_TOKEN_TTL.to_i,
+                 payload["exp"] - payload["iat"]
+    assert_nil bc.refresh_token
+    assert_in_delta now.to_f + 19.minutes.to_i, bc.expires_at.to_f, 2
+  end
+
+  test "app_store_connect grant accepts a base64 encoded private key" do
+    bc = create_credential(
+      grant: "app_store_connect",
+      token_endpoint: nil,
+      client_id: "issuer-id",
+      external_user_key: "KEY123",
+      client_secret: Base64.strict_encode64(app_store_connect_private_key.to_pem),
+      refresh_token: nil
+    )
+
+    bc.refresh!
+    bc.reload
+
+    refute bc.dead?
+    assert_match(/\A[^.]+\.[^.]+\.[^.]+\z/, bc.access_token)
+  end
+
+  test "app_store_connect grant marks invalid private keys dead" do
+    bc = create_credential(
+      grant: "app_store_connect",
+      token_endpoint: nil,
+      client_id: "issuer-id",
+      external_user_key: "KEY123",
+      client_secret: "not-a-private-key",
+      refresh_token: nil
+    )
+
+    bc.refresh!
+    bc.reload
+
+    assert bc.dead?
+    assert_equal "invalid_private_key", bc.dead_reason
+  end
+
   test "preqin grant prefers the Preqin refresh endpoint when it has a refresh token" do
     client = Minitest::Mock.new
     expect_refresh(client, returns: result(access_token: "AT", refresh_token: nil)) do |request|
@@ -676,6 +775,20 @@ class BrokerCredentialTest < ActiveSupport::TestCase
       token_endpoint: "https://api.github.com/app/installations/456/access_tokens",
       client_id: "123",
       client_secret: github_private_key.to_pem,
+      refresh_token: nil
+    )
+    bc.update_columns(last_refresh: 1.hour.ago, next_attempt_at: 1.minute.ago)
+
+    assert_includes BrokerCredential.refreshable.pluck(:id), bc.id
+  end
+
+  test "refreshable includes app_store_connect credentials without a refresh_token" do
+    bc = create_credential(
+      grant: "app_store_connect",
+      token_endpoint: nil,
+      client_id: "issuer-id",
+      external_user_key: "KEY123",
+      client_secret: app_store_connect_private_key.to_pem,
       refresh_token: nil
     )
     bc.update_columns(last_refresh: 1.hour.ago, next_attempt_at: 1.minute.ago)
