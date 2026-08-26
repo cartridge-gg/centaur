@@ -31,6 +31,17 @@ SLUG="$2"
 SRC="$HOME/github/$REPO"
 DEST="$HOME/branches/$REPO"
 
+# Deterministic, deployment-neutral bot identity used only when no explicit
+# override is set and the authenticated GitHub user cannot be discovered (e.g.
+# GitHub App installation tokens return 403 for /user). This makes commits
+# carry a stable bot author instead of an improvised address. The bare
+# "<slug>[bot]@users.noreply.github.com" form deliberately
+# omits the numeric "id+" prefix, so GitHub links it to no real account —
+# unlike centaur@users.noreply.github.com, which it attributes to an unrelated
+# user.
+readonly FALLBACK_GIT_USER_NAME="centaur-agent[bot]"
+readonly FALLBACK_GIT_USER_EMAIL="centaur-agent[bot]@users.noreply.github.com"
+
 # Match commit authorship to the account that will publish the PR so GitHub does
 # not preserve a separate sandbox identity as a squash-merge co-author.
 configure_git_identity() {
@@ -54,13 +65,16 @@ configure_git_identity() {
         IFS=$'\t' read -r name email <<< "$identity"
     fi
 
-    if [ -n "$name" ] && [ -n "$email" ]; then
-        git -C "$DEST" config user.name "$name"
-        git -C "$DEST" config user.email "$email"
-    elif ! git -C "$DEST" var GIT_AUTHOR_IDENT >/dev/null 2>&1; then
-        echo "Warning: no Git author identity is configured; set" \
-            "CENTAUR_GIT_USER_NAME and CENTAUR_GIT_USER_EMAIL before committing" >&2
+    # Never leave the clone without an author: user.useConfigOnly makes git
+    # refuse to commit when unset, which is what tempts agents to improvise a
+    # bad address. Install the safe bot fallback instead.
+    if [ -z "$name" ] || [ -z "$email" ]; then
+        name="$FALLBACK_GIT_USER_NAME"
+        email="$FALLBACK_GIT_USER_EMAIL"
     fi
+
+    git -C "$DEST" config user.name "$name"
+    git -C "$DEST" config user.email "$email"
 }
 
 if [[ ! "$SLUG" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$ ]]; then

@@ -90,6 +90,60 @@ class GitBranchTest(unittest.TestCase):
         self.assertTrue(commit.startswith("Perry Dime <svc_ai@paradigm.xyz>\n"))
         self.assertNotIn("Co-authored-by:", commit)
 
+    def test_falls_back_to_bot_identity_without_override_or_github(self) -> None:
+        destination = self._run_git_branch({"GITHUB_TOKEN": ""})
+
+        name = self._git(
+            "-C", str(destination), "config", "user.name"
+        ).stdout.strip()
+        email = self._git(
+            "-C", str(destination), "config", "user.email"
+        ).stdout.strip()
+        self.assertEqual(name, "centaur-agent[bot]")
+        self.assertEqual(email, "centaur-agent[bot]@users.noreply.github.com")
+        self.assertNotEqual(email, "centaur@users.noreply.github.com")
+
+        # With the fallback in place a commit succeeds and carries the safe bot
+        # author, so no agent needs to improvise centaur@users.noreply.github.com.
+        (destination / "CHANGELOG.md").write_text("fixed\n")
+        self._git("-C", str(destination), "add", "CHANGELOG.md")
+        self._git("-C", str(destination), "commit", "-m", "fix: fallback identity")
+        commit = self._git(
+            "-C", str(destination), "show", "-s", "--format=%an <%ae>", "HEAD"
+        ).stdout.strip()
+        self.assertEqual(
+            commit, "centaur-agent[bot] <centaur-agent[bot]@users.noreply.github.com>"
+        )
+        self.assertNotIn("centaur@users.noreply.github.com", commit)
+
+    def test_falls_back_when_authenticated_user_lookup_fails(self) -> None:
+        # GitHub App installation tokens return 403 for /user; emulate gh failing.
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(
+            "#!/bin/sh\n"
+            "echo 'HTTP 403: Resource not accessible by integration' >&2\n"
+            "exit 1\n"
+        )
+        gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
+
+        destination = self._run_git_branch(
+            {
+                "GITHUB_TOKEN": "placeholder",
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            }
+        )
+
+        self.assertEqual(
+            self._git("-C", str(destination), "config", "user.name").stdout.strip(),
+            "centaur-agent[bot]",
+        )
+        self.assertEqual(
+            self._git("-C", str(destination), "config", "user.email").stdout.strip(),
+            "centaur-agent[bot]@users.noreply.github.com",
+        )
+
     def test_explicit_identity_does_not_require_github(self) -> None:
         destination = self._run_git_branch(
             {
