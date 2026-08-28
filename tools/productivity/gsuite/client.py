@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import urllib.request
+import uuid
 from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse, urlsplit
@@ -469,6 +470,54 @@ def calendar_events(
     return events
 
 
+# Google Meet is not a plain event field: the body carries a conferencing
+# createRequest and the call must opt in with conferenceDataVersion=1, or
+# Calendar silently drops conferenceData and returns an event with no link.
+_MEET_SOLUTION_KEY = "hangoutsMeet"
+
+
+def _conference_create_request() -> dict:
+    """Body fragment asking Calendar to mint a Google Meet conference.
+
+    ``requestId`` is the mint's idempotency key: Calendar reuses the existing
+    conference when the same id is replayed, so it must be fresh per event.
+    """
+    return {
+        "createRequest": {
+            "requestId": uuid.uuid4().hex,
+            "conferenceSolutionKey": {"type": _MEET_SOLUTION_KEY},
+        }
+    }
+
+
+def _meet_link(event: dict) -> str:
+    """Return the event's Google Meet URL, or "" when it has none."""
+    link = event.get("hangoutLink")
+    if link:
+        return link
+
+    for entry in event.get("conferenceData", {}).get("entryPoints", []):
+        if entry.get("entryPointType") == "video" and entry.get("uri"):
+            return entry["uri"]
+
+    return ""
+
+
+def _await_meet_link(service, calendar_id: str, event: dict) -> str:
+    """Return the Meet URL, re-fetching the event once if the mint is pending.
+
+    Calendar can answer the write before the conference exists, leaving a
+    pending createRequest and no entry points. One re-fetch settles it in
+    practice and spares callers from polling.
+    """
+    link = _meet_link(event)
+    if link or not event.get("id"):
+        return link
+
+    refreshed = service.events().get(calendarId=calendar_id, eventId=event["id"]).execute()
+    return _meet_link(refreshed)
+
+
 def calendar_create_event(
     summary: str,
     start: str,
@@ -477,6 +526,7 @@ def calendar_create_event(
     description: str | None = None,
     location: str | None = None,
     attendees: list[str] | None = None,
+    conference: bool = False,
 ) -> dict:
     """Create a calendar event.
 
@@ -488,9 +538,10 @@ def calendar_create_event(
         description: Event description
         location: Event location
         attendees: List of attendee emails
+        conference: Attach a Google Meet conference to the event
 
     Returns:
-        Dict with id, html_link
+        Dict with id, html_link, meet_link (meet_link is "" without conference)
     """
     service = get_calendar_service()
 
@@ -512,12 +563,18 @@ def calendar_create_event(
     if attendees:
         event["attendees"] = [{"email": email} for email in attendees]
 
+    insert_kwargs = {}
+    if conference:
+        event["conferenceData"] = _conference_create_request()
+        insert_kwargs["conferenceDataVersion"] = 1
+
     result = (
         service.events()
         .insert(
             calendarId=calendar_id,
             body=event,
             sendUpdates="all" if attendees else "none",
+            **insert_kwargs,
         )
         .execute()
     )
@@ -525,6 +582,7 @@ def calendar_create_event(
     return {
         "id": result.get("id", ""),
         "html_link": result.get("htmlLink", ""),
+        "meet_link": _await_meet_link(service, calendar_id, result) if conference else "",
     }
 
 
@@ -537,6 +595,7 @@ def calendar_update_event(
     description: str | None = None,
     location: str | None = None,
     add_attendees: list[str] | None = None,
+    conference: bool = False,
 ) -> dict:
     """Update a calendar event.
 
@@ -549,9 +608,10 @@ def calendar_update_event(
         description: New description
         location: New location
         add_attendees: List of attendee emails to add
+        conference: Attach a Google Meet conference if the event lacks one
 
     Returns:
-        Dict with id, html_link
+        Dict with id, html_link, meet_link ("" when the event has no Meet)
     """
     service = get_calendar_service()
 
@@ -583,6 +643,15 @@ def calendar_update_event(
                 existing.append({"email": email})
         event["attendees"] = existing
 
+    # conferenceDataVersion defaults to 0, under which Calendar ignores the
+    # conferenceData we just read back -- that is what keeps an existing Meet
+    # intact on an ordinary update.
+    update_kwargs = {}
+    if conference:
+        update_kwargs["conferenceDataVersion"] = 1
+        if not event.get("conferenceData"):
+            event["conferenceData"] = _conference_create_request()
+
     result = (
         service.events()
         .update(
@@ -590,6 +659,7 @@ def calendar_update_event(
             eventId=event_id,
             body=event,
             sendUpdates="all" if add_attendees else "none",
+            **update_kwargs,
         )
         .execute()
     )
@@ -597,6 +667,7 @@ def calendar_update_event(
     return {
         "id": result.get("id", ""),
         "html_link": result.get("htmlLink", ""),
+        "meet_link": _await_meet_link(service, calendar_id, result) if conference else "",
     }
 
 
