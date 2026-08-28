@@ -490,6 +490,29 @@ def _conference_create_request() -> dict:
     }
 
 
+def _is_material_change(
+    *,
+    summary: str | None,
+    start: str | None,
+    end: str | None,
+    location: str | None,
+    add_attendees: list[str] | None,
+    conference_added: bool,
+) -> bool:
+    """Whether an edit is one an attendee needs to be told about.
+
+    When, where, what it is called, who else is coming, and whether there is
+    now a call to join. Description-only edits are deliberately excluded: they
+    are the common case for tidying wording, and mailing everyone for that
+    trains people to ignore the notices that matter.
+    """
+    return (
+        any(field is not None for field in (summary, start, end, location))
+        or bool(add_attendees)
+        or conference_added
+    )
+
+
 def _meet_link(event: dict) -> str:
     """Return the event's Google Meet URL, or "" when it has none."""
     link = event.get("hangoutLink")
@@ -596,6 +619,7 @@ def calendar_update_event(
     location: str | None = None,
     add_attendees: list[str] | None = None,
     conference: bool = False,
+    notify: bool | None = None,
 ) -> dict:
     """Update a calendar event.
 
@@ -609,6 +633,9 @@ def calendar_update_event(
         location: New location
         add_attendees: List of attendee emails to add
         conference: Attach a Google Meet conference if the event lacks one
+        notify: Email the attendees. Defaults to notifying when the event has
+            attendees and the change is material (see _is_material_change);
+            pass True or False to decide explicitly.
 
     Returns:
         Dict with id, html_link, meet_link ("" when the event has no Meet)
@@ -647,10 +674,22 @@ def calendar_update_event(
     # conferenceData we just read back -- that is what keeps an existing Meet
     # intact on an ordinary update.
     update_kwargs = {}
+    conference_added = False
     if conference:
         update_kwargs["conferenceDataVersion"] = 1
         if not event.get("conferenceData"):
             event["conferenceData"] = _conference_create_request()
+            conference_added = True
+
+    if notify is None:
+        notify = bool(event.get("attendees")) and _is_material_change(
+            summary=summary,
+            start=start,
+            end=end,
+            location=location,
+            add_attendees=add_attendees,
+            conference_added=conference_added,
+        )
 
     result = (
         service.events()
@@ -658,7 +697,7 @@ def calendar_update_event(
             calendarId=calendar_id,
             eventId=event_id,
             body=event,
-            sendUpdates="all" if add_attendees else "none",
+            sendUpdates="all" if notify else "none",
             **update_kwargs,
         )
         .execute()
@@ -669,6 +708,34 @@ def calendar_update_event(
         "html_link": result.get("htmlLink", ""),
         "meet_link": _await_meet_link(service, calendar_id, result) if conference else "",
     }
+
+
+def calendar_delete_event(
+    event_id: str,
+    calendar_id: str = "primary",
+    notify: bool = True,
+) -> dict:
+    """Delete a calendar event.
+
+    Args:
+        event_id: Event ID to delete
+        calendar_id: Calendar ID (default: primary)
+        notify: Email the attendees that the event was cancelled. Defaults to
+            True: a cancellation nobody is told about just leaves the meeting
+            sitting on everyone's calendar.
+
+    Returns:
+        Dict with id, deleted
+    """
+    service = get_calendar_service()
+
+    service.events().delete(
+        calendarId=calendar_id,
+        eventId=event_id,
+        sendUpdates="all" if notify else "none",
+    ).execute()
+
+    return {"id": event_id, "deleted": True}
 
 
 def calendar_rsvp(
@@ -2684,6 +2751,7 @@ class GSuiteClient:
         description: str | None = None,
         location: str | None = None,
         attendees: list[str] | None = None,
+        conference: bool = False,
     ) -> dict:
         """Create a calendar event.
 
@@ -2695,9 +2763,10 @@ class GSuiteClient:
             description: Event description
             location: Event location
             attendees: List of attendee emails
+            conference: Attach a Google Meet conference to the event
 
         Returns:
-            Dict with id, html_link
+            Dict with id, html_link, meet_link
         """
         return calendar_create_event(
             summary,
@@ -2707,6 +2776,7 @@ class GSuiteClient:
             description=description,
             location=location,
             attendees=attendees,
+            conference=conference,
         )
 
     def calendar_update_event(
@@ -2719,6 +2789,8 @@ class GSuiteClient:
         description: str | None = None,
         location: str | None = None,
         add_attendees: list[str] | None = None,
+        conference: bool = False,
+        notify: bool | None = None,
     ) -> dict:
         """Update a calendar event.
 
@@ -2731,9 +2803,12 @@ class GSuiteClient:
             description: New description
             location: New location
             add_attendees: List of attendee emails to add
+            conference: Attach a Google Meet conference if the event lacks one
+            notify: Email the attendees; defaults to notifying on a material
+                change to an event that has attendees
 
         Returns:
-            Dict with id, html_link
+            Dict with id, html_link, meet_link
         """
         return calendar_update_event(
             event_id,
@@ -2744,7 +2819,27 @@ class GSuiteClient:
             description=description,
             location=location,
             add_attendees=add_attendees,
+            conference=conference,
+            notify=notify,
         )
+
+    def calendar_delete_event(
+        self,
+        event_id: str,
+        calendar_id: str = "primary",
+        notify: bool = True,
+    ) -> dict:
+        """Delete a calendar event.
+
+        Args:
+            event_id: Event ID to delete
+            calendar_id: Calendar ID (default: primary)
+            notify: Email the attendees that the event was cancelled
+
+        Returns:
+            Dict with id, deleted
+        """
+        return calendar_delete_event(event_id, calendar_id=calendar_id, notify=notify)
 
     def calendar_rsvp(
         self,

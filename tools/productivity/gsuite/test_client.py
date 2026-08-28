@@ -760,6 +760,7 @@ class _FakeEventsApi:
         self.insert_calls: list[dict] = []
         self.update_calls: list[dict] = []
         self.get_calls: list[dict] = []
+        self.delete_calls: list[dict] = []
         self._insert_result = insert_result or {}
         self._update_result = update_result or {}
         self._get_results = list(get_results or [])
@@ -775,6 +776,10 @@ class _FakeEventsApi:
     def get(self, **kwargs):
         self.get_calls.append(kwargs)
         return _CreateRequest(self._get_results.pop(0) if self._get_results else {})
+
+    def delete(self, **kwargs):
+        self.delete_calls.append(kwargs)
+        return _CreateRequest({})
 
 
 class _FakeCalendarService:
@@ -932,3 +937,123 @@ def test_calendar_update_event_without_conference_omits_the_version_flag(monkeyp
 
     assert "conferenceDataVersion" not in fake_service.events_api.update_calls[0]
     assert result["meet_link"] == ""
+
+
+def _calendar_service_with_attendee(**kwargs):
+    defaults = {
+        "get_results": [
+            {
+                "id": "event-123",
+                "summary": "Standup",
+                "attendees": [{"email": "outside@example.com"}],
+            }
+        ],
+        "update_result": {"id": "event-123", "htmlLink": "https://calendar.google.com/event-123"},
+    }
+    defaults.update(kwargs)
+    return _FakeCalendarService(**defaults)
+
+
+def test_calendar_update_event_notifies_attendees_of_a_time_change(monkeypatch):
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event(
+        "event-123", start="2026-09-01T10:00:00Z", end="2026-09-01T11:00:00Z"
+    )
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "all"
+
+
+def test_calendar_update_event_stays_quiet_for_a_description_edit(monkeypatch):
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", description="typo fixed")
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_calendar_update_event_stays_quiet_when_there_are_no_attendees(monkeypatch):
+    fake_service = _FakeCalendarService(
+        get_results=[{"id": "event-123", "summary": "Solo focus block"}],
+        update_result={"id": "event-123"},
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", start="2026-09-01T10:00:00Z")
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_calendar_update_event_notify_flag_overrides_both_ways(monkeypatch):
+    silent = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: silent)
+    client.calendar_update_event("event-123", start="2026-09-01T10:00:00Z", notify=False)
+    assert silent.events_api.update_calls[0]["sendUpdates"] == "none"
+
+    loud = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: loud)
+    client.calendar_update_event("event-123", description="typo fixed", notify=True)
+    assert loud.events_api.update_calls[0]["sendUpdates"] == "all"
+
+
+def test_calendar_update_event_still_notifies_when_adding_attendees(monkeypatch):
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", add_attendees=["new@example.com"])
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "all"
+
+
+def test_calendar_update_event_notifies_when_a_meet_is_added(monkeypatch):
+    fake_service = _calendar_service_with_attendee(
+        update_result={"id": "event-123", "hangoutLink": "https://meet.google.com/abc-defg-hij"}
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", conference=True)
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "all"
+
+
+def test_calendar_update_event_stays_quiet_when_the_meet_already_existed(monkeypatch):
+    fake_service = _calendar_service_with_attendee(
+        get_results=[
+            {
+                "id": "event-123",
+                "summary": "Standup",
+                "attendees": [{"email": "outside@example.com"}],
+                "conferenceData": {"conferenceId": "abc-defg-hij"},
+            }
+        ]
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", conference=True)
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_calendar_delete_event_notifies_attendees_by_default(monkeypatch):
+    fake_service = _FakeCalendarService()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    result = client.calendar_delete_event("event-123")
+
+    assert fake_service.events_api.delete_calls == [
+        {"calendarId": "primary", "eventId": "event-123", "sendUpdates": "all"}
+    ]
+    assert result == {"id": "event-123", "deleted": True}
+
+
+def test_calendar_delete_event_can_cancel_silently(monkeypatch):
+    fake_service = _FakeCalendarService()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_delete_event("event-123", calendar_id="team@example.com", notify=False)
+
+    assert fake_service.events_api.delete_calls == [
+        {"calendarId": "team@example.com", "eventId": "event-123", "sendUpdates": "none"}
+    ]
