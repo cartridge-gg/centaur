@@ -794,6 +794,39 @@ describe('codexAppServerToRendererEvents', () => {
   })
 })
 
+describe('CodexAppServerRendererEventMapper empty final answer', () => {
+  it('synthesizes the empty-final-answer placeholder by default', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const done = mapper.flush().find(event => event.type === 'renderer.done')
+    expect(done).toMatchObject({
+      type: 'renderer.done',
+      answerMarkdown: 'Execution completed, but no final text was captured.'
+    })
+  })
+
+  it('stays empty on an intentional empty completion when suppressEmptyFinalAnswer is set', () => {
+    const mapper = new CodexAppServerRendererEventMapper({ suppressEmptyFinalAnswer: true })
+    const done = mapper.flush().find(event => event.type === 'renderer.done')
+    expect(done?.type).toBe('renderer.done')
+    expect((done as { answerMarkdown?: string }).answerMarkdown ?? '').toBe('')
+  })
+
+  it('keeps genuine failures visible even when suppressEmptyFinalAnswer is set', () => {
+    const mapper = new CodexAppServerRendererEventMapper({ suppressEmptyFinalAnswer: true })
+    const done = mapper
+      .process({
+        type: 'turn.failed',
+        error: { message: 'boom', additionalDetails: 'worker crashed' }
+      })
+      .find(event => event.type === 'renderer.done')
+    expect(done).toMatchObject({
+      type: 'renderer.done',
+      answerMarkdown: 'Execution failed: boom: worker crashed',
+      error: 'boom: worker crashed'
+    })
+  })
+})
+
 describe('isRetryableCodexErrorNotification', () => {
   const retryable = {
     method: 'error',
