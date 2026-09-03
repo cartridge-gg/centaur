@@ -683,6 +683,22 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     )
   end
 
+  test "composer offers GPT-6 Astra as a first-class codex pick that is not the default" do
+    agents = Console::ThreadsController::COMPOSER_AGENTS
+    astra = agents.find { |agent| agent.value == "gpt-6-astra" }
+
+    assert astra, "expected a GPT-6 Astra composer agent"
+    assert_equal "codex", astra.harness
+    assert_equal "gpt-6-astra", astra.model
+    assert_includes astra.efforts.map(&:first), "max"
+    assert_includes astra.efforts.map(&:first), "ultra"
+    refute_includes astra.efforts.map(&:first), "minimal"
+
+    # The first entry doubles as the fallback default pick, so GPT-6 Astra must
+    # never occupy it while the model is rollout-gated.
+    refute_equal "gpt-6-astra", agents.first.value
+  end
+
   test "visible thread scope matches Slack threads owned by the current user's Slack OAuth record" do
     app = oauth_apps(:acme_slack)
     app.update!(client_secret: "slack-secret", labels: { "slack_team_id" => "T123" })

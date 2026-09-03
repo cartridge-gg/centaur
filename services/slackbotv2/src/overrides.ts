@@ -14,8 +14,9 @@
  * another harness restarts the thread on the requested one. Harness/model/provider
  * choices are sticky at the Slack thread level: the last flag wins for later
  * turns in the same thread. `--model` accepts either a full model id
- * (claude-sonnet-4-6, gpt-5.2, ...), an amp mode (deep/fast), or a Claude alias
- * (fable/opus/sonnet/haiku) which expands to the full id. Reasoning effort only
+ * (claude-sonnet-4-6, gpt-5.2, ...), an amp mode (deep/fast), a Claude alias
+ * (fable/opus/sonnet/haiku), or an OpenAI alias (gpt-6/astra -> gpt-6-astra),
+ * each of which expands to the full id. Reasoning effort only
  * affects the codex-compatible harnesses and stays per-turn; other harnesses
  * ignore it. The provider rides the blocks-protocol
  * `provider` field and is fixed when the codex thread starts. Provider
@@ -68,6 +69,22 @@ const CLAUDE_MODEL_ALIASES: Record<string, string> = {
   sonnet: 'claude-sonnet-4-6'
 }
 
+// Intuitive OpenAI model aliases usable as --model values (--model astra,
+// --model gpt-6). Unlike the Claude aliases these have no bare-flag form. Only
+// these exact tokens expand; any other --model value still passes through
+// verbatim, so explicit arbitrary model ids keep working.
+const OPENAI_MODEL_ALIASES: Record<string, string> = {
+  astra: 'gpt-6-astra',
+  'gpt-6': 'gpt-6-astra'
+}
+
+// Combined --model value alias table shared by the flag parser and the
+// object-shaped override normalizer.
+const MODEL_ALIASES: Record<string, string> = {
+  ...CLAUDE_MODEL_ALIASES,
+  ...OPENAI_MODEL_ALIASES
+}
+
 const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =
   Object.fromEntries(
     Object.entries(CLAUDE_MODEL_ALIASES).map(([alias, model]) => [
@@ -85,7 +102,8 @@ const STRATEGY_REASONING_EFFORTS = new Set([
   'medium',
   'high',
   'xhigh',
-  'max'
+  'max',
+  'ultra'
 ])
 
 const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
@@ -107,7 +125,8 @@ const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
   'gpt-5.5-pro': 'codex',
   'gpt-5.6-luna': 'codex',
   'gpt-5.6-sol': 'codex',
-  'gpt-5.6-terra': 'codex'
+  'gpt-5.6-terra': 'codex',
+  'gpt-6-astra': 'codex'
 }
 
 // Values are one horizontal-whitespace-delimited token; a newline after the
@@ -145,7 +164,8 @@ const REASONING_EFFORTS: Record<string, string> = {
   xhigh: 'xhigh',
   xhi: 'xhigh',
   'x-high': 'xhigh',
-  max: 'max'
+  max: 'max',
+  ultra: 'ultra'
 }
 
 export function extractMessageOverrides(text: string): MessageOverrides {
@@ -158,7 +178,7 @@ export function extractMessageOverrides(text: string): MessageOverrides {
   const modelMatch = MODEL_FLAG_PATTERN.exec(cleaned)
   if (modelMatch) {
     const value = modelMatch[1]!
-    model = CLAUDE_MODEL_ALIASES[value.toLowerCase()] ?? value
+    model = MODEL_ALIASES[value.toLowerCase()] ?? value
     cleaned = stripMatch(cleaned, modelMatch)
   }
 
@@ -301,7 +321,7 @@ export function normalizeHarnessOverrides(
   }
 
   const modelRaw = cleanString(raw.model)
-  if (modelRaw) model = CLAUDE_MODEL_ALIASES[modelRaw.toLowerCase()] ?? modelRaw
+  if (modelRaw) model = MODEL_ALIASES[modelRaw.toLowerCase()] ?? modelRaw
 
   const reasoningRaw = cleanString(raw.reasoning)
   if (reasoningRaw) {

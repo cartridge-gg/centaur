@@ -110,6 +110,16 @@ class Console::ThreadsController < ApplicationController
   MODEL_EFFORT_OVERRIDES = {
     [ "claude-opus-5", "fast" ] => "claude-opus-5-fast"
   }.freeze
+  # GPT-6 Astra advertises the wider Codex catalog: no `minimal`, but `max` and
+  # `ultra` on top of the standard efforts.
+  GPT_6_EFFORTS = [
+    %w[low Low],
+    %w[medium Medium],
+    %w[high High],
+    [ "xhigh", "Extra High" ],
+    %w[max Max],
+    %w[ultra Ultra]
+  ].freeze
   # First entry doubles as the default pick (unless the deploy's default-model
   # resolution for its harness names another listed model). Operator-configured
   # Codex providers are appended by .composer_agents at runtime.
@@ -117,6 +127,11 @@ class Console::ThreadsController < ApplicationController
     ComposerAgent.new(value: "gpt-5.6-sol", label: "GPT-5.6 Sol",
                       harness: "codex", model: "gpt-5.6-sol",
                       efforts: CODEX_EFFORTS + [ %w[max Max] ]),
+    # GPT-6 Astra is offered as a first-class Codex pick but is intentionally not
+    # the first entry, so it never becomes the composer's default selection.
+    ComposerAgent.new(value: "gpt-6-astra", label: "GPT-6 Astra",
+                      harness: "codex", model: "gpt-6-astra",
+                      efforts: GPT_6_EFFORTS),
     ComposerAgent.new(value: "nanocodex", label: "Nanocodex (GPT-5.6 Sol)",
                       harness: "nanocodex", model: nil, efforts: []),
     ComposerAgent.new(value: "gpt-5.5", label: "GPT-5.5",

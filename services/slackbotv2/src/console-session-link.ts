@@ -26,7 +26,8 @@ const REASONING_DISPLAY_NAMES: Record<string, string> = {
   medium: 'Medium',
   high: 'High',
   xhigh: 'XHigh',
-  max: 'Max'
+  max: 'Max',
+  ultra: 'Ultra'
 }
 
 const STANDARD_CODEX_REASONING_EFFORTS = new Set([
@@ -42,6 +43,11 @@ const GPT_5_6_REASONING_EFFORTS = new Set([
   ...STANDARD_CODEX_REASONING_EFFORTS,
   'max'
 ])
+const GPT_6_REASONING_EFFORTS = new Set([
+  ...STANDARD_CODEX_REASONING_EFFORTS,
+  'max',
+  'ultra'
+])
 const CODEX_REASONING_EFFORTS_BY_MODEL: Record<string, ReadonlySet<string>> = {
   'gpt-5.2': STANDARD_CODEX_REASONING_EFFORTS,
   'gpt-5.2-codex': CODEX_MODEL_REASONING_EFFORTS,
@@ -53,7 +59,8 @@ const CODEX_REASONING_EFFORTS_BY_MODEL: Record<string, ReadonlySet<string>> = {
   'gpt-5.5-pro': PRO_CODEX_REASONING_EFFORTS,
   'gpt-5.6-luna': GPT_5_6_REASONING_EFFORTS,
   'gpt-5.6-sol': GPT_5_6_REASONING_EFFORTS,
-  'gpt-5.6-terra': GPT_5_6_REASONING_EFFORTS
+  'gpt-5.6-terra': GPT_5_6_REASONING_EFFORTS,
+  'gpt-6-astra': GPT_6_REASONING_EFFORTS
 }
 
 const CODEX_CONFIG = codexConfig as {
@@ -185,6 +192,9 @@ export function reasoningForModel(
   const effectiveEffort = harness === 'nanocodex' && effort === 'minimal' ? 'low' : effort
   if (selectedModel === 'gpt-5.6') {
     return GPT_5_6_REASONING_EFFORTS.has(effectiveEffort) ? effort : undefined
+  }
+  if (selectedModel === 'gpt-6') {
+    return GPT_6_REASONING_EFFORTS.has(effectiveEffort) ? effort : undefined
   }
   const supported = Object.entries(CODEX_REASONING_EFFORTS_BY_MODEL).find(
     ([modelId]) => selectedModel === modelId || selectedModel.startsWith(`${modelId}-20`)

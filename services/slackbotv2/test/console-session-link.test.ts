@@ -39,7 +39,7 @@ describe('harnessDisplayName', () => {
 })
 
 describe('reasoningForModel', () => {
-  const allEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+  const allEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
   const standardEfforts = ['none', 'low', 'medium', 'high', 'xhigh']
   const proEfforts = ['medium', 'high', 'xhigh']
   const codexModelEfforts = ['low', 'medium', 'high', 'xhigh']
@@ -54,7 +54,8 @@ describe('reasoningForModel', () => {
     'gpt-5.5-pro': proEfforts,
     'gpt-5.6-luna': [...standardEfforts, 'max'],
     'gpt-5.6-sol': [...standardEfforts, 'max'],
-    'gpt-5.6-terra': [...standardEfforts, 'max']
+    'gpt-5.6-terra': [...standardEfforts, 'max'],
+    'gpt-6-astra': [...standardEfforts, 'max', 'ultra']
   }
 
   test('matches the reasoning efforts advertised by supported Codex models', () => {
@@ -81,6 +82,9 @@ describe('reasoningForModel', () => {
   test('supports current model aliases and snapshots without widening their effort sets', () => {
     expect(reasoningForModel('codex', 'gpt-5.6', 'max')).toBe('max')
     expect(reasoningForModel('nanocodex', 'gpt-5.6', 'max')).toBe('max')
+    expect(reasoningForModel('codex', 'gpt-6', 'max')).toBe('max')
+    expect(reasoningForModel('codex', 'gpt-6-astra', 'ultra')).toBe('ultra')
+    expect(reasoningForModel('codex', 'gpt-6-astra-2026-09-01', 'xhigh')).toBe('xhigh')
     expect(reasoningForModel('codex', 'gpt-5.6-sol-2026-07-01', 'minimal')).toBeUndefined()
     expect(reasoningForModel('nanocodex', 'gpt-5.6-sol-2026-07-01', 'minimal')).toBe(
       'minimal'

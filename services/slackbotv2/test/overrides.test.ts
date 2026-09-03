@@ -123,6 +123,12 @@ describe('extractMessageOverrides', () => {
     expect(extractMessageOverrides('--model fable go').model).toBe('claude-fable-5')
   })
 
+  test('--model expands OpenAI aliases to gpt-6-astra', () => {
+    expect(extractMessageOverrides('--codex --model astra go').model).toBe('gpt-6-astra')
+    expect(extractMessageOverrides('--model gpt-6 go').model).toBe('gpt-6-astra')
+    expect(extractMessageOverrides('--model ASTRA go').model).toBe('gpt-6-astra')
+  })
+
   test('--model accepts a newline immediately after the value', () => {
     expect(extractMessageOverrides('--claude --model=fable\nwhat model are you')).toEqual({
       cleanedText: 'what model are you',
@@ -152,6 +158,9 @@ describe('extractMessageOverrides', () => {
   test('--model passes non-alias values through verbatim', () => {
     expect(extractMessageOverrides('--codex --model gpt-5.2-codex go').model).toBe('gpt-5.2-codex')
     expect(extractMessageOverrides('--amp --model fast go').model).toBe('fast')
+    expect(extractMessageOverrides('--codex --model gpt-6-astra-2026-09-01 go').model).toBe(
+      'gpt-6-astra-2026-09-01'
+    )
   })
 
   test('explicit flags win over shortcut implications', () => {
@@ -220,6 +229,10 @@ describe('extractMessageOverrides', () => {
 
   test('-rsn accepts the GPT-5.6 max effort', () => {
     expect(extractMessageOverrides('-rsn max fix it').reasoning).toBe('max')
+  })
+
+  test('-rsn accepts the GPT-6 Astra ultra effort', () => {
+    expect(extractMessageOverrides('-rsn ultra fix it').reasoning).toBe('ultra')
   })
 
   test('-rsn combines with a harness flag', () => {
@@ -330,6 +343,12 @@ describe('normalizeHarnessOverrides', () => {
       provider: undefined,
       reasoning: undefined
     })
+    expect(normalizeHarnessOverrides({ model: 'gpt-6' })).toEqual({
+      harnessType: undefined,
+      model: 'gpt-6-astra',
+      provider: undefined,
+      reasoning: undefined
+    })
   })
 
   test('reports and drops unrecognized enum-like values', () => {
@@ -383,6 +402,12 @@ describe('validateStrategyOverrides', () => {
       model: 'gpt-5.5-pro',
       provider: undefined,
       reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'gpt-6-astra', reasoning: 'ultra' })).toEqual({
+      harnessType: 'codex',
+      model: 'gpt-6-astra',
+      provider: undefined,
+      reasoning: 'ultra'
     })
   })
 
