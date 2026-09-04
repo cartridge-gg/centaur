@@ -635,6 +635,10 @@ struct SandboxArgs {
     centaur_api_url_override: Option<String>,
     #[arg(long, env = "CENTAUR_API_URL")]
     centaur_api_url: Option<String>,
+    /// Owner/repo slug for org overlay delivery through repo-cache. When set,
+    /// sandboxes read overlay prompts and skills from the mounted checkout.
+    #[arg(long = "overlay-repo", env = "CENTAUR_OVERLAY_REPO")]
+    overlay_repo: Option<String>,
     #[arg(long = "repos-path", env = "REPOS_PATH")]
     repos_path: Option<String>,
     #[arg(long = "repos-pvc", env = "REPOS_PVC")]
@@ -943,6 +947,15 @@ impl SandboxArgs {
         "/opt/centaur/workflows".to_owned()
     }
 
+    fn overlay_dir_in_repo_cache(&self) -> Option<String> {
+        let slug = clean_optional_value(self.overlay_repo.as_deref())?;
+        let slug = slug.trim_matches('/');
+        if slug.is_empty() {
+            return None;
+        }
+        Some(format!("{SANDBOX_REPOS_MOUNT_PATH}/{slug}"))
+    }
+
     fn default_workflow_host_path(&self) -> String {
         match self.backend {
             SandboxBackendKind::Local => default_workflow_host_path(),
@@ -1107,6 +1120,14 @@ impl SandboxArgs {
                     envs.push((name.to_owned(), value));
                 }
             }
+        }
+
+        if let Some(overlay_dir) = self.overlay_dir_in_repo_cache()
+            && !envs
+                .iter()
+                .any(|(existing, _)| existing == "CENTAUR_OVERLAY_DIR")
+        {
+            envs.push(("CENTAUR_OVERLAY_DIR".to_owned(), overlay_dir));
         }
 
         // Operator extra env wins over template defaults (same precedence as
@@ -2171,6 +2192,22 @@ mod tests {
             }
             Self { saved }
         }
+
+        fn clear(vars: &[&'static str]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|name| (*name, env::var(name).ok()))
+                .collect();
+            for name in vars {
+                // SAFETY: tests that mutate process env hold ENV_LOCK for the
+                // duration of the guard, so concurrent tests in this module
+                // cannot observe partial mutations.
+                unsafe {
+                    env::remove_var(name);
+                }
+            }
+            Self { saved }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -2186,6 +2223,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[derive(Debug, Parser)]
+    struct SandboxArgsWrapper {
+        #[command(flatten)]
+        sandbox: SandboxArgs,
+    }
+
+    #[test]
+    fn overlay_dir_in_repo_cache_parses_overlay_repo() {
+        let args = SandboxArgsWrapper::parse_from(["test", "--overlay-repo", "owner/repo"]).sandbox;
+        assert_eq!(
+            args.overlay_dir_in_repo_cache().as_deref(),
+            Some("/home/agent/github/owner/repo")
+        );
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("CENTAUR_OVERLAY_REPO", "env-owner/env-repo")]);
+        let args = SandboxArgsWrapper::parse_from(["test"]).sandbox;
+        assert_eq!(
+            args.overlay_dir_in_repo_cache().as_deref(),
+            Some("/home/agent/github/env-owner/env-repo")
+        );
+    }
+
+    #[test]
+    fn overlay_dir_in_repo_cache_ignores_empty_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear(&["CENTAUR_OVERLAY_REPO"]);
+
+        let args = SandboxArgsWrapper::parse_from(["test"]).sandbox;
+        assert_eq!(args.overlay_dir_in_repo_cache(), None);
+
+        let args = SandboxArgsWrapper::parse_from(["test", "--overlay-repo", ""]).sandbox;
+        assert_eq!(args.overlay_dir_in_repo_cache(), None);
+
+        let args = SandboxArgsWrapper::parse_from(["test", "--overlay-repo", "///"]).sandbox;
+        assert_eq!(args.overlay_dir_in_repo_cache(), None);
+    }
+
+    #[test]
+    fn codex_app_server_env_template_injects_repo_cache_overlay_dir() {
+        let args = SandboxArgsWrapper::parse_from([
+            "test",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--overlay-repo",
+            "owner/repo",
+        ])
+        .sandbox;
+
+        let env = args.codex_app_server_env_template().unwrap();
+        assert!(env.iter().any(|(name, value)| {
+            name == "CENTAUR_OVERLAY_DIR" && value == "/home/agent/github/owner/repo"
+        }));
+    }
+
+    #[test]
+    fn codex_app_server_env_template_omits_overlay_dir_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear(&["CENTAUR_OVERLAY_REPO"]);
+        let args = SandboxArgsWrapper::parse_from([
+            "test",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+        ])
+        .sandbox;
+
+        let env = args.codex_app_server_env_template().unwrap();
+        assert!(!env.iter().any(|(name, _)| name == "CENTAUR_OVERLAY_DIR"));
     }
 
     #[test]
