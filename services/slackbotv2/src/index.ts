@@ -2689,6 +2689,14 @@ async function renderPlainTextExecutionStream(
     for await (const _chunk of chatStream) {
       void _chunk
     }
+    const capturedText = fallback.text()
+    if (!capturedText && !fallback.isInterrupted()) {
+      // Intentional empty completion (e.g. a subscribed thread where the agent
+      // chose not to reply): stay silent rather than posting a placeholder.
+      // Failures are unaffected — they carry "Execution failed" text here.
+      traceLog(options, 'slackbotv2_render_plain_text_empty', trace, { chars: 0 })
+      return
+    }
     const text = truncateSlackText(
       fallback.textOrDefault(),
       SLACK_FALLBACK_TEXT_MAX_CHARS,
@@ -3539,6 +3547,11 @@ function rendererOptions(
   const mapper = options.mapper
   return {
     ...mapper,
+    // Slack stays silent on an intentional empty completion (e.g. a subscribed
+    // thread where the agent chose not to reply) rather than posting the
+    // synthesized EMPTY_FINAL_ANSWER_TEXT placeholder. Failures are unaffected:
+    // they carry their own "Execution failed" text and remain visible.
+    suppressEmptyFinalAnswer: true,
     logInfo: rendererLogInfo(options, capture),
     async onRendererEvent(event: RendererEvent) {
       await mapper?.onRendererEvent?.(event)
@@ -3561,6 +3574,7 @@ function fallbackRendererOptions(options: SlackbotV2Options): CodexAppServerToCh
   const mapper = options.mapper
   return {
     ...mapper,
+    suppressEmptyFinalAnswer: true,
     logInfo: rendererLogInfo(options),
     async onRendererEvent(event: RendererEvent) {
       try {

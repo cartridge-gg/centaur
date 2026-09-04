@@ -78,6 +78,13 @@ export type CodexAppServerRendererEventMapperOptions = {
   // consumers that stream text into their own surface (discordbot) pass 0 to
   // emit deltas immediately. Default 500ms (Slack card-first rendering).
   preStreamGraceMs?: number
+  // When a turn completes successfully with no assistant text, the renderer
+  // normally synthesizes EMPTY_FINAL_ANSWER_TEXT so a surface has something to
+  // post. Surfaces that would rather stay silent on an intentional empty
+  // completion (a subscribed Slack thread where the agent chose not to reply)
+  // set this to skip that synthesis. Failures are unaffected: fail() emits its
+  // own "Execution failed" text and an error, so genuine failures stay visible.
+  suppressEmptyFinalAnswer?: boolean
 }
 
 export type CodexAppServerToChatStreamOptions = CodexAppServerRendererEventMapperOptions & {
@@ -94,6 +101,7 @@ export class CodexAppServerRendererEventMapper
   private readonly unknownAgentMessagePhase: AgentMessagePhase
   private readonly includeTaskOutput: boolean
   private readonly preStreamGraceMs: number
+  private readonly suppressEmptyFinalAnswer: boolean
 
   constructor(options: CodexAppServerRendererEventMapperOptions = {}) {
     this.sessionId = options.sessionId ?? ''
@@ -101,6 +109,7 @@ export class CodexAppServerRendererEventMapper
     this.unknownAgentMessagePhase = options.unknownAgentMessagePhase ?? 'final_answer'
     this.includeTaskOutput = options.taskOutput === 'full'
     this.preStreamGraceMs = options.preStreamGraceMs ?? PRE_STREAM_GRACE_MS
+    this.suppressEmptyFinalAnswer = options.suppressEmptyFinalAnswer === true
   }
 
   process(source: ServerNotification | RustSessionStreamEvent | unknown): RendererEvent[] {
@@ -358,6 +367,7 @@ export class CodexAppServerRendererEventMapper
 
   private ensureFinalAnswerText(): void {
     if (this.state.answerText.trim()) return
+    if (this.suppressEmptyFinalAnswer) return
     this.state.harnessAnswerText += EMPTY_FINAL_ANSWER_TEXT
     recomposeBuffers(this.state)
   }
