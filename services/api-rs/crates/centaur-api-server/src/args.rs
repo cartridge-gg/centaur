@@ -25,7 +25,7 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, Toleration, ToolSource, ToolsConfig,
+    OtlpEgressTarget, StateVolumeConfig, Toleration, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, ResourceRequirements, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -547,6 +547,40 @@ struct SandboxArgs {
         env = "SESSION_SANDBOX_IMAGE_PULL_POLICY"
     )]
     agent_image_pull_policy: Option<String>,
+    /// Give every session sandbox a persistent state volume: one
+    /// PersistentVolumeClaim per sandbox, created from the Sandbox's
+    /// `volumeClaimTemplates`, kept across an idle pause and deleted with the
+    /// sandbox. The entrypoint links `~/.codex`, `~/.claude`, `~/uploads` and
+    /// `~/branches` into it, so a resumed session keeps its harness history and
+    /// working copies. The chart renders `sandbox.stateVolume.*` into these.
+    #[arg(
+        long = "session-sandbox-state-volume-enabled",
+        env = "SESSION_SANDBOX_STATE_VOLUME_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    state_volume_enabled: bool,
+    #[arg(
+        long = "session-sandbox-state-volume-size",
+        env = "SESSION_SANDBOX_STATE_VOLUME_SIZE",
+        default_value = "10Gi"
+    )]
+    state_volume_size: String,
+    /// StorageClass for the claims. Empty means "omit", which only provisions
+    /// on a cluster with a default class.
+    #[arg(
+        long = "session-sandbox-state-volume-storage-class-name",
+        env = "SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME"
+    )]
+    state_volume_storage_class_name: Option<String>,
+    /// Mount path inside the sandbox; also handed to the entrypoint as
+    /// `CENTAUR_STATE_DIR`.
+    #[arg(
+        long = "session-sandbox-state-volume-mount-path",
+        env = "SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH",
+        default_value = "/home/agent/state"
+    )]
+    state_volume_mount_path: String,
     #[arg(
         long = "session-sandbox-image-pull-secrets",
         env = "SESSION_SANDBOX_IMAGE_PULL_SECRETS",
@@ -1134,6 +1168,33 @@ impl SandboxArgs {
     /// [`Self::sandbox_extra_env`]: an ignored node selector silently schedules
     /// sandboxes wherever the default scheduler chooses, and an operator setting
     /// this is trying to prevent exactly that.
+    /// The persistent state volume, when enabled. Validated here so a bad
+    /// mount path or size fails startup instead of every sandbox create.
+    fn state_volume_config(&self) -> Result<Option<StateVolumeConfig>, ServerError> {
+        if !self.state_volume_enabled {
+            return Ok(None);
+        }
+        let mount_path = self.state_volume_mount_path.trim();
+        if !mount_path.starts_with('/') || mount_path.len() < 2 || mount_path.ends_with('/') {
+            return Err(ServerError::UnsupportedConfig(format!(
+                "SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH must be an absolute path inside the \
+                 sandbox, got {mount_path:?}"
+            )));
+        }
+        let size = self.state_volume_size.trim();
+        if size.is_empty() {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_STATE_VOLUME_SIZE must be a Kubernetes quantity such as 10Gi"
+                    .to_owned(),
+            ));
+        }
+        let mut config = StateVolumeConfig::new(mount_path, size);
+        if let Some(class) = clean_optional_value(self.state_volume_storage_class_name.as_deref()) {
+            config = config.storage_class_name(class);
+        }
+        Ok(Some(config))
+    }
+
     fn node_selector(&self) -> Result<BTreeMap<String, String>, ServerError> {
         let Some(raw) = self
             .node_selector_json
@@ -1510,6 +1571,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .filter(|name| !name.is_empty())
             .map(str::to_owned);
         config.ready_timeout = Duration::from_secs(args.ready_timeout_secs);
+        config.state_volume = args.state_volume_config()?;
         let mut proxy = args.iron_proxy.to_config()?;
         let mut fragments = vec![args.iron_proxy.infra_fragment()?];
         if let Some(tool_fragment) = args.discover_tool_proxy_fragment()? {
@@ -2331,6 +2393,71 @@ mod tests {
         assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
         assert_eq!(args.sandbox.ready_timeout_secs, 17);
         assert_eq!(args.sandbox.k8s_context.as_deref(), Some("kind-test"));
+    }
+
+    #[test]
+    fn state_volume_is_off_by_default_and_parses_when_enabled() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+        assert!(!args.sandbox.state_volume_enabled);
+        assert_eq!(args.sandbox.state_volume_config().unwrap(), None);
+
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-state-volume-enabled",
+            "true",
+            "--session-sandbox-state-volume-size",
+            "20Gi",
+            "--session-sandbox-state-volume-storage-class-name",
+            "local-path",
+            "--session-sandbox-state-volume-mount-path",
+            "/home/agent/state",
+        ])
+        .unwrap();
+        let config = args.sandbox.state_volume_config().unwrap().unwrap();
+        assert_eq!(config.mount_path, "/home/agent/state");
+        assert_eq!(config.size, "20Gi");
+        assert_eq!(config.storage_class_name.as_deref(), Some("local-path"));
+
+        // An empty class means "omit" (the chart renders "" when unset).
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-state-volume-enabled",
+            "true",
+            "--session-sandbox-state-volume-storage-class-name",
+            "",
+        ])
+        .unwrap();
+        let config = args.sandbox.state_volume_config().unwrap().unwrap();
+        assert_eq!(config.storage_class_name, None);
+        assert_eq!(config.size, "10Gi");
+    }
+
+    #[test]
+    fn state_volume_rejects_a_relative_mount_path() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-state-volume-enabled",
+            "true",
+            "--session-sandbox-state-volume-mount-path",
+            "state",
+        ])
+        .unwrap();
+        let error = args.sandbox.state_volume_config().unwrap_err().to_string();
+        assert!(
+            error.contains("SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH"),
+            "{error}"
+        );
     }
 
     #[test]
