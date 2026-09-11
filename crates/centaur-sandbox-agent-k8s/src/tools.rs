@@ -25,7 +25,7 @@
 use centaur_sandbox_core::RepoCacheAccess;
 use serde_json::{Value, json};
 
-const AGENT_UID: i64 = 1001;
+pub(crate) const AGENT_UID: i64 = 1001;
 
 /// Base tools path inside both the api-rs pod and the agent sandbox.
 pub(crate) const BASE_TOOL_DIR: &str = "/app/tools";

@@ -16,6 +16,7 @@ centaur-telemetry.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+jiff.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
