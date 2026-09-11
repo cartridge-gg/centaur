@@ -197,6 +197,24 @@ where
         Ok(())
     }
 
+    pub async fn annotate(
+        &self,
+        id: &SandboxId,
+        annotations: &BTreeMap<String, Option<String>>,
+    ) -> SandboxResult<()> {
+        let backend = self.backend.name();
+        match self.backend.annotate(id, annotations).await {
+            Ok(()) => {
+                record_sandbox_operation(backend, "annotate", "success");
+                Ok(())
+            }
+            Err(error) => {
+                record_sandbox_operation(backend, "annotate", "error");
+                Err(error)
+            }
+        }
+    }
+
     pub async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
         let backend = self.backend.name();
         match self.backend.resume(id).await {

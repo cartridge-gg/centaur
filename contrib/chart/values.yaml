@@ -389,10 +389,19 @@ sandbox:
     # Token usage, cost, status, session, and tool telemetry remain available
     # when this is disabled.
     captureTranscripts: false
+  # Persistent per-sandbox state: one PersistentVolumeClaim per session
+  # sandbox (created from the Sandbox's volumeClaimTemplates, kept across an
+  # idle pause, deleted with the sandbox) mounted at `mountPath`. The sandbox
+  # entrypoint links ~/.codex, ~/.claude, ~/uploads and ~/branches into it,
+  # so a resumed session keeps its harness history and its working copies.
+  # The cluster needs a StorageClass that can provision the claims; with no
+  # default class set `storageClassName` explicitly. Warm-pool sandboxes are
+  # not created while this is on (a warm pod cannot gain a claim later).
   stateVolume:
     enabled: false
     size: 10Gi
     storageClassName: ""
+    mountPath: /home/agent/state
   # Requests/limits for the agent container of every sandbox pod, per-session
   # and warm (k8s resources map).
   resources: {}
@@ -498,6 +507,11 @@ apiRs:
   sandboxWorkload: codex-app-server
   sandboxReadyTimeoutSecs: 90
   sandboxWarmPoolSize: 3
+  # Continue a session's Codex thread when its sandbox is resumed after an
+  # idle pause: the harness persists its thread id on the state volume and
+  # calls thread/resume on the next start (fresh thread when the rollout is
+  # gone). Needs sandbox.stateVolume.enabled; api-rs refuses to start otherwise.
+  sandboxResumeThreadEnabled: false
   sandboxWarmPoolReplenishIntervalSecs: 5
   # Capacity manager: when nonzero, api-rs keeps observed running-like
   # sandboxes at or below this limit by discarding ready warm sandboxes first,
@@ -587,6 +601,13 @@ apiRs:
   sessionEventsRetentionSweepIntervalSecs: 300
   # Minimum age before proxy resources without a live Sandbox are reaped.
   sandboxOrphanSweepGraceSecs: 600
+  # Session sandbox retention: a workflow may keep a session's sandbox past
+  # the max lifetime while it owns open work (ctx.session_keepalive /
+  # ctx.stop_session_sandbox), for at most keepaliveMaxSecs from its first
+  # lease; the reaper honours the projected keep-until/keep-hard-deadline
+  # annotations up to the same cap. Needs sandboxMaxLifetimeSecs above 0.
+  sandboxKeepaliveEnabled: false
+  sandboxKeepaliveMaxSecs: 604800 # 7 days
   # Cleanup worker: stop unreferenced session/warm-pool sandboxes after two
   # consecutive sweeps and restore idle-pauses lost across api-rs restarts.
   # The idle backstop is only used when older execution rows have no persisted

@@ -18,7 +18,7 @@ use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SESSION_OUTPUT_LINE_EVENT, SandboxRuntime,
-    SessionRuntime,
+    SessionKeepaliveRequest, SessionRuntime, StopSessionSandboxRequest,
 };
 use centaur_session_sqlx::PgSessionStore;
 use chrono::{DateTime, Utc};
@@ -3486,6 +3486,20 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.session_keepalive") => match parse_session_keepalive(message) {
+            Ok(request) => match session_runtime.session_keepalive(request).await {
+                Ok(receipt) => serde_json::to_value(receipt).map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            },
+            Err(error) => Err(error),
+        },
+        Some("ctx.stop_session_sandbox") => match parse_stop_session_sandbox(message) {
+            Ok(request) => match session_runtime.stop_session_sandbox(request).await {
+                Ok(receipt) => serde_json::to_value(receipt).map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            },
+            Err(error) => Err(error),
+        },
         Some("ctx.agent_turn") => {
             let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
             match run_python_agent_turn(
@@ -3652,6 +3666,68 @@ fn parse_optional_python_duration_seconds(
         )));
     }
     Ok(Some(Duration::from_secs_f64(seconds)))
+}
+
+fn required_rpc_string(message: &Value, field: &str, request_type: &str) -> Result<String, String> {
+    message
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("{request_type} requires a non-empty {field}"))
+}
+
+fn parse_rpc_thread_key(
+    message: &Value,
+    request_type: &str,
+) -> Result<centaur_session_core::ThreadKey, String> {
+    let raw = required_rpc_string(message, "thread_key", request_type)?;
+    centaur_session_core::ThreadKey::parse(raw)
+        .map_err(|error| format!("{request_type} invalid thread_key: {error}"))
+}
+
+/// `ctx.session_keepalive`: `thread_key`, `key`, `generation`, and `until`
+/// (RFC 3339, or null/absent to close the lease without stopping).
+fn parse_session_keepalive(message: &Value) -> Result<SessionKeepaliveRequest, String> {
+    const REQUEST: &str = "ctx.session_keepalive";
+    let until = match message.get("until") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) => Some(
+            DateTime::parse_from_rfc3339(raw.trim())
+                .map(|value| std::time::SystemTime::from(value.with_timezone(&Utc)))
+                .map_err(|error| format!("{REQUEST} invalid until: {error}"))?,
+        ),
+        Some(_) => {
+            return Err(format!(
+                "{REQUEST} until must be an RFC 3339 string or null"
+            ));
+        }
+    };
+    Ok(SessionKeepaliveRequest {
+        thread_key: parse_rpc_thread_key(message, REQUEST)?,
+        key: required_rpc_string(message, "key", REQUEST)?,
+        generation: required_rpc_string(message, "generation", REQUEST)?,
+        until,
+    })
+}
+
+/// `ctx.stop_session_sandbox`: `thread_key`, `key`, `idempotency_key`, and
+/// an optional `generation` (empty or absent closes whichever generation of
+/// the lease is active).
+fn parse_stop_session_sandbox(message: &Value) -> Result<StopSessionSandboxRequest, String> {
+    const REQUEST: &str = "ctx.stop_session_sandbox";
+    Ok(StopSessionSandboxRequest {
+        thread_key: parse_rpc_thread_key(message, REQUEST)?,
+        key: required_rpc_string(message, "key", REQUEST)?,
+        generation: message
+            .get("generation")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned(),
+        idempotency_key: required_rpc_string(message, "idempotency_key", REQUEST)?,
+    })
 }
 
 fn parse_python_wake_at(message: &Value) -> Result<DateTime<Utc>, String> {
@@ -4616,6 +4692,85 @@ pub enum WorkflowRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_keepalive_rpc_parses_and_validates() {
+        let request = parse_session_keepalive(&json!({
+            "type": "ctx.session_keepalive",
+            "thread_key": "slack:C123:1788885008.207239",
+            "key": " github:o/r:1 ",
+            "generation": "PR_kwDO",
+            "until": "2026-09-18T10:00:00Z",
+        }))
+        .unwrap();
+        assert_eq!(request.thread_key.as_str(), "slack:C123:1788885008.207239");
+        assert_eq!(request.key, "github:o/r:1");
+        assert_eq!(request.generation, "PR_kwDO");
+        let expected = DateTime::parse_from_rfc3339("2026-09-18T10:00:00Z")
+            .map(|value| std::time::SystemTime::from(value.with_timezone(&Utc)))
+            .unwrap();
+        assert_eq!(request.until, Some(expected));
+
+        // null / absent closes without stopping.
+        let request = parse_session_keepalive(&json!({
+            "thread_key": "slack:C123:1.2", "key": "k", "generation": "g", "until": null,
+        }))
+        .unwrap();
+        assert_eq!(request.until, None);
+        let request = parse_session_keepalive(&json!({
+            "thread_key": "slack:C123:1.2", "key": "k", "generation": "g",
+        }))
+        .unwrap();
+        assert_eq!(request.until, None);
+
+        for (message, needle) in [
+            (json!({"key": "k", "generation": "g"}), "thread_key"),
+            (
+                json!({"thread_key": "slack:C123:1.2", "generation": "g"}),
+                "key",
+            ),
+            (
+                json!({"thread_key": "slack:C123:1.2", "key": "k"}),
+                "generation",
+            ),
+            (
+                json!({"thread_key": "slack:C123:1.2", "key": "k", "generation": "g", "until": "tomorrow"}),
+                "invalid until",
+            ),
+            (
+                json!({"thread_key": "slack:C123:1.2", "key": "k", "generation": "g", "until": 5}),
+                "RFC 3339",
+            ),
+            (
+                json!({"thread_key": "nope", "key": "k", "generation": "g"}),
+                "invalid thread_key",
+            ),
+        ] {
+            let error = parse_session_keepalive(&message).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
+    }
+
+    #[test]
+    fn stop_session_sandbox_rpc_requires_every_field() {
+        let request = parse_stop_session_sandbox(&json!({
+            "thread_key": "slack:C123:1.2", "key": "github:o/r:1", "generation": "g1",
+            "idempotency_key": "delivery-42",
+        }))
+        .unwrap();
+        assert_eq!(request.idempotency_key, "delivery-42");
+        let error = parse_stop_session_sandbox(&json!({
+            "thread_key": "slack:C123:1.2", "key": "github:o/r:1", "generation": "g1",
+        }))
+        .unwrap_err();
+        assert!(error.contains("idempotency_key"), "{error}");
+        // generation is optional: empty closes whichever generation is active.
+        let request = parse_stop_session_sandbox(&json!({
+            "thread_key": "slack:C123:1.2", "key": "github:o/r:1", "idempotency_key": "d",
+        }))
+        .unwrap();
+        assert_eq!(request.generation, "");
+    }
     use chrono::TimeZone;
 
     async fn assert_structured_host_error_is_bounded(message_type: &str) {

@@ -85,6 +85,12 @@ impl SandboxStatus {
     }
 }
 
+/// Annotation keys the control plane projects a session's sandbox retention
+/// into (RFC 3339 instants), so the backend-only max-lifetime reaper can honour
+/// it: keep the sandbox until `keep-until`, never past `keep-hard-deadline`.
+pub const KEEP_UNTIL_ANNOTATION: &str = "centaur.ai/keep-until";
+pub const KEEP_HARD_DEADLINE_ANNOTATION: &str = "centaur.ai/keep-hard-deadline";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 /// Backend observation used by reconciliation.
 ///
@@ -111,6 +117,13 @@ pub struct ObservedSandbox {
     /// When the sandbox was suspended, if it is currently suspended and the
     /// backend records it.
     pub suspended_since: Option<SystemTime>,
+    /// Session retention: keep the sandbox (paused or running) until this
+    /// instant even past the max lifetime, if the backend records it.
+    #[serde(default)]
+    pub keep_until: Option<SystemTime>,
+    /// The hard bound on `keep_until`: retention is never honoured past it.
+    #[serde(default)]
+    pub keep_hard_deadline: Option<SystemTime>,
 }
 
 impl ObservedSandbox {
@@ -128,7 +141,19 @@ impl ObservedSandbox {
             instance_id: None,
             created_at: None,
             suspended_since: None,
+            keep_until: None,
+            keep_hard_deadline: None,
         }
+    }
+
+    pub fn with_keep_until(mut self, keep_until: Option<SystemTime>) -> Self {
+        self.keep_until = keep_until;
+        self
+    }
+
+    pub fn with_keep_hard_deadline(mut self, keep_hard_deadline: Option<SystemTime>) -> Self {
+        self.keep_hard_deadline = keep_hard_deadline;
+        self
     }
 
     pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
