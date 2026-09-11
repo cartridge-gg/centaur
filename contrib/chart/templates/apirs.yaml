@@ -335,6 +335,8 @@ spec:
               value: {{ .Values.apiRs.sandboxReadyTimeoutSecs | quote }}
             - name: SESSION_SANDBOX_WARM_POOL_SIZE
               value: {{ .Values.apiRs.sandboxWarmPoolSize | quote }}
+            - name: SESSION_SANDBOX_RESUME_THREAD_ENABLED
+              value: {{ .Values.apiRs.sandboxResumeThreadEnabled | default false | quote }}
             - name: SESSION_SANDBOX_WARM_POOL_REPLENISH_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxWarmPoolReplenishIntervalSecs | quote }}
             - name: SESSION_SANDBOX_RUNNING_LIMIT
@@ -349,6 +351,10 @@ spec:
               value: {{ .Values.apiRs.sessionEventsRetentionSweepIntervalSecs | quote }}
             - name: SESSION_SANDBOX_ORPHAN_SWEEP_GRACE_SECS
               value: {{ .Values.apiRs.sandboxOrphanSweepGraceSecs | quote }}
+            - name: SESSION_SANDBOX_KEEPALIVE_ENABLED
+              value: {{ .Values.apiRs.sandboxKeepaliveEnabled | default false | quote }}
+            - name: SESSION_SANDBOX_KEEPALIVE_MAX_SECS
+              value: {{ .Values.apiRs.sandboxKeepaliveMaxSecs | default 604800 | quote }}
             - name: SESSION_SANDBOX_CLEANUP_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxCleanupIntervalSecs | quote }}
             - name: SESSION_SANDBOX_IDLE_CLEANUP_BACKSTOP_SECS
@@ -387,6 +393,10 @@ spec:
 {{- if and .Values.sandbox.stateVolume.storageClassName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME")) }}
             - name: SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME
               value: {{ .Values.sandbox.stateVolume.storageClassName | quote }}
+{{- end }}
+{{- if and .Values.sandbox.stateVolume.mountPath (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH")) }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH
+              value: {{ .Values.sandbox.stateVolume.mountPath | quote }}
 {{- end }}
 {{- end }}
 {{- if and .Values.sandbox.resources (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_RESOURCES")) }}

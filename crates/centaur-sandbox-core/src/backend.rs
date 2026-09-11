@@ -102,4 +102,16 @@ pub trait SandboxBackend: Send + Sync {
     ) -> SandboxResult<BTreeMap<String, u32>> {
         Ok(BTreeMap::new())
     }
+
+    /// Record control-plane annotations on the sandbox; a `None` value removes
+    /// the key. Backends without durable per-sandbox metadata may ignore this,
+    /// in which case the max-lifetime reaper cannot honour session retention
+    /// on them.
+    async fn annotate(
+        &self,
+        _id: &SandboxId,
+        _annotations: &BTreeMap<String, Option<String>>,
+    ) -> SandboxResult<()> {
+        Ok(())
+    }
 }

@@ -359,11 +359,14 @@ sandbox:
   # entrypoint keeps the session's workspace clone, uploads, branches, and native
   # Codex/Claude files there, so they survive idle pause and pod replacement, but
   # not final sandbox deletion. Existing sandboxes/claims are not migrated.
+  # Warm-pool sandboxes are not created while this is on (a warm pod cannot
+  # gain a claim later).
   stateVolume:
     enabled: false
     size: 10Gi
     # Empty uses the cluster default storage class.
     storageClassName: ""
+    mountPath: /home/agent/state
   # Requests/limits for the agent container of every sandbox pod, per-session
   # and warm (k8s resources map).
   resources: {}
@@ -620,6 +623,11 @@ apiRs:
   mcpV2Enabled: false
   sandboxReadyTimeoutSecs: 90
   sandboxWarmPoolSize: 3
+  # Continue a session's Codex thread when its sandbox is resumed after an
+  # idle pause: the harness persists its thread id on the state volume and
+  # calls thread/resume on the next start (fresh thread when the rollout is
+  # gone). Needs sandbox.stateVolume.enabled; api-rs refuses to start otherwise.
+  sandboxResumeThreadEnabled: false
   sandboxWarmPoolReplenishIntervalSecs: 5
   # Best-effort admission gate: when nonzero, api-rs rejects sandbox creates
   # and resumes at or above this observed running count, excluding ready warm
@@ -708,6 +716,13 @@ apiRs:
   sessionEventsRetentionSweepIntervalSecs: 300
   # Minimum age before proxy resources without a live Sandbox are reaped.
   sandboxOrphanSweepGraceSecs: 600
+  # Session sandbox retention: a workflow may keep a session's sandbox past
+  # the max lifetime while it owns open work (ctx.session_keepalive /
+  # ctx.stop_session_sandbox), for at most keepaliveMaxSecs from its first
+  # lease; the reaper honours the projected keep-until/keep-hard-deadline
+  # annotations up to the same cap. Needs sandboxMaxLifetimeSecs above 0.
+  sandboxKeepaliveEnabled: false
+  sandboxKeepaliveMaxSecs: 604800 # 7 days
   # Cleanup worker: stop unreferenced session/warm-pool sandboxes after two
   # consecutive sweeps and restore idle-pauses lost across api-rs restarts.
   # The idle backstop is only used when older execution rows have no persisted

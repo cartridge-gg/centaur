@@ -32,8 +32,8 @@ use centaur_sandbox_core::{Mount, MountKind, ResourceRequirements, SandboxSpec};
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
-    PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionEventRetentionConfig,
-    SessionPrincipalAdmission, SessionSandboxCleanupConfig,
+    KeepaliveConfig, PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode,
+    SessionEventRetentionConfig, SessionPrincipalAdmission, SessionSandboxCleanupConfig,
 };
 use centaur_session_sqlx::TextSearchBackend;
 use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
@@ -112,6 +112,10 @@ impl Args {
 
     pub(crate) fn sandbox_reaper_config(&self) -> SandboxReaperConfig {
         self.sandbox.sandbox_reaper_config()
+    }
+
+    pub(crate) fn sandbox_keepalive_config(&self) -> Result<Option<KeepaliveConfig>, ServerError> {
+        self.sandbox.sandbox_keepalive_config()
     }
 
     pub(crate) fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
@@ -737,17 +741,12 @@ struct SandboxArgs {
         env = "SESSION_SANDBOX_IMAGE_PULL_POLICY"
     )]
     agent_image_pull_policy: Option<String>,
-    #[arg(
-        long = "session-sandbox-image-pull-secrets",
-        env = "SESSION_SANDBOX_IMAGE_PULL_SECRETS",
-        value_delimiter = ','
-    )]
-    image_pull_secrets: Vec<String>,
-    /// Session sandbox container resources as a JSON Kubernetes
-    /// `ResourceRequirements` object. The chart renders `sandbox.resources`
-    /// into this because api-rs creates these pods at runtime.
-    #[arg(long = "session-sandbox-resources", env = "SESSION_SANDBOX_RESOURCES")]
-    sandbox_resources_json: Option<String>,
+    /// Give every session sandbox a persistent state volume: one
+    /// PersistentVolumeClaim per sandbox, created from the Sandbox's
+    /// `volumeClaimTemplates`, kept across an idle pause and deleted with the
+    /// sandbox. The entrypoint links `~/.codex`, `~/.claude`, `~/uploads` and
+    /// `~/branches` into it, so a resumed session keeps its harness history and
+    /// working copies. The chart renders `sandbox.stateVolume.*` into these.
     #[arg(
         long = "session-sandbox-state-volume-enabled",
         env = "SESSION_SANDBOX_STATE_VOLUME_ENABLED",
@@ -761,11 +760,43 @@ struct SandboxArgs {
         default_value = "10Gi"
     )]
     state_volume_size: String,
+    /// StorageClass for the claims. Empty means "omit", which only provisions
+    /// on a cluster with a default class.
     #[arg(
         long = "session-sandbox-state-volume-storage-class-name",
         env = "SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME"
     )]
     state_volume_storage_class_name: Option<String>,
+    /// Mount path inside the sandbox; also handed to the entrypoint as
+    /// `CENTAUR_STATE_DIR`.
+    #[arg(
+        long = "session-sandbox-state-volume-mount-path",
+        env = "SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH",
+        default_value = "/home/agent/state"
+    )]
+    state_volume_mount_path: String,
+    /// Let a resumed session continue its Codex thread: the harness records
+    /// its thread id on the state volume and calls `thread/resume` on the next
+    /// start (falling back to a fresh thread when the rollout is gone). Needs
+    /// the state volume; without it there is nothing to resume from.
+    #[arg(
+        long = "session-sandbox-resume-thread-enabled",
+        env = "SESSION_SANDBOX_RESUME_THREAD_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    resume_thread_enabled: bool,
+    #[arg(
+        long = "session-sandbox-image-pull-secrets",
+        env = "SESSION_SANDBOX_IMAGE_PULL_SECRETS",
+        value_delimiter = ','
+    )]
+    image_pull_secrets: Vec<String>,
+    /// Session sandbox container resources as a JSON Kubernetes
+    /// `ResourceRequirements` object. The chart renders `sandbox.resources`
+    /// into this because api-rs creates these pods at runtime.
+    #[arg(long = "session-sandbox-resources", env = "SESSION_SANDBOX_RESOURCES")]
+    sandbox_resources_json: Option<String>,
     #[arg(
         long = "session-sandbox-ready-timeout-secs",
         alias = "kubernetes-sandbox-ready-timeout-s",
@@ -805,6 +836,25 @@ struct SandboxArgs {
         default_value_t = 259_200
     )]
     sandbox_max_lifetime_secs: u64,
+    /// Let a session keep its sandbox past the max lifetime while it owns
+    /// open work (workflow RPCs `ctx.session_keepalive` /
+    /// `ctx.stop_session_sandbox`). Needs the max-lifetime sweep: retention is
+    /// an extension of it, not a replacement.
+    #[arg(
+        long = "session-sandbox-keepalive-enabled",
+        env = "SESSION_SANDBOX_KEEPALIVE_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    sandbox_keepalive_enabled: bool,
+    /// The most a session's retention may extend its sandbox, measured from
+    /// its first lease; the reaper applies the same cap past the max lifetime.
+    #[arg(
+        long = "session-sandbox-keepalive-max-secs",
+        env = "SESSION_SANDBOX_KEEPALIVE_MAX_SECS",
+        default_value_t = 604_800
+    )]
+    sandbox_keepalive_max_secs: u64,
     #[arg(
         long = "session-sandbox-reap-interval-secs",
         env = "SESSION_SANDBOX_REAP_INTERVAL_SECS",
@@ -1182,6 +1232,12 @@ impl SandboxArgs {
 
     fn codex_app_server_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
         let mut envs = vec![("CENTAUR_API_URL".to_owned(), self.centaur_api_url())];
+        if self.resume_thread_enabled && self.state_volume_enabled {
+            // Read by the harness server (crates/harness-server/src/codex.rs):
+            // persist the Codex thread id under CODEX_HOME (on the state
+            // volume) and resume it on the next start.
+            envs.push((CODEX_THREAD_PERSIST_ENV.to_owned(), "1".to_owned()));
+        }
 
         // Single source of truth: propagate this control plane's harness auth
         // modes into the sandbox so the agent's auth.json matches the
@@ -1290,6 +1346,46 @@ impl SandboxArgs {
         }
 
         Ok(envs)
+    }
+
+    /// The persistent state volume, when enabled. Validated here so a bad
+    /// mount path or size fails startup instead of every sandbox create.
+    fn state_volume_config(&self) -> Result<Option<StateVolumeConfig>, ServerError> {
+        if !self.state_volume_enabled {
+            return Ok(None);
+        }
+        let mount_path = self.state_volume_mount_path.trim();
+        if !mount_path.starts_with('/') || mount_path.len() < 2 || mount_path.ends_with('/') {
+            return Err(ServerError::UnsupportedConfig(format!(
+                "SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH must be an absolute path inside the \
+                 sandbox, got {mount_path:?}"
+            )));
+        }
+        let size = self.state_volume_size.trim();
+        if size.is_empty() {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_STATE_VOLUME_SIZE must be a Kubernetes quantity such as 10Gi"
+                    .to_owned(),
+            ));
+        }
+        let mut config = StateVolumeConfig::new(mount_path, size);
+        if let Some(class) = clean_optional_value(self.state_volume_storage_class_name.as_deref()) {
+            config = config.storage_class_name(class);
+        }
+        Ok(Some(config))
+    }
+
+    /// Thread continuation is only meaningful on top of the state volume: the
+    /// harness persists the thread id there and the rollout files live there.
+    fn validate_resume_thread(&self) -> Result<(), ServerError> {
+        if self.resume_thread_enabled && !self.state_volume_enabled {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_RESUME_THREAD_ENABLED needs SESSION_SANDBOX_STATE_VOLUME_ENABLED: \
+                 a thread can only be resumed from a persistent state volume"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// `SESSION_SANDBOX_NODE_SELECTOR` parsed as a JSON object of label
@@ -1535,6 +1631,18 @@ impl SandboxArgs {
     }
 
     fn warm_pool_config(&self, bootstrap_iron_control_principal: &str) -> Option<WarmPoolConfig> {
+        // A warm sandbox boots before any session owns it, and a persistent
+        // state claim cannot be attached to a running pod later; with the state
+        // volume on, every session sandbox is created cold so it gets its own
+        // claim from the start. Ready warm inventory left over from before the
+        // flip is retired at startup (SessionRuntime::retire_warm_pool_inventory).
+        if self.state_volume_enabled && self.warm_pool_size > 0 {
+            warn!(
+                warm_pool_size = self.warm_pool_size,
+                "session sandbox warm pool disabled: the persistent state volume is enabled"
+            );
+            return None;
+        }
         (self.warm_pool_size > 0).then(|| WarmPoolConfig {
             target_size: self.warm_pool_size,
             replenish_interval: Duration::from_secs(self.warm_pool_replenish_interval_secs),
@@ -1556,7 +1664,34 @@ impl SandboxArgs {
             interval: Duration::from_secs(self.sandbox_reap_interval_secs),
             orphan_sweep_grace: Duration::from_secs(self.sandbox_orphan_sweep_grace_secs),
             max_lifetime: ttl(self.sandbox_max_lifetime_secs),
+            keepalive_max: self
+                .sandbox_keepalive_enabled
+                .then(|| ttl(self.sandbox_keepalive_max_secs))
+                .flatten(),
         }
+    }
+
+    /// Session sandbox retention, when enabled. Refused without the
+    /// max-lifetime sweep, which would make every lease an unenforced promise.
+    fn sandbox_keepalive_config(&self) -> Result<Option<KeepaliveConfig>, ServerError> {
+        if !self.sandbox_keepalive_enabled {
+            return Ok(None);
+        }
+        if self.sandbox_max_lifetime_secs == 0 {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_KEEPALIVE_ENABLED needs a max-lifetime sweep: set \
+                 SESSION_SANDBOX_MAX_LIFETIME_SECS above 0"
+                    .to_owned(),
+            ));
+        }
+        if self.sandbox_keepalive_max_secs == 0 {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_KEEPALIVE_MAX_SECS must be above 0".to_owned(),
+            ));
+        }
+        Ok(Some(KeepaliveConfig {
+            max_extension: Duration::from_secs(self.sandbox_keepalive_max_secs),
+        }))
     }
 
     fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
@@ -1668,14 +1803,6 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         let mut config =
             AgentSandboxConfig::new(args.k8s_namespace.clone(), args.iron_control.settings()?);
         config.image_pull_policy = args.agent_image_pull_policy.clone();
-        if args.state_volume_enabled {
-            // The sandbox entrypoint persists native harness state here.
-            let mut state_volume =
-                StateVolumeConfig::new("/home/agent/state", args.state_volume_size.clone());
-            state_volume.storage_class_name =
-                clean_optional_value(args.state_volume_storage_class_name.as_deref());
-            config = config.state_volume(state_volume);
-        }
         config.image_pull_secrets = args
             .image_pull_secrets
             .iter()
@@ -1715,6 +1842,8 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .filter(|name| !name.is_empty())
             .map(str::to_owned);
         config.ready_timeout = Duration::from_secs(args.ready_timeout_secs);
+        config.state_volume = args.state_volume_config()?;
+        args.validate_resume_thread()?;
         let mut proxy = args.iron_proxy.to_config()?;
         let mut fragments = vec![args.iron_proxy.infra_fragment()?];
         if let Some(tool_fragment) = args.discover_tool_proxy_fragment()? {
@@ -1730,6 +1859,10 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         Ok(config)
     }
 }
+
+/// Sandbox env the harness server reads to persist and resume its Codex
+/// thread across a pause (see `crates/harness-server/src/codex.rs`).
+const CODEX_THREAD_PERSIST_ENV: &str = "CENTAUR_CODEX_THREAD_PERSIST";
 
 #[derive(Debug, ClapArgs)]
 struct ToolsArgs {
@@ -2755,6 +2888,211 @@ mod tests {
             let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
             assert_eq!(config.state_volume, None);
         }
+    }
+
+    #[test]
+    fn state_volume_is_off_by_default_and_parses_when_enabled() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+        assert!(!args.sandbox.state_volume_enabled);
+        assert_eq!(args.sandbox.state_volume_config().unwrap(), None);
+
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-state-volume-enabled",
+            "true",
+            "--session-sandbox-state-volume-size",
+            "20Gi",
+            "--session-sandbox-state-volume-storage-class-name",
+            "local-path",
+            "--session-sandbox-state-volume-mount-path",
+            "/home/agent/state",
+        ])
+        .unwrap();
+        let config = args.sandbox.state_volume_config().unwrap().unwrap();
+        assert_eq!(config.mount_path, "/home/agent/state");
+        assert_eq!(config.size, "20Gi");
+        assert_eq!(config.storage_class_name.as_deref(), Some("local-path"));
+
+        // An empty class means "omit" (the chart renders "" when unset).
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-state-volume-enabled",
+            "true",
+            "--session-sandbox-state-volume-storage-class-name",
+            "",
+        ])
+        .unwrap();
+        let config = args.sandbox.state_volume_config().unwrap().unwrap();
+        assert_eq!(config.storage_class_name, None);
+        assert_eq!(config.size, "10Gi");
+    }
+
+    #[test]
+    fn resume_thread_needs_the_state_volume_and_rides_the_sandbox_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--session-sandbox-centaur-api-url",
+            "http://host.docker.internal:8080",
+        ];
+        let args = Args::try_parse_from(
+            base.iter()
+                .copied()
+                .chain(["--session-sandbox-resume-thread-enabled", "true"]),
+        )
+        .unwrap();
+        let error = args
+            .sandbox
+            .validate_resume_thread()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("SESSION_SANDBOX_STATE_VOLUME_ENABLED"),
+            "{error}"
+        );
+        assert!(
+            !args
+                .sandbox
+                .codex_app_server_env_template()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == CODEX_THREAD_PERSIST_ENV)
+        );
+
+        let args = Args::try_parse_from(base.iter().copied().chain([
+            "--session-sandbox-resume-thread-enabled",
+            "true",
+            "--session-sandbox-state-volume-enabled",
+            "true",
+        ]))
+        .unwrap();
+        args.sandbox.validate_resume_thread().unwrap();
+        let envs = args.sandbox.codex_app_server_env_template().unwrap();
+        assert!(envs.contains(&(CODEX_THREAD_PERSIST_ENV.to_owned(), "1".to_owned())));
+
+        // Off by default, and the state volume alone does not turn it on.
+        let args = Args::try_parse_from(
+            base.iter()
+                .copied()
+                .chain(["--session-sandbox-state-volume-enabled", "true"]),
+        )
+        .unwrap();
+        assert!(
+            !args
+                .sandbox
+                .codex_app_server_env_template()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == CODEX_THREAD_PERSIST_ENV)
+        );
+    }
+
+    #[test]
+    fn keepalive_is_off_by_default_and_needs_the_max_lifetime_sweep() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+        assert!(args.sandbox.sandbox_keepalive_config().unwrap().is_none());
+        assert_eq!(args.sandbox.sandbox_reaper_config().keepalive_max, None);
+
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-keepalive-enabled",
+            "true",
+            "--session-sandbox-keepalive-max-secs",
+            "86400",
+        ])
+        .unwrap();
+        let config = args.sandbox.sandbox_keepalive_config().unwrap().unwrap();
+        assert_eq!(config.max_extension, Duration::from_secs(86_400));
+        assert_eq!(
+            args.sandbox.sandbox_reaper_config().keepalive_max,
+            Some(Duration::from_secs(86_400))
+        );
+
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-keepalive-enabled",
+            "true",
+            "--session-sandbox-max-lifetime-secs",
+            "0",
+        ])
+        .unwrap();
+        let error = args
+            .sandbox
+            .sandbox_keepalive_config()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("SESSION_SANDBOX_MAX_LIFETIME_SECS"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn state_volume_disables_the_warm_pool() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-warm-pool-size",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.sandbox.warm_pool_config("prn").map(|c| c.target_size),
+            Some(3)
+        );
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-warm-pool-size",
+            "3",
+            "--session-sandbox-state-volume-enabled",
+            "true",
+        ])
+        .unwrap();
+        assert!(args.sandbox.warm_pool_config("prn").is_none());
+    }
+
+    #[test]
+    fn state_volume_rejects_a_relative_mount_path() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-state-volume-enabled",
+            "true",
+            "--session-sandbox-state-volume-mount-path",
+            "state",
+        ])
+        .unwrap();
+        let error = args.sandbox.state_volume_config().unwrap_err().to_string();
+        assert!(
+            error.contains("SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

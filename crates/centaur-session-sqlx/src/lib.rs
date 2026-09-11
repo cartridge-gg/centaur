@@ -1633,6 +1633,35 @@ impl PgSessionStore {
         Ok(sandbox_id)
     }
 
+    pub async fn reserve_ready_warm_sandboxes_for_eviction(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<String>, SessionStoreError> {
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            with candidates as (
+                select sandbox_id
+                from session_warm_sandboxes
+                where status = 'ready'
+                order by created_at, sandbox_id
+                for update skip locked
+                limit $1
+            )
+            update session_warm_sandboxes warm
+            set
+                status = 'evicting',
+                updated_at = now()
+            from candidates
+            where warm.sandbox_id = candidates.sandbox_id
+            returning warm.sandbox_id
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn list_stale_evicting_warm_sandbox_ids(
         &self,
         min_age: Duration,
@@ -1668,6 +1697,61 @@ impl PgSessionStore {
         .bind(error)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// One top-level key of `sessions.metadata`; `Ok(None)` when the key is
+    /// unset, `NotFound` when the session does not exist.
+    pub async fn session_metadata_value(
+        &self,
+        thread_key: &ThreadKey,
+        key: &str,
+    ) -> Result<Option<Value>, SessionStoreError> {
+        let row = sqlx::query_scalar::<_, Option<Value>>(
+            r#"
+            select metadata -> $2
+            from sessions
+            where thread_key = $1
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(value) => Ok(value),
+            None => Err(SessionStoreError::NotFound {
+                thread_key: thread_key.as_str().to_owned(),
+            }),
+        }
+    }
+
+    /// Set one top-level key of `sessions.metadata`, leaving the rest of the
+    /// document untouched.
+    pub async fn set_session_metadata_value(
+        &self,
+        thread_key: &ThreadKey,
+        key: &str,
+        value: &Value,
+    ) -> Result<(), SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update sessions
+            set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), array[$2]::text[], $3::jsonb, true),
+                updated_at = now()
+            where thread_key = $1
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(SessionStoreError::NotFound {
+                thread_key: thread_key.as_str().to_owned(),
+            });
+        }
         Ok(())
     }
 
