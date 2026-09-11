@@ -88,4 +88,16 @@ pub trait SandboxBackend: Send + Sync {
 
     /// Resume a previously suspended sandbox and wait until it can serve I/O.
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()>;
+
+    /// Record control-plane annotations on the sandbox; a `None` value removes
+    /// the key. Backends without durable per-sandbox metadata may ignore this,
+    /// in which case the max-lifetime reaper cannot honour session retention
+    /// on them.
+    async fn annotate(
+        &self,
+        _id: &SandboxId,
+        _annotations: &BTreeMap<String, Option<String>>,
+    ) -> SandboxResult<()> {
+        Ok(())
+    }
 }

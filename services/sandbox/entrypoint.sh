@@ -49,13 +49,34 @@ if [ -n "${TOOL_DIRS:-}" ]; then
     install-tool-shims || echo "warning: failed to install Centaur tool CLI shims" >&2
 fi
 
+# Persistent state. When the control plane gives the sandbox a state volume it
+# sets CENTAUR_STATE_DIR to the mount path; the harness rollout files, uploads
+# and writable branch clones then live on the volume and survive an idle pause
+# (the pod is deleted, the claim is kept). An explicitly configured state dir
+# that is missing or read-only is a deployment fault: refuse to run ephemerally
+# and silently lose the session's memory.
+if [ -n "${CENTAUR_STATE_DIR:-}" ] && { [ ! -d "$STATE_DIR" ] || [ ! -w "$STATE_DIR" ]; }; then
+    echo "error: CENTAUR_STATE_DIR=$STATE_DIR is not a writable directory; the persistent state volume is missing" >&2
+    exit 1
+fi
 if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
     mkdir -p "$STATE_DIR/workspace" "$STATE_DIR/uploads" "$STATE_DIR/branches" "$STATE_DIR/codex" "$STATE_DIR/claude"
-    rm -rf "$HOME_DIR/.codex" "$HOME_DIR/.claude" "$HOME_DIR/uploads" "$HOME_DIR/branches"
-    ln -s "$STATE_DIR/codex" "$HOME_DIR/.codex"
-    ln -s "$STATE_DIR/claude" "$HOME_DIR/.claude"
-    ln -s "$STATE_DIR/uploads" "$HOME_DIR/uploads"
-    ln -s "$STATE_DIR/branches" "$HOME_DIR/branches"
+    # Idempotent across restarts of the same volume: an existing link is
+    # replaced, an image-provided directory seeds the state dir with any file
+    # not already there (never overwriting persisted state) before the link
+    # takes its place.
+    for _centaur_pair in "codex:.codex" "claude:.claude" "uploads:uploads" "branches:branches"; do
+        _centaur_state="${STATE_DIR}/${_centaur_pair%%:*}"
+        _centaur_home="${HOME_DIR}/${_centaur_pair##*:}"
+        if [ -L "$_centaur_home" ]; then
+            rm -f "$_centaur_home"
+        elif [ -d "$_centaur_home" ]; then
+            cp -an "$_centaur_home/." "$_centaur_state/" 2>/dev/null || true
+            rm -rf "$_centaur_home"
+        fi
+        ln -s "$_centaur_state" "$_centaur_home"
+    done
+    unset _centaur_pair _centaur_state _centaur_home
     export CENTAUR_PERSISTENT_STATE=1
 fi
 

@@ -120,6 +120,56 @@ class WorkflowContext:
             request["timeout_seconds"] = duration_seconds(timeout)
         return await self._rpc.request(request)
 
+    async def session_keepalive(
+        self,
+        thread_key: str,
+        *,
+        key: str,
+        generation: str,
+        until: dt.datetime | None,
+    ) -> dict[str, Any]:
+        """Keep a session's sandbox past the max lifetime while ``key`` (e.g. a
+        pull request the session owns) is open. ``until=None`` closes that
+        lease without stopping the sandbox. Never creates a session or boots a
+        sandbox; the control plane bounds ``until`` by its retention cap."""
+        if until is not None:
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=dt.timezone.utc)
+            until_value: str | None = until.astimezone(dt.timezone.utc).isoformat()
+        else:
+            until_value = None
+        return await self._rpc.request(
+            {
+                "type": "ctx.session_keepalive",
+                "thread_key": thread_key,
+                "key": key,
+                "generation": generation,
+                "until": until_value,
+            }
+        )
+
+    async def stop_session_sandbox(
+        self,
+        thread_key: str,
+        *,
+        key: str,
+        idempotency_key: str,
+        generation: str = "",
+    ) -> dict[str, Any]:
+        """Close the retention lease ``key`` and, when the session holds no
+        other active lease, stop its sandbox. An empty ``generation`` closes
+        whichever generation of the lease is active. A retry with the same
+        ``idempotency_key`` is a no-op."""
+        return await self._rpc.request(
+            {
+                "type": "ctx.stop_session_sandbox",
+                "thread_key": thread_key,
+                "key": key,
+                "generation": generation,
+                "idempotency_key": idempotency_key,
+            }
+        )
+
     async def agent_turn(self, text: str | None = None, **kwargs: Any) -> Any:
         # Per-workflow AGENT_DEFAULTS (model / provider / reasoning / harness,
         # ...) form the base; explicit per-call kwargs override them key by key.

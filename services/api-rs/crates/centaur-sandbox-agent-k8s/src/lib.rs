@@ -12,8 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    KEEP_HARD_DEADLINE_ANNOTATION, KEEP_UNTIL_ANNOTATION, MountKind, ObservedSandbox,
+    SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo, SandboxResult, SandboxSpec,
+    SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -38,6 +39,9 @@ mod tools;
 const BACKEND_NAME: &str = "agent-sandbox-k8s";
 const DEFAULT_CONTAINER_NAME: &str = "agent";
 const MANAGED_BY_LABEL: &str = "centaur.ai/managed-by";
+/// Tells the sandbox entrypoint where the persistent state volume is mounted;
+/// it links the harness state dirs into it (services/sandbox/entrypoint.sh).
+pub const STATE_DIR_ENV: &str = "CENTAUR_STATE_DIR";
 const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
 const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
 const MANAGED_BY_VALUE: &str = "api-rs";
@@ -302,7 +306,12 @@ impl AgentSandboxBackend {
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
-            .with_suspended_since(sandbox_paused_at(sandbox)))
+            .with_suspended_since(sandbox_paused_at(sandbox))
+            .with_keep_until(sandbox_annotation_time(sandbox, KEEP_UNTIL_ANNOTATION))
+            .with_keep_hard_deadline(sandbox_annotation_time(
+                sandbox,
+                KEEP_HARD_DEADLINE_ANNOTATION,
+            )))
     }
 
     async fn patch_sandbox_merge(&self, id: &SandboxId, patch: Value) -> SandboxResult<()> {
@@ -314,15 +323,28 @@ impl AgentSandboxBackend {
             .map_err(|err| map_kube_error("patch sandbox", err))
     }
 
+    /// Delete the sandbox's state claim, whether or not the CURRENT config
+    /// has a state volume: a claim created while the feature was on must not
+    /// outlive its sandbox after the feature is turned off. A claim of the
+    /// expected name that clearly belongs to something else (another owner)
+    /// is left alone.
     async fn delete_state_pvc(&self, id: &SandboxId) -> SandboxResult<()> {
-        if self.config.state_volume.is_none() {
+        let name = state_pvc_name(id);
+        let api = self.persistent_volume_claims();
+        let claim = match api.get_opt(&name).await {
+            Ok(Some(claim)) => claim,
+            Ok(None) => return Ok(()),
+            Err(err) => return Err(map_kube_error("get sandbox state pvc", err)),
+        };
+        if !state_pvc_belongs_to(&claim, id) {
+            tracing::warn!(
+                sandbox_id = id.as_str(),
+                claim = %name,
+                "state claim is owned by another object; not deleting it"
+            );
             return Ok(());
         }
-        match self
-            .persistent_volume_claims()
-            .delete(&state_pvc_name(id), &DeleteParams::default())
-            .await
-        {
+        match api.delete(&name, &DeleteParams::default()).await {
             Ok(_) => Ok(()),
             Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete sandbox state pvc", err)),
@@ -577,25 +599,27 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
+        // Every companion resource is attempted independently so one failure
+        // never leaves the others behind (a state claim that survives its
+        // sandbox is a leaked volume); the first error is reported after all
+        // four attempts, and every step tolerates an already-missing object so
+        // a retried stop converges.
         let proxy_result = self.delete_iron_proxy_resources(id).await;
         let files_result = self.delete_sandbox_files_config_map(id).await;
-        match self
+        let sandbox_result = match self
             .sandboxes()
             .delete(id.as_str(), &DeleteParams::default())
             .await
         {
-            Ok(_) => {
-                proxy_result?;
-                files_result?;
-                self.delete_state_pvc(id).await
-            }
-            Err(err) if is_not_found(&err) => {
-                proxy_result?;
-                files_result?;
-                self.delete_state_pvc(id).await
-            }
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete sandbox", err)),
-        }
+        };
+        let pvc_result = self.delete_state_pvc(id).await;
+        sandbox_result?;
+        proxy_result?;
+        files_result?;
+        pvc_result
     }
 
     async fn assign_iron_control_proxy_principal(
@@ -631,6 +655,18 @@ impl SandboxBackend for AgentSandboxBackend {
         // recorded at create, and already handles proxies deleted out from
         // under a suspended sandbox.
         self.delete_iron_proxy_resources(id).await
+    }
+
+    async fn annotate(
+        &self,
+        id: &SandboxId,
+        annotations: &BTreeMap<String, Option<String>>,
+    ) -> SandboxResult<()> {
+        if annotations.is_empty() {
+            return Ok(());
+        }
+        self.patch_sandbox_merge(id, sandbox_annotations_patch(annotations))
+            .await
     }
 
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -744,13 +780,20 @@ fn sandbox_creation_time(sandbox: &crd::Sandbox) -> Option<SystemTime> {
 }
 
 fn sandbox_paused_at(sandbox: &crd::Sandbox) -> Option<SystemTime> {
-    let raw = sandbox
-        .metadata
-        .annotations
-        .as_ref()?
-        .get(PAUSED_AT_ANNOTATION)?;
-    let timestamp = raw.parse::<jiff::Timestamp>().ok()?;
+    sandbox_annotation_time(sandbox, PAUSED_AT_ANNOTATION)
+}
+
+/// An RFC 3339 instant stored in a Sandbox annotation; absent or malformed
+/// reads as unset.
+fn sandbox_annotation_time(sandbox: &crd::Sandbox, key: &str) -> Option<SystemTime> {
+    let raw = sandbox.metadata.annotations.as_ref()?.get(key)?;
+    let timestamp = raw.trim().parse::<jiff::Timestamp>().ok()?;
     Some(SystemTime::from(timestamp))
+}
+
+/// A JSON merge patch that sets or removes (`None`) Sandbox annotations.
+fn sandbox_annotations_patch(annotations: &BTreeMap<String, Option<String>>) -> Value {
+    json!({ "metadata": { "annotations": annotations } })
 }
 
 fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
@@ -854,6 +897,24 @@ fn build_agent_sandbox(
             upsert_env(&mut agent_env, &name, value);
         }
     }
+    if let Some(state_volume) = &config.state_volume {
+        // The entrypoint refuses to start when CENTAUR_STATE_DIR names a
+        // missing dir, so it must be exactly the mount path; a spec env that
+        // says otherwise is a misconfiguration, not something to overrule.
+        if let Some((_, existing)) = agent_env.iter().find(|(name, _)| name == STATE_DIR_ENV)
+            && existing != &state_volume.mount_path
+        {
+            return Err(SandboxError::InvalidSpec(format!(
+                "{STATE_DIR_ENV} is set to {existing:?} but the state volume mounts at {:?}",
+                state_volume.mount_path
+            )));
+        }
+        upsert_env(
+            &mut agent_env,
+            STATE_DIR_ENV,
+            state_volume.mount_path.clone(),
+        );
+    }
     insert_optional(
         &mut container,
         "env",
@@ -938,7 +999,9 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
-    if repo_cache_tools.is_some() {
+    // fsGroup makes the tools emptyDir and the state claim writable by the
+    // agent uid; a freshly provisioned claim is root-owned otherwise.
+    if repo_cache_tools.is_some() || config.state_volume.is_some() {
         pod_spec["securityContext"] = tools::pod_security_context_json();
     }
     insert_optional(
@@ -1181,6 +1244,25 @@ fn state_volume_claim_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
 
 fn state_pvc_name(id: &SandboxId) -> String {
     format!("state-{}", id.as_str())
+}
+
+/// A claim named for this sandbox is ours unless something else claims it:
+/// an owner reference to a different object, or our own sandbox-id label
+/// naming another sandbox. The controller that creates claims from
+/// `volumeClaimTemplates` may set either, neither, or both.
+fn state_pvc_belongs_to(claim: &PersistentVolumeClaim, id: &SandboxId) -> bool {
+    let owners_match = claim
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_none_or(|owners| owners.iter().all(|owner| owner.name == id.as_str()));
+    let label_matches = claim
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(SANDBOX_ID_LABEL))
+        .is_none_or(|label| label == id.as_str());
+    owners_match && label_matches
 }
 
 fn insert_optional<T>(target: &mut Value, key: &str, value: Option<T>)
@@ -1843,6 +1925,166 @@ mod tests {
         assert_eq!(
             sandbox_status_from_pod(1, Some(&failed_pod)),
             SandboxStatus::Stopped
+        );
+    }
+
+    #[test]
+    fn state_volume_hands_the_mount_path_to_the_entrypoint_and_sets_fs_group() {
+        let spec =
+            SandboxSpec::new("centaur-agent:latest").env("CENTAUR_API_URL", "http://api:8000");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings()).state_volume(
+            StateVolumeConfig::new("/home/agent/state", "20Gi").storage_class_name("local-path"),
+        );
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        let container = &sandbox.spec.pod_template.spec.containers[0];
+        let env = container.env.as_ref().unwrap();
+        let state_dir = env.iter().find(|env| env.name == STATE_DIR_ENV).unwrap();
+        assert_eq!(state_dir.value.as_deref(), Some("/home/agent/state"));
+        assert!(env.iter().any(|env| env.name == "CENTAUR_API_URL"));
+        let mount = container
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.name == "state")
+            .unwrap();
+        assert_eq!(mount.mount_path, "/home/agent/state");
+        let claims = sandbox.spec.volume_claim_templates.as_ref().unwrap();
+        assert_eq!(claims.len(), 1);
+        let claim = serde_json::to_value(&claims[0]).unwrap();
+        assert_eq!(claim["metadata"]["name"], "state");
+        assert_eq!(claim["spec"]["storageClassName"], "local-path");
+        assert_eq!(claim["spec"]["resources"]["requests"]["storage"], "20Gi");
+        assert_eq!(claim["spec"]["accessModes"][0], "ReadWriteOnce");
+        // No tools bootstrap in this spec: the fsGroup comes from the state volume alone.
+        let security =
+            serde_json::to_value(&sandbox.spec.pod_template.spec.security_context).unwrap();
+        assert_eq!(security["fsGroup"], tools::AGENT_UID);
+    }
+
+    #[test]
+    fn state_volume_without_a_class_omits_it_and_ephemeral_sandboxes_get_no_state_dir() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings())
+            .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"));
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let claim = serde_json::to_value(&sandbox.spec.volume_claim_templates.as_ref().unwrap()[0])
+            .unwrap();
+        assert!(claim["spec"].get("storageClassName").is_none());
+
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert!(sandbox.spec.volume_claim_templates.is_none());
+        let container = &sandbox.spec.pod_template.spec.containers[0];
+        assert!(
+            container
+                .env
+                .as_ref()
+                .is_none_or(|env| env.iter().all(|env| env.name != STATE_DIR_ENV))
+        );
+        assert!(sandbox.spec.pod_template.spec.security_context.is_none());
+    }
+
+    #[test]
+    fn state_volume_rejects_a_conflicting_state_dir_env() {
+        let spec = SandboxSpec::new("centaur-agent:latest").env(STATE_DIR_ENV, "/somewhere/else");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings())
+            .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"));
+        let error = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap_err();
+        assert!(error.to_string().contains(STATE_DIR_ENV), "{error}");
+        // The same value is fine (operators may pin it explicitly).
+        let spec = SandboxSpec::new("centaur-agent:latest").env(STATE_DIR_ENV, "/home/agent/state");
+        build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+    }
+
+    #[test]
+    fn state_pvc_ownership_check() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        let id = SandboxId::new("asbx-test");
+        let owner = |name: &str| OwnerReference {
+            api_version: "agents.x-k8s.io/v1alpha1".to_owned(),
+            kind: "Sandbox".to_owned(),
+            name: name.to_owned(),
+            uid: "uid".to_owned(),
+            ..OwnerReference::default()
+        };
+        let claim =
+            |owners: Option<Vec<OwnerReference>>, label: Option<&str>| PersistentVolumeClaim {
+                metadata: ObjectMeta {
+                    name: Some(state_pvc_name(&id)),
+                    owner_references: owners,
+                    labels: label.map(|value| {
+                        BTreeMap::from([(SANDBOX_ID_LABEL.to_owned(), value.to_owned())])
+                    }),
+                    ..ObjectMeta::default()
+                },
+                ..PersistentVolumeClaim::default()
+            };
+        assert!(state_pvc_belongs_to(&claim(None, None), &id));
+        assert!(state_pvc_belongs_to(
+            &claim(Some(vec![owner("asbx-test")]), None),
+            &id
+        ));
+        assert!(state_pvc_belongs_to(&claim(None, Some("asbx-test")), &id));
+        assert!(!state_pvc_belongs_to(
+            &claim(Some(vec![owner("asbx-other")]), None),
+            &id
+        ));
+        assert!(!state_pvc_belongs_to(&claim(None, Some("asbx-other")), &id));
+    }
+
+    #[test]
+    fn retention_annotations_are_observed_and_patched() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let mut sandbox =
+            build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert_eq!(
+            sandbox_annotation_time(&sandbox, KEEP_UNTIL_ANNOTATION),
+            None
+        );
+        let annotations = sandbox
+            .metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new);
+        annotations.insert(
+            KEEP_UNTIL_ANNOTATION.to_owned(),
+            "2026-09-18T10:00:00Z".to_owned(),
+        );
+        annotations.insert(
+            KEEP_HARD_DEADLINE_ANNOTATION.to_owned(),
+            "garbage".to_owned(),
+        );
+        let keep_until = sandbox_annotation_time(&sandbox, KEEP_UNTIL_ANNOTATION).unwrap();
+        assert_eq!(
+            keep_until,
+            SystemTime::from("2026-09-18T10:00:00Z".parse::<jiff::Timestamp>().unwrap())
+        );
+        assert_eq!(
+            sandbox_annotation_time(&sandbox, KEEP_HARD_DEADLINE_ANNOTATION),
+            None
+        );
+
+        let patch = sandbox_annotations_patch(&BTreeMap::from([
+            (
+                KEEP_UNTIL_ANNOTATION.to_owned(),
+                Some("2026-09-18T10:00:00Z".to_owned()),
+            ),
+            (KEEP_HARD_DEADLINE_ANNOTATION.to_owned(), None),
+        ]));
+        assert_eq!(
+            patch["metadata"]["annotations"][KEEP_UNTIL_ANNOTATION],
+            "2026-09-18T10:00:00Z"
+        );
+        // A None value renders as null, which a merge patch treats as "remove".
+        assert!(patch["metadata"]["annotations"][KEEP_HARD_DEADLINE_ANNOTATION].is_null());
+        assert!(
+            patch["metadata"]["annotations"]
+                .as_object()
+                .unwrap()
+                .contains_key(KEEP_HARD_DEADLINE_ANNOTATION)
         );
     }
 

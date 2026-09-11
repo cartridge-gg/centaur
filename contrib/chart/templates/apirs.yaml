@@ -317,6 +317,8 @@ spec:
               value: {{ .Values.apiRs.sandboxReadyTimeoutSecs | quote }}
             - name: SESSION_SANDBOX_WARM_POOL_SIZE
               value: {{ .Values.apiRs.sandboxWarmPoolSize | quote }}
+            - name: SESSION_SANDBOX_RESUME_THREAD_ENABLED
+              value: {{ .Values.apiRs.sandboxResumeThreadEnabled | default false | quote }}
             - name: SESSION_SANDBOX_WARM_POOL_REPLENISH_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxWarmPoolReplenishIntervalSecs | quote }}
             - name: SESSION_SANDBOX_RUNNING_LIMIT
@@ -327,6 +329,10 @@ spec:
               value: {{ .Values.apiRs.sandboxMaxLifetimeSecs | quote }}
             - name: SESSION_SANDBOX_REAP_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxReapIntervalSecs | quote }}
+            - name: SESSION_SANDBOX_KEEPALIVE_ENABLED
+              value: {{ .Values.apiRs.sandboxKeepaliveEnabled | default false | quote }}
+            - name: SESSION_SANDBOX_KEEPALIVE_MAX_SECS
+              value: {{ .Values.apiRs.sandboxKeepaliveMaxSecs | default 604800 | quote }}
             - name: SESSION_SANDBOX_CLEANUP_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxCleanupIntervalSecs | quote }}
             - name: SESSION_SANDBOX_IDLE_CLEANUP_BACKSTOP_SECS
@@ -353,6 +359,18 @@ spec:
               value: {{ printf "%s:%s" .Values.sandbox.image.repository .Values.sandbox.image.tag | quote }}
             - name: SESSION_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.sandbox.image.pullPolicy | quote }}
+{{- if .Values.sandbox.stateVolume.enabled }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_ENABLED
+              value: "true"
+            - name: SESSION_SANDBOX_STATE_VOLUME_SIZE
+              value: {{ .Values.sandbox.stateVolume.size | quote }}
+{{- if .Values.sandbox.stateVolume.storageClassName }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME
+              value: {{ .Values.sandbox.stateVolume.storageClassName | quote }}
+{{- end }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH
+              value: {{ .Values.sandbox.stateVolume.mountPath | default "/home/agent/state" | quote }}
+{{- end }}
 {{- if and .Values.sandbox.resources (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_RESOURCES")) }}
             - name: SESSION_SANDBOX_RESOURCES
               value: {{ toJson .Values.sandbox.resources | quote }}
