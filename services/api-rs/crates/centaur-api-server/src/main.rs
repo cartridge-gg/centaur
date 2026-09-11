@@ -90,6 +90,19 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     }
     if let Some(config) = args.warm_pool_config(&iron_control.warm_pool_bootstrap_principal) {
         runtime = runtime.with_warm_pool(config);
+    } else {
+        // No pool this run: retire any ready inventory a previous configuration
+        // left behind, or those pods would stay referenced and never be reaped.
+        match runtime.retire_warm_pool_inventory().await {
+            Ok(0) => {}
+            Ok(stopped) => tracing::info!(stopped, "retired leftover warm sandbox inventory"),
+            Err(error) => {
+                tracing::warn!(%error, "failed to retire leftover warm sandbox inventory")
+            }
+        }
+    }
+    if let Some(config) = args.sandbox_keepalive_config()? {
+        runtime = runtime.with_sandbox_keepalive(config);
     }
     runtime = runtime.with_sandbox_reaper(args.sandbox_reaper_config());
     runtime = runtime.with_sandbox_cleanup(args.sandbox_cleanup_config());
