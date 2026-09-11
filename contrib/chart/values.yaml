@@ -537,6 +537,13 @@ apiRs:
   # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days
   sandboxReapIntervalSecs: 300
+  # Session sandbox retention: a workflow may keep a session's sandbox past
+  # the max lifetime while it owns open work (ctx.session_keepalive /
+  # ctx.stop_session_sandbox), for at most keepaliveMaxSecs from its first
+  # lease; the reaper honours the projected keep-until/keep-hard-deadline
+  # annotations up to the same cap. Needs sandboxMaxLifetimeSecs above 0.
+  sandboxKeepaliveEnabled: false
+  sandboxKeepaliveMaxSecs: 604800 # 7 days
   # Cleanup worker: stop unreferenced session/warm-pool sandboxes after two
   # consecutive sweeps and restore idle-pauses lost across api-rs restarts.
   # The idle backstop is only used when older execution rows have no persisted

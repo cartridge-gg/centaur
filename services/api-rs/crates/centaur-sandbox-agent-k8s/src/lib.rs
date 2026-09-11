@@ -12,8 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    KEEP_HARD_DEADLINE_ANNOTATION, KEEP_UNTIL_ANNOTATION, MountKind, ObservedSandbox,
+    SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo, SandboxResult, SandboxSpec,
+    SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -305,7 +306,12 @@ impl AgentSandboxBackend {
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
-            .with_suspended_since(sandbox_paused_at(sandbox)))
+            .with_suspended_since(sandbox_paused_at(sandbox))
+            .with_keep_until(sandbox_annotation_time(sandbox, KEEP_UNTIL_ANNOTATION))
+            .with_keep_hard_deadline(sandbox_annotation_time(
+                sandbox,
+                KEEP_HARD_DEADLINE_ANNOTATION,
+            )))
     }
 
     async fn patch_sandbox_merge(&self, id: &SandboxId, patch: Value) -> SandboxResult<()> {
@@ -651,6 +657,18 @@ impl SandboxBackend for AgentSandboxBackend {
         self.delete_iron_proxy_resources(id).await
     }
 
+    async fn annotate(
+        &self,
+        id: &SandboxId,
+        annotations: &BTreeMap<String, Option<String>>,
+    ) -> SandboxResult<()> {
+        if annotations.is_empty() {
+            return Ok(());
+        }
+        self.patch_sandbox_merge(id, sandbox_annotations_patch(annotations))
+            .await
+    }
+
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
         // Resume only has the sandbox id, not the spec, so rebind the proxy to
         // the principal recorded at create rather than re-resolving from spec.
@@ -762,13 +780,20 @@ fn sandbox_creation_time(sandbox: &crd::Sandbox) -> Option<SystemTime> {
 }
 
 fn sandbox_paused_at(sandbox: &crd::Sandbox) -> Option<SystemTime> {
-    let raw = sandbox
-        .metadata
-        .annotations
-        .as_ref()?
-        .get(PAUSED_AT_ANNOTATION)?;
-    let timestamp = raw.parse::<jiff::Timestamp>().ok()?;
+    sandbox_annotation_time(sandbox, PAUSED_AT_ANNOTATION)
+}
+
+/// An RFC 3339 instant stored in a Sandbox annotation; absent or malformed
+/// reads as unset.
+fn sandbox_annotation_time(sandbox: &crd::Sandbox, key: &str) -> Option<SystemTime> {
+    let raw = sandbox.metadata.annotations.as_ref()?.get(key)?;
+    let timestamp = raw.trim().parse::<jiff::Timestamp>().ok()?;
     Some(SystemTime::from(timestamp))
+}
+
+/// A JSON merge patch that sets or removes (`None`) Sandbox annotations.
+fn sandbox_annotations_patch(annotations: &BTreeMap<String, Option<String>>) -> Value {
+    json!({ "metadata": { "annotations": annotations } })
 }
 
 fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
@@ -2008,6 +2033,59 @@ mod tests {
             &id
         ));
         assert!(!state_pvc_belongs_to(&claim(None, Some("asbx-other")), &id));
+    }
+
+    #[test]
+    fn retention_annotations_are_observed_and_patched() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let mut sandbox =
+            build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert_eq!(
+            sandbox_annotation_time(&sandbox, KEEP_UNTIL_ANNOTATION),
+            None
+        );
+        let annotations = sandbox
+            .metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new);
+        annotations.insert(
+            KEEP_UNTIL_ANNOTATION.to_owned(),
+            "2026-09-18T10:00:00Z".to_owned(),
+        );
+        annotations.insert(
+            KEEP_HARD_DEADLINE_ANNOTATION.to_owned(),
+            "garbage".to_owned(),
+        );
+        let keep_until = sandbox_annotation_time(&sandbox, KEEP_UNTIL_ANNOTATION).unwrap();
+        assert_eq!(
+            keep_until,
+            SystemTime::from("2026-09-18T10:00:00Z".parse::<jiff::Timestamp>().unwrap())
+        );
+        assert_eq!(
+            sandbox_annotation_time(&sandbox, KEEP_HARD_DEADLINE_ANNOTATION),
+            None
+        );
+
+        let patch = sandbox_annotations_patch(&BTreeMap::from([
+            (
+                KEEP_UNTIL_ANNOTATION.to_owned(),
+                Some("2026-09-18T10:00:00Z".to_owned()),
+            ),
+            (KEEP_HARD_DEADLINE_ANNOTATION.to_owned(), None),
+        ]));
+        assert_eq!(
+            patch["metadata"]["annotations"][KEEP_UNTIL_ANNOTATION],
+            "2026-09-18T10:00:00Z"
+        );
+        // A None value renders as null, which a merge patch treats as "remove".
+        assert!(patch["metadata"]["annotations"][KEEP_HARD_DEADLINE_ANNOTATION].is_null());
+        assert!(
+            patch["metadata"]["annotations"]
+                .as_object()
+                .unwrap()
+                .contains_key(KEEP_HARD_DEADLINE_ANNOTATION)
+        );
     }
 
     #[test]

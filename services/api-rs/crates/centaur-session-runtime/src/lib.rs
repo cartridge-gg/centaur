@@ -1,4 +1,5 @@
 mod cleanup;
+mod retention;
 mod title_generator;
 
 use std::{
@@ -52,6 +53,10 @@ use tracing::{Instrument, Span, debug, error, info, info_span, warn};
 use uuid::Uuid;
 
 pub use cleanup::SessionSandboxCleanupConfig;
+pub use retention::{
+    KeepaliveOutcome, Lease, LeaseClose, LeaseState, RETENTION_METADATA_KEY, Retention,
+    RetentionError,
+};
 pub use title_generator::SessionTitleGenerationError;
 use title_generator::{
     OpenAiSessionTitleGenerator, sanitize_session_title, session_title_source_from_parts,
@@ -150,11 +155,68 @@ pub struct SessionRuntime {
     session_title_in_flight: SessionTitleThreadSet,
     session_title_rerun_requested: SessionTitleThreadSet,
     capacity: Option<Arc<SandboxCapacityController>>,
+    /// Session sandbox retention (`session_keepalive` / `stop_session_sandbox`);
+    /// None refuses both.
+    keepalive: Option<KeepaliveConfig>,
     stdout_owner_id: String,
     /// Set once a shutdown handoff begins; fences new stdout-owner claims
     /// so an execution cannot start on a control plane that is about to
     /// exit and release its leases.
     shutting_down: Arc<AtomicBool>,
+}
+
+/// Bounds for session sandbox retention. `max_extension` caps how long a
+/// session may keep its sandbox from its first lease (`hard_deadline =
+/// started_at + max_extension`); the reaper applies the same cap past the max
+/// lifetime.
+#[derive(Clone, Copy, Debug)]
+pub struct KeepaliveConfig {
+    pub max_extension: Duration,
+}
+
+/// `session_keepalive` input: open, renew (`until = Some`) or close
+/// (`until = None`) one lease on the session's sandbox retention.
+#[derive(Clone, Debug)]
+pub struct SessionKeepaliveRequest {
+    pub thread_key: ThreadKey,
+    /// The work the lease stands for, e.g. `github:<owner>/<repo>:<pr>`.
+    pub key: String,
+    /// The event that opened it; a closed generation is never reopened.
+    pub generation: String,
+    pub until: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionKeepaliveReceipt {
+    pub thread_key: String,
+    pub sandbox_id: Option<String>,
+    pub until: Option<String>,
+    pub hard_deadline: Option<String>,
+    pub applied: bool,
+    pub active_leases: usize,
+    /// Whether the retention was projected onto the current sandbox.
+    pub projected: bool,
+}
+
+/// `stop_session_sandbox` input: close one lease and, when none remains,
+/// stop the session's sandbox.
+#[derive(Clone, Debug)]
+pub struct StopSessionSandboxRequest {
+    pub thread_key: ThreadKey,
+    pub key: String,
+    pub generation: String,
+    /// Stable per close event; a retry with the same key is a no-op.
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StopSessionSandboxReceipt {
+    pub thread_key: String,
+    pub sandbox_id: Option<String>,
+    pub stopped: bool,
+    pub already_stopped: bool,
+    pub active_leases: usize,
+    pub reason: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -933,6 +995,7 @@ impl SessionRuntime {
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: Arc::new(iron_control),
             warm_pool: None,
+            keepalive: None,
             personas: None,
             session_title_generator: None,
             session_title_in_flight: Arc::new(DashSet::new()),
@@ -1543,6 +1606,255 @@ impl SessionRuntime {
             );
         }
         Ok(stopped)
+    }
+
+    pub fn with_sandbox_keepalive(mut self, config: KeepaliveConfig) -> Self {
+        if config.max_extension.is_zero() {
+            return self;
+        }
+        self.keepalive = Some(config);
+        self
+    }
+
+    fn keepalive_config(&self) -> Result<KeepaliveConfig, SessionRuntimeError> {
+        self.keepalive.ok_or_else(|| {
+            SessionRuntimeError::BadRequest(
+                "session sandbox retention is disabled (SESSION_SANDBOX_KEEPALIVE_ENABLED)"
+                    .to_owned(),
+            )
+        })
+    }
+
+    async fn load_retention(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Option<Retention>, SessionRuntimeError> {
+        let value = self
+            .store
+            .session_metadata_value(thread_key, RETENTION_METADATA_KEY)
+            .await?;
+        Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+    }
+
+    async fn save_retention(
+        &self,
+        thread_key: &ThreadKey,
+        retention: &Retention,
+    ) -> Result<(), SessionRuntimeError> {
+        let value = serde_json::to_value(retention).map_err(|error| {
+            SessionRuntimeError::BadRequest(format!("retention is not serializable: {error}"))
+        })?;
+        self.store
+            .set_session_metadata_value(thread_key, RETENTION_METADATA_KEY, &value)
+            .await?;
+        Ok(())
+    }
+
+    /// Project the session's retention onto its sandbox as annotations. Best
+    /// effort: a failure is logged, and the next assignment or keepalive
+    /// projects again. Returns whether the annotations were written.
+    async fn project_retention(&self, thread_key: &ThreadKey, sandbox_id: &str) -> bool {
+        if self.keepalive.is_none() {
+            return false;
+        }
+        let annotations = match self.load_retention(thread_key).await {
+            Ok(Some(retention)) => retention.annotations(),
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(%thread_key, sandbox_id, %error, "failed to load sandbox retention");
+                return false;
+            }
+        };
+        match self
+            .sandbox_runtime
+            .manager
+            .annotate(&SandboxId::new(sandbox_id), &annotations)
+            .await
+        {
+            Ok(()) => true,
+            Err(SandboxError::NotFound(_)) => false,
+            Err(error) => {
+                warn!(%thread_key, sandbox_id, %error, "failed to project sandbox retention");
+                false
+            }
+        }
+    }
+
+    /// Open, renew or close a retention lease on the session's sandbox. Never
+    /// creates a session or boots a sandbox.
+    pub async fn session_keepalive(
+        &self,
+        request: SessionKeepaliveRequest,
+    ) -> Result<SessionKeepaliveReceipt, SessionRuntimeError> {
+        let config = self.keepalive_config()?;
+        if request.key.trim().is_empty() || request.generation.trim().is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "session keepalive requires a non-empty key and generation".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(&request.thread_key).await?;
+        let existing = self.load_retention(&request.thread_key).await?;
+        let now = SystemTime::now();
+        let (retention, outcome) = retention::apply_keepalive(
+            existing,
+            request.key.trim(),
+            request.generation.trim(),
+            request.until,
+            now,
+            config.max_extension,
+        )
+        .map_err(|error| SessionRuntimeError::BadRequest(error.to_string()))?;
+        if outcome.applied {
+            self.save_retention(&request.thread_key, &retention).await?;
+        }
+        let projected = match session.sandbox_id.as_deref() {
+            Some(sandbox_id) => {
+                self.project_retention(&request.thread_key, sandbox_id)
+                    .await
+            }
+            None => false,
+        };
+        self.store
+            .append_event(
+                &request.thread_key,
+                None,
+                "session.sandbox_keepalive",
+                json!({
+                    "thread_key": request.thread_key.as_str(),
+                    "sandbox_id": session.sandbox_id,
+                    "key": request.key.trim(),
+                    "generation": request.generation.trim(),
+                    "until": request.until.map(retention::format_time),
+                    "applied": outcome.applied,
+                    "active_leases": retention.active_leases(),
+                    "projected": projected,
+                }),
+            )
+            .await?;
+        Ok(SessionKeepaliveReceipt {
+            thread_key: request.thread_key.as_str().to_owned(),
+            sandbox_id: session.sandbox_id,
+            until: retention.effective_until().map(retention::format_time),
+            hard_deadline: Some(retention.hard_deadline.clone()),
+            applied: outcome.applied,
+            active_leases: retention.active_leases(),
+            projected,
+        })
+    }
+
+    /// Close a retention lease and, when the session holds no other active
+    /// lease, stop its sandbox. Idempotent per `idempotency_key`.
+    pub async fn stop_session_sandbox(
+        &self,
+        request: StopSessionSandboxRequest,
+    ) -> Result<StopSessionSandboxReceipt, SessionRuntimeError> {
+        let config = self.keepalive_config()?;
+        if request.key.trim().is_empty() || request.idempotency_key.trim().is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "stop_session_sandbox requires a non-empty key and idempotency_key".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(&request.thread_key).await?;
+        let existing = self.load_retention(&request.thread_key).await?;
+        let (retention, close) = retention::close_lease(
+            existing,
+            request.key.trim(),
+            request.generation.trim(),
+            request.idempotency_key.trim(),
+            SystemTime::now(),
+            config.max_extension,
+        );
+        let thread_key = request.thread_key.as_str().to_owned();
+        if close.already_done {
+            return Ok(StopSessionSandboxReceipt {
+                thread_key,
+                sandbox_id: session.sandbox_id,
+                stopped: false,
+                already_stopped: true,
+                active_leases: close.active_remaining,
+                reason: "already_done".to_owned(),
+            });
+        }
+        self.save_retention(&request.thread_key, &retention).await?;
+        if close.active_remaining > 0 {
+            if let Some(sandbox_id) = session.sandbox_id.as_deref() {
+                self.project_retention(&request.thread_key, sandbox_id)
+                    .await;
+            }
+            return Ok(StopSessionSandboxReceipt {
+                thread_key,
+                sandbox_id: session.sandbox_id,
+                stopped: false,
+                already_stopped: false,
+                active_leases: close.active_remaining,
+                reason: "leases_remaining".to_owned(),
+            });
+        }
+        let Some(sandbox_id) = session.sandbox_id.clone() else {
+            return Ok(StopSessionSandboxReceipt {
+                thread_key,
+                sandbox_id: None,
+                stopped: false,
+                already_stopped: true,
+                active_leases: 0,
+                reason: "no_sandbox".to_owned(),
+            });
+        };
+        // Active work is interrupted through the ordinary path first so the
+        // execution ends as cancelled rather than as a lost pipe.
+        let interrupted = self
+            .interrupt_active_execution(&request.thread_key, "retention_closed")
+            .await
+            .map(|outcome| outcome.interrupted)
+            .unwrap_or(false);
+        let id = SandboxId::new(sandbox_id.as_str());
+        self.sandbox_pipes.remove(&sandbox_id);
+        let stopped = match self.sandbox_runtime.manager.stop(&id).await {
+            Ok(()) => true,
+            Err(SandboxError::NotFound(_)) => false,
+            Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
+        };
+        self.store
+            .update_sandbox_id(&request.thread_key, None)
+            .await?;
+        self.store
+            .append_event(
+                &request.thread_key,
+                None,
+                "session.sandbox_stopped",
+                json!({
+                    "thread_key": request.thread_key.as_str(),
+                    "sandbox_id": sandbox_id,
+                    "reason": "retention_closed",
+                    "key": request.key.trim(),
+                    "generation": request.generation.trim(),
+                    "idempotency_key": request.idempotency_key.trim(),
+                    "interrupted_execution": interrupted,
+                    "stopped": stopped,
+                }),
+            )
+            .await?;
+        info!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_sandbox_stopped",
+            thread_key = %request.thread_key,
+            sandbox_id,
+            stopped,
+            interrupted,
+            "stopped session sandbox: retention closed"
+        );
+        Ok(StopSessionSandboxReceipt {
+            thread_key,
+            sandbox_id: Some(sandbox_id),
+            stopped,
+            already_stopped: !stopped,
+            active_leases: 0,
+            reason: if stopped {
+                "stopped".to_owned()
+            } else {
+                "sandbox_missing".to_owned()
+            },
+        })
     }
 
     pub fn with_sandbox_capacity(mut self, config: SandboxCapacityConfig) -> Self {
@@ -3143,6 +3455,7 @@ impl SessionRuntime {
                                 desired_capabilities,
                             )
                             .await?;
+                        self.project_retention(thread_key, sandbox_id.as_str()).await;
                         self.store
                             .append_event(
                                 thread_key,
@@ -3219,6 +3532,7 @@ impl SessionRuntime {
             self.store
                 .update_sandbox_assignment(thread_key, handle.id.as_str(), desired_capabilities)
                 .await?;
+            self.project_retention(thread_key, handle.id.as_str()).await;
             self.record_sandbox_ready(SandboxReadyObservation {
                 thread_key,
                 execution_id,
@@ -8746,6 +9060,11 @@ mod tests {
 /// silently otherwise, mirroring `ABSURD_TEST_DATABASE_URL` in absurd-sdk).
 #[cfg(test)]
 mod adoption_tests {
+    use centaur_sandbox_core::{KEEP_HARD_DEADLINE_ANNOTATION, KEEP_UNTIL_ANNOTATION};
+
+    /// (sandbox id, annotations) pairs the mock backend was asked to write.
+    type RecordedAnnotations = Vec<(String, BTreeMap<String, Option<String>>)>;
+
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -8813,6 +9132,7 @@ mod adoption_tests {
         stopped: std::sync::Mutex<Vec<String>>,
         proxy_ensures: std::sync::Mutex<Vec<ProxyEnsure>>,
         missing_on_stop: std::sync::Mutex<BTreeSet<String>>,
+        annotations: std::sync::Mutex<RecordedAnnotations>,
     }
 
     impl MockBackend {
@@ -8831,6 +9151,7 @@ mod adoption_tests {
                 stopped: std::sync::Mutex::new(Vec::new()),
                 proxy_ensures: std::sync::Mutex::new(Vec::new()),
                 missing_on_stop: std::sync::Mutex::new(BTreeSet::new()),
+                annotations: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -8884,6 +9205,9 @@ mod adoption_tests {
 
         fn stopped(&self) -> Vec<String> {
             self.stopped.lock().unwrap().clone()
+        }
+        fn annotations(&self) -> RecordedAnnotations {
+            self.annotations.lock().unwrap().clone()
         }
 
         fn proxy_ensures(&self) -> Vec<ProxyEnsure> {
@@ -8979,6 +9303,17 @@ mod adoption_tests {
             Ok(())
         }
 
+        async fn annotate(
+            &self,
+            id: &SandboxId,
+            annotations: &BTreeMap<String, Option<String>>,
+        ) -> SandboxResult<()> {
+            self.annotations
+                .lock()
+                .unwrap()
+                .push((id.as_str().to_owned(), annotations.clone()));
+            Ok(())
+        }
         async fn pause(&self, _id: &SandboxId) -> SandboxResult<()> {
             self.set_observed_status(_id.as_str(), SandboxStatus::Suspended);
             Ok(())
@@ -10611,6 +10946,139 @@ mod adoption_tests {
                 && event.payload["workflow_run_id"] == json!(workflow_run_id)
                 && event.payload["cleared"] == json!(true)
         }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_and_stop_follow_per_pr_leases() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:retention-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some("sbx-kept"))
+            .await
+            .expect("assign sandbox");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Suspended, Vec::new()));
+        let runtime =
+            runtime_with(&store, backend.clone()).with_sandbox_keepalive(KeepaliveConfig {
+                max_extension: Duration::from_secs(7 * 86_400),
+            });
+        let until = SystemTime::now() + Duration::from_secs(86_400);
+
+        let receipt = runtime
+            .session_keepalive(SessionKeepaliveRequest {
+                thread_key: thread_key.clone(),
+                key: "github:o/r:1".to_owned(),
+                generation: "g1".to_owned(),
+                until: Some(until),
+            })
+            .await
+            .expect("keepalive");
+        assert!(receipt.applied && receipt.projected && receipt.active_leases == 1);
+        assert_eq!(receipt.sandbox_id.as_deref(), Some("sbx-kept"));
+        let (id, annotations) = backend.annotations().pop().expect("projected");
+        assert_eq!(id, "sbx-kept");
+        assert!(annotations[KEEP_UNTIL_ANNOTATION].is_some());
+        assert!(annotations[KEEP_HARD_DEADLINE_ANNOTATION].is_some());
+
+        // A second PR from the same session: the sandbox stays until both close.
+        runtime
+            .session_keepalive(SessionKeepaliveRequest {
+                thread_key: thread_key.clone(),
+                key: "github:o/r:2".to_owned(),
+                generation: "g2".to_owned(),
+                until: Some(until),
+            })
+            .await
+            .expect("keepalive 2");
+        let receipt = runtime
+            .stop_session_sandbox(StopSessionSandboxRequest {
+                thread_key: thread_key.clone(),
+                key: "github:o/r:1".to_owned(),
+                generation: "g1".to_owned(),
+                idempotency_key: "close-1".to_owned(),
+            })
+            .await
+            .expect("close 1");
+        assert!(
+            !receipt.stopped && receipt.active_leases == 1 && receipt.reason == "leases_remaining"
+        );
+        assert!(backend.stopped().is_empty());
+
+        let receipt = runtime
+            .stop_session_sandbox(StopSessionSandboxRequest {
+                thread_key: thread_key.clone(),
+                key: "github:o/r:2".to_owned(),
+                generation: "g2".to_owned(),
+                idempotency_key: "close-2".to_owned(),
+            })
+            .await
+            .expect("close 2");
+        assert!(receipt.stopped && receipt.active_leases == 0 && receipt.reason == "stopped");
+        assert_eq!(backend.stopped(), vec!["sbx-kept".to_owned()]);
+        assert_eq!(
+            store.get_session(&thread_key).await.unwrap().sandbox_id,
+            None
+        );
+
+        // A retried close is a no-op with the answer it had.
+        let receipt = runtime
+            .stop_session_sandbox(StopSessionSandboxRequest {
+                thread_key: thread_key.clone(),
+                key: "github:o/r:2".to_owned(),
+                generation: "g2".to_owned(),
+                idempotency_key: "close-2".to_owned(),
+            })
+            .await
+            .expect("close 2 again");
+        assert!(!receipt.stopped && receipt.already_stopped && receipt.reason == "already_done");
+        assert_eq!(backend.stopped().len(), 1);
+        let all = events(&store, &thread_key).await;
+        assert!(
+            all.iter()
+                .any(|event| event.event_type == "session.sandbox_keepalive")
+        );
+        assert!(all.iter().any(|event| {
+            event.event_type == "session.sandbox_stopped"
+                && event.payload["reason"] == json!("retention_closed")
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_is_refused_when_disabled() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:retention-off-{}", uuid::Uuid::new_v4())).unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Suspended, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        let error = runtime
+            .session_keepalive(SessionKeepaliveRequest {
+                thread_key,
+                key: "k".to_owned(),
+                generation: "g".to_owned(),
+                until: Some(SystemTime::now() + Duration::from_secs(60)),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SessionRuntimeError::BadRequest(_)),
+            "{error}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

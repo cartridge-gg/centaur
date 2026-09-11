@@ -32,7 +32,8 @@ use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
-    PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionSandboxCleanupConfig,
+    KeepaliveConfig, PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode,
+    SessionSandboxCleanupConfig,
 };
 use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
@@ -93,6 +94,10 @@ impl Args {
 
     pub(crate) fn sandbox_reaper_config(&self) -> SandboxReaperConfig {
         self.sandbox.sandbox_reaper_config()
+    }
+
+    pub(crate) fn sandbox_keepalive_config(&self) -> Result<Option<KeepaliveConfig>, ServerError> {
+        self.sandbox.sandbox_keepalive_config()
     }
 
     pub(crate) fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
@@ -648,6 +653,25 @@ struct SandboxArgs {
         default_value_t = 259_200
     )]
     sandbox_max_lifetime_secs: u64,
+    /// Let a session keep its sandbox past the max lifetime while it owns
+    /// open work (workflow RPCs `ctx.session_keepalive` /
+    /// `ctx.stop_session_sandbox`). Needs the max-lifetime sweep: retention is
+    /// an extension of it, not a replacement.
+    #[arg(
+        long = "session-sandbox-keepalive-enabled",
+        env = "SESSION_SANDBOX_KEEPALIVE_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    sandbox_keepalive_enabled: bool,
+    /// The most a session's retention may extend its sandbox, measured from
+    /// its first lease; the reaper applies the same cap past the max lifetime.
+    #[arg(
+        long = "session-sandbox-keepalive-max-secs",
+        env = "SESSION_SANDBOX_KEEPALIVE_MAX_SECS",
+        default_value_t = 604_800
+    )]
+    sandbox_keepalive_max_secs: u64,
     #[arg(
         long = "session-sandbox-reap-interval-secs",
         env = "SESSION_SANDBOX_REAP_INTERVAL_SECS",
@@ -1478,7 +1502,34 @@ impl SandboxArgs {
         SandboxReaperConfig {
             interval: Duration::from_secs(self.sandbox_reap_interval_secs),
             max_lifetime: ttl(self.sandbox_max_lifetime_secs),
+            keepalive_max: self
+                .sandbox_keepalive_enabled
+                .then(|| ttl(self.sandbox_keepalive_max_secs))
+                .flatten(),
         }
+    }
+
+    /// Session sandbox retention, when enabled. Refused without the
+    /// max-lifetime sweep, which would make every lease an unenforced promise.
+    fn sandbox_keepalive_config(&self) -> Result<Option<KeepaliveConfig>, ServerError> {
+        if !self.sandbox_keepalive_enabled {
+            return Ok(None);
+        }
+        if self.sandbox_max_lifetime_secs == 0 {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_KEEPALIVE_ENABLED needs a max-lifetime sweep: set \
+                 SESSION_SANDBOX_MAX_LIFETIME_SECS above 0"
+                    .to_owned(),
+            ));
+        }
+        if self.sandbox_keepalive_max_secs == 0 {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_KEEPALIVE_MAX_SECS must be above 0".to_owned(),
+            ));
+        }
+        Ok(Some(KeepaliveConfig {
+            max_extension: Duration::from_secs(self.sandbox_keepalive_max_secs),
+        }))
     }
 
     fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
@@ -2549,6 +2600,55 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|(name, _)| name == CODEX_THREAD_PERSIST_ENV)
+        );
+    }
+
+    #[test]
+    fn keepalive_is_off_by_default_and_needs_the_max_lifetime_sweep() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+        assert!(args.sandbox.sandbox_keepalive_config().unwrap().is_none());
+        assert_eq!(args.sandbox.sandbox_reaper_config().keepalive_max, None);
+
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-keepalive-enabled",
+            "true",
+            "--session-sandbox-keepalive-max-secs",
+            "86400",
+        ])
+        .unwrap();
+        let config = args.sandbox.sandbox_keepalive_config().unwrap().unwrap();
+        assert_eq!(config.max_extension, Duration::from_secs(86_400));
+        assert_eq!(
+            args.sandbox.sandbox_reaper_config().keepalive_max,
+            Some(Duration::from_secs(86_400))
+        );
+
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-keepalive-enabled",
+            "true",
+            "--session-sandbox-max-lifetime-secs",
+            "0",
+        ])
+        .unwrap();
+        let error = args
+            .sandbox
+            .sandbox_keepalive_config()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("SESSION_SANDBOX_MAX_LIFETIME_SECS"),
+            "{error}"
         );
     }
 
