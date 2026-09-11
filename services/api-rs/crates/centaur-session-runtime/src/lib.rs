@@ -1485,6 +1485,66 @@ impl SessionRuntime {
         self
     }
 
+    /// Stop every ready warm sandbox and mark its row failed. For a runtime
+    /// that runs without a warm pool (the operator turned it off, or the
+    /// persistent state volume forces it off) this is the only path that
+    /// retires inventory left over from before: a `ready` row keeps its
+    /// sandbox referenced, so the orphan cleanup would never reap the pod,
+    /// and with no `WarmPoolManager` nothing else would either. Returns the
+    /// number of sandboxes stopped. Best effort per sandbox.
+    pub async fn retire_warm_pool_inventory(&self) -> Result<usize, SessionRuntimeError> {
+        if self.warm_pool.is_some() {
+            return Ok(0);
+        }
+        const BATCH: i64 = 50;
+        let mut stopped = 0usize;
+        loop {
+            let batch = self
+                .store
+                .reserve_ready_warm_sandboxes_for_eviction(BATCH)
+                .await?;
+            if batch.is_empty() {
+                break;
+            }
+            for sandbox_id in batch {
+                let id = SandboxId::new(sandbox_id.as_str());
+                self.sandbox_pipes.remove(&sandbox_id);
+                let outcome = match self.sandbox_runtime.manager.stop(&id).await {
+                    Ok(()) | Err(SandboxError::NotFound(_)) => {
+                        stopped += 1;
+                        "retired: warm pool disabled".to_owned()
+                    }
+                    Err(error) => {
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "warm_pool_retire_failed",
+                            sandbox_id,
+                            %error,
+                            "failed to stop warm sandbox while retiring the pool"
+                        );
+                        format!("retire failed: {error}")
+                    }
+                };
+                if let Err(error) = self
+                    .store
+                    .mark_warm_sandbox_failed(sandbox_id.as_str(), &outcome)
+                    .await
+                {
+                    warn!(sandbox_id, %error, "failed to record retired warm sandbox");
+                }
+            }
+        }
+        if stopped > 0 {
+            info!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "warm_pool_retired",
+                stopped,
+                "retired warm sandbox inventory: the warm pool is disabled"
+            );
+        }
+        Ok(stopped)
+    }
+
     pub fn with_sandbox_capacity(mut self, config: SandboxCapacityConfig) -> Self {
         if !config.is_enabled() {
             return self;
@@ -10551,6 +10611,46 @@ mod adoption_tests {
                 && event.payload["workflow_run_id"] == json!(workflow_run_id)
                 && event.payload["cleared"] == json!(true)
         }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retiring_warm_inventory_stops_ready_sandboxes_and_fails_their_rows() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let ready = format!("sbx-warm-{}", uuid::Uuid::new_v4());
+        store
+            .insert_ready_warm_sandbox(&ready, "test-workload")
+            .await
+            .expect("insert warm sandbox");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        assert!(runtime.warm_pool.is_none());
+
+        let stopped = runtime
+            .retire_warm_pool_inventory()
+            .await
+            .expect("retire warm inventory");
+
+        assert!(stopped >= 1);
+        assert!(backend.stopped().contains(&ready));
+        assert!(
+            !store
+                .list_ready_warm_sandbox_ids()
+                .await
+                .expect("list ready")
+                .contains(&ready)
+        );
+        assert!(
+            !store
+                .list_referenced_sandbox_ids()
+                .await
+                .expect("list referenced")
+                .contains(&ready)
+        );
+        // Idempotent: nothing left to retire.
+        assert_eq!(runtime.retire_warm_pool_inventory().await.unwrap(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -460,6 +460,11 @@ apiRs:
   sandboxWorkload: codex-app-server
   sandboxReadyTimeoutSecs: 90
   sandboxWarmPoolSize: 3
+  # Continue a session's Codex thread when its sandbox is resumed after an
+  # idle pause: the harness persists its thread id on the state volume and
+  # calls thread/resume on the next start (fresh thread when the rollout is
+  # gone). Needs sandbox.stateVolume.enabled; api-rs refuses to start otherwise.
+  sandboxResumeThreadEnabled: false
   sandboxWarmPoolReplenishIntervalSecs: 5
   # Capacity manager: when nonzero, api-rs keeps observed running-like
   # sandboxes at or below this limit by discarding ready warm sandboxes first,
