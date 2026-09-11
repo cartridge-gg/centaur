@@ -8,8 +8,8 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nanocodex::{
-    AgentEvent, AgentEvents, Nanocodex, OpenAiAuth, Prompt, Thinking, Tools, Turn, UserInput,
-    load_chatgpt_auth,
+    AgentEvent, AgentEvents, Nanocodex, OpenAiAuth, Prompt, Responses, ResponsesHistory,
+    ResponsesTransport, Thinking, Tools, Turn, UserInput, load_chatgpt_auth,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -36,6 +36,7 @@ async fn run() -> Result<()> {
     let session_id = format!("nanocodex-{}", Uuid::new_v4().simple());
     let child_agents = Arc::new(ChildAgents::default());
     let default_thinking = configured_default_thinking();
+    let responses = configured_responses()?;
 
     let (sender, mut receiver) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -71,6 +72,7 @@ async fn run() -> Result<()> {
                         &child_agents,
                         subagents,
                         default_thinking,
+                        &responses,
                     )?;
                     agent = Some(new_agent);
                     events = Some(new_events);
@@ -145,11 +147,13 @@ fn build_agent(
     child_agents: &Arc<ChildAgents>,
     subagents: bool,
     thinking: Thinking,
+    responses: &Responses,
 ) -> Result<(Nanocodex, AgentEvents)> {
     let builder = Nanocodex::builder(auth.clone())
         .thinking(thinking)
         .workspace(cwd)
-        .session_id(session_id);
+        .session_id(session_id)
+        .responses(responses.clone());
     let result = if subagents {
         let tools_agents = Arc::downgrade(child_agents);
         let tools = Tools::default();
@@ -341,6 +345,64 @@ fn parse_blocks_line(line: &str, staged: &mut HashMap<String, PathBuf>) -> Resul
             message: format!("unsupported blocks input type `{kind}`"),
         }),
     }
+}
+
+/// Builds the Nanocodex Responses transport configuration from the
+/// upstream-compatible environment variables, allowing the Centaur adapter to
+/// route over HTTPS to a custom Responses base while keeping the SDK defaults
+/// whenever a variable is unset. Invalid values fail clearly.
+fn configured_responses() -> Result<Responses> {
+    responses_from_env(|name| env::var(name).ok())
+}
+
+/// Pure builder for [`configured_responses`]; the closure resolves each
+/// environment variable so tests can exercise it without mutating process env.
+fn responses_from_env(get: impl Fn(&str) -> Option<String>) -> Result<Responses> {
+    let mut builder = Responses::builder();
+
+    if let Some(value) = nonempty(get("NANOCODEX_RESPONSES_TRANSPORT")) {
+        let transport: ResponsesTransport = value
+            .trim()
+            .parse()
+            .map_err(|message| responses_config_error("NANOCODEX_RESPONSES_TRANSPORT", message))?;
+        builder = builder.transport(transport);
+    }
+    if let Some(value) = nonempty(get("NANOCODEX_RESPONSES_HISTORY")) {
+        let history: ResponsesHistory = value
+            .trim()
+            .parse()
+            .map_err(|message| responses_config_error("NANOCODEX_RESPONSES_HISTORY", message))?;
+        builder = builder.history(history);
+    }
+    if let Some(value) = nonempty(get("NANOCODEX_STORE_RESPONSES")) {
+        let store = parse_store(value.trim())
+            .map_err(|message| responses_config_error("NANOCODEX_STORE_RESPONSES", message))?;
+        builder = builder.store(store);
+    }
+    if let Some(url) = nonempty(get("OPENAI_RESPONSES_WEBSOCKET_URL")) {
+        builder = builder.websocket_url(url);
+    }
+    if let Some(url) = nonempty(get("OPENAI_API_BASE_URL")) {
+        builder = builder.api_base_url(url);
+    }
+
+    Ok(builder.build())
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn parse_store(value: &str) -> std::result::Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(format!("expected a boolean, got {other:?}")),
+    }
+}
+
+fn responses_config_error(name: &str, message: String) -> HarnessServerError {
+    HarnessServerError::Nanocodex(format!("invalid {name}: {message}"))
 }
 
 fn configured_default_thinking() -> Thinking {
@@ -702,5 +764,95 @@ mod tests {
                 name: "OPENAI_API_KEY"
             }
         ));
+    }
+
+    fn env_lookup(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn responses_config_preserves_defaults_when_unset() {
+        assert!(responses_from_env(|_| None).is_ok());
+    }
+
+    #[test]
+    fn responses_config_accepts_full_https_base_set() {
+        // The coherent transport/history/store set that routes Nanocodex over
+        // HTTPS to a custom Responses base.
+        let get = env_lookup(&[
+            ("NANOCODEX_RESPONSES_TRANSPORT", "https"),
+            ("NANOCODEX_RESPONSES_HISTORY", "full-replay"),
+            ("NANOCODEX_STORE_RESPONSES", "false"),
+            ("OPENAI_API_BASE_URL", "https://responses.example/v1"),
+            (
+                "OPENAI_RESPONSES_WEBSOCKET_URL",
+                "wss://responses.example/ws",
+            ),
+        ]);
+
+        assert!(responses_from_env(get).is_ok());
+    }
+
+    #[test]
+    fn responses_config_rejects_unknown_transport() {
+        let get = env_lookup(&[("NANOCODEX_RESPONSES_TRANSPORT", "carrier-pigeon")]);
+
+        let Err(error) = responses_from_env(get) else {
+            panic!("expected a configuration error");
+        };
+
+        assert!(matches!(error, HarnessServerError::Nanocodex(message)
+                if message.contains("NANOCODEX_RESPONSES_TRANSPORT")
+                    && message.contains("carrier-pigeon")));
+    }
+
+    #[test]
+    fn responses_config_rejects_unknown_history() {
+        let get = env_lookup(&[("NANOCODEX_RESPONSES_HISTORY", "sometimes")]);
+
+        let Err(error) = responses_from_env(get) else {
+            panic!("expected a configuration error");
+        };
+
+        assert!(matches!(error, HarnessServerError::Nanocodex(message)
+                if message.contains("NANOCODEX_RESPONSES_HISTORY")));
+    }
+
+    #[test]
+    fn responses_config_rejects_non_boolean_store() {
+        let get = env_lookup(&[("NANOCODEX_STORE_RESPONSES", "maybe")]);
+
+        let Err(error) = responses_from_env(get) else {
+            panic!("expected a configuration error");
+        };
+
+        assert!(matches!(error, HarnessServerError::Nanocodex(message)
+                if message.contains("NANOCODEX_STORE_RESPONSES") && message.contains("maybe")));
+    }
+
+    #[test]
+    fn responses_config_ignores_blank_values() {
+        let get = env_lookup(&[
+            ("NANOCODEX_RESPONSES_TRANSPORT", "   "),
+            ("OPENAI_API_BASE_URL", ""),
+        ]);
+
+        assert!(responses_from_env(get).is_ok());
+    }
+
+    #[test]
+    fn store_flag_accepts_common_spellings() {
+        assert_eq!(parse_store("true"), Ok(true));
+        assert_eq!(parse_store("FALSE"), Ok(false));
+        assert_eq!(parse_store("1"), Ok(true));
+        assert_eq!(parse_store("0"), Ok(false));
+        assert!(parse_store("nope").is_err());
     }
 }
