@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
 use std::sync::{
     Arc,
@@ -541,7 +542,8 @@ struct StartedCodexThread {
 /// How to open the Codex thread a turn runs on.
 #[derive(Clone, Copy)]
 enum OpenThread<'a> {
-    /// Start a thread, or resume `CODEX_CONTINUE_THREAD_ID` when set.
+    /// Start a thread, or resume `CODEX_CONTINUE_THREAD_ID` (or the persisted
+    /// thread id, when thread persistence is on) when set.
     New,
     /// Resume a thread on its saved provider.
     Resume(&'a str),
@@ -549,24 +551,84 @@ enum OpenThread<'a> {
     Fork(&'a str),
 }
 
-fn start_or_resume_thread<W: Write>(
-    codex: &mut CodexJsonRpcChild,
-    stdout: &mut W,
-    request_id: &mut i64,
-    model: Option<&str>,
-    model_provider: &str,
-    open: OpenThread<'_>,
-    traceparent: Option<&str>,
-) -> Result<StartedCodexThread> {
-    let cwd = env::current_dir()?.display().to_string();
-    let initial_resume = env::var("CODEX_CONTINUE_THREAD_ID").unwrap_or_default();
-    let open = match open {
-        OpenThread::New if !initial_resume.trim().is_empty() => {
-            OpenThread::Resume(initial_resume.trim())
-        }
-        open => open,
-    };
-    let (method, mut params) = match open {
+/// Sandbox env that turns on thread persistence: the control plane sets it
+/// when sessions have a persistent state volume (CODEX_HOME lives on it).
+pub(crate) const CODEX_THREAD_PERSIST_ENV: &str = "CENTAUR_CODEX_THREAD_PERSIST";
+/// Where the current thread id is kept, relative to CODEX_HOME.
+pub(crate) const PERSISTED_THREAD_FILE: &str = "centaur-thread-id";
+
+/// Where a resume target came from, which decides what a failed
+/// `thread/resume` means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeSource {
+    /// `CODEX_CONTINUE_THREAD_ID` or an in-process resume/fork: an explicit
+    /// instruction; a failure is an error, as before.
+    Explicit,
+    /// The id this harness persisted under CODEX_HOME on an earlier start
+    /// (the pod was recreated on the same state volume). A failure means the
+    /// rollout is gone or incompatible: start fresh and keep the pod.
+    Persisted,
+}
+
+fn thread_persistence_enabled() -> bool {
+    env_flag_enabled(env::var(CODEX_THREAD_PERSIST_ENV).ok().as_deref())
+}
+
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn persisted_thread_path() -> PathBuf {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::util::default_codex_home)
+        .join(PERSISTED_THREAD_FILE)
+}
+
+fn read_persisted_thread_id(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let id = contents.trim();
+    (!id.is_empty() && id.lines().count() == 1).then(|| id.to_owned())
+}
+
+fn write_persisted_thread_id(path: &Path, thread_id: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{thread_id}\n"))
+}
+
+fn clear_persisted_thread_id(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "harness-server: failed to remove stale persisted codex thread id {}: {error}",
+            path.display()
+        );
+    }
+}
+
+/// The thread a new thread request resumes, if any: an explicit env override
+/// wins; otherwise the persisted id when persistence is on.
+fn resume_target(
+    env_id: Option<&str>,
+    persisted_id: Option<&str>,
+) -> Option<(String, ResumeSource)> {
+    if let Some(id) = env_id.map(str::trim).filter(|id| !id.is_empty()) {
+        return Some((id.to_owned(), ResumeSource::Explicit));
+    }
+    persisted_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| (id.to_owned(), ResumeSource::Persisted))
+}
+
+fn thread_params(open: OpenThread<'_>, cwd: &str, model_provider: &str) -> (&'static str, Value) {
+    match open {
         OpenThread::New => (
             "thread/start",
             json!({
@@ -600,7 +662,97 @@ fn start_or_resume_thread<W: Write>(
                 "modelProvider": model_provider,
             }),
         ),
+    }
+}
+
+fn start_or_resume_thread<W: Write>(
+    codex: &mut CodexJsonRpcChild,
+    stdout: &mut W,
+    request_id: &mut i64,
+    model: Option<&str>,
+    model_provider: &str,
+    open: OpenThread<'_>,
+    traceparent: Option<&str>,
+) -> Result<StartedCodexThread> {
+    let cwd = env::current_dir()?.display().to_string();
+    let persisted_path = thread_persistence_enabled().then(persisted_thread_path);
+    // Only a new thread consults the env override and the persisted id; an
+    // in-process resume or fork (the caller recovering or switching its own
+    // thread) is explicit.
+    let target = match open {
+        OpenThread::New => resume_target(
+            env::var("CODEX_CONTINUE_THREAD_ID").ok().as_deref(),
+            persisted_path
+                .as_deref()
+                .and_then(read_persisted_thread_id)
+                .as_deref(),
+        ),
+        _ => None,
     };
+    let (open, source) = match &target {
+        Some((thread_id, source)) => (OpenThread::Resume(thread_id), *source),
+        None => (open, ResumeSource::Explicit),
+    };
+    let started = match open_thread(
+        codex,
+        stdout,
+        request_id,
+        &cwd,
+        model,
+        model_provider,
+        open,
+        traceparent,
+    ) {
+        Ok(started) => started,
+        Err(error) if source == ResumeSource::Persisted => {
+            // The rollout for the persisted id is gone or unreadable (a
+            // harness upgrade, a wiped CODEX_HOME, a corrupt file). Start a
+            // fresh thread on this pod rather than failing the turn: the
+            // working copies on the state volume are still worth more than a
+            // replacement sandbox.
+            eprintln!(
+                "harness-server: could not resume persisted codex thread; \
+                 starting a new thread: {error}"
+            );
+            if let Some(path) = persisted_path.as_deref() {
+                clear_persisted_thread_id(path);
+            }
+            open_thread(
+                codex,
+                stdout,
+                request_id,
+                &cwd,
+                model,
+                model_provider,
+                OpenThread::New,
+                traceparent,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(path) = persisted_path.as_deref()
+        && let Err(error) = write_persisted_thread_id(path, &started.id)
+    {
+        eprintln!(
+            "harness-server: failed to persist codex thread id to {}: {error}",
+            path.display()
+        );
+    }
+    Ok(started)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_thread<W: Write>(
+    codex: &mut CodexJsonRpcChild,
+    stdout: &mut W,
+    request_id: &mut i64,
+    cwd: &str,
+    model: Option<&str>,
+    model_provider: &str,
+    open: OpenThread<'_>,
+    traceparent: Option<&str>,
+) -> Result<StartedCodexThread> {
+    let (method, mut params) = thread_params(open, cwd, model_provider);
     // Start the thread on the model its first turn runs. Without this, the
     // thread starts on config.toml's `model` and switches on its first turn,
     // and the Responses backend intermittently refuses that first request
@@ -1237,6 +1389,73 @@ fn notification_matches_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_thread_file(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "harness-server-thread-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("codex").join(PERSISTED_THREAD_FILE)
+    }
+
+    #[test]
+    fn resume_target_prefers_the_env_override_then_the_persisted_id() {
+        assert_eq!(
+            resume_target(Some(" thr_env "), Some("thr_file")),
+            Some(("thr_env".to_owned(), ResumeSource::Explicit))
+        );
+        assert_eq!(
+            resume_target(Some("  "), Some("thr_file")),
+            Some(("thr_file".to_owned(), ResumeSource::Persisted))
+        );
+        assert_eq!(
+            resume_target(None, Some("thr_file")),
+            Some(("thr_file".to_owned(), ResumeSource::Persisted))
+        );
+        assert_eq!(resume_target(None, None), None);
+        assert_eq!(resume_target(None, Some("")), None);
+    }
+
+    #[test]
+    fn persisted_thread_id_round_trips_and_clears() {
+        let path = temp_thread_file("round-trip");
+        assert_eq!(read_persisted_thread_id(&path), None);
+        write_persisted_thread_id(&path, "thr_123").unwrap();
+        assert_eq!(read_persisted_thread_id(&path).as_deref(), Some("thr_123"));
+        // A stale multi-line or empty file is not a thread id.
+        std::fs::write(&path, "thr_1\nthr_2\n").unwrap();
+        assert_eq!(read_persisted_thread_id(&path), None);
+        std::fs::write(&path, "\n").unwrap();
+        assert_eq!(read_persisted_thread_id(&path), None);
+        clear_persisted_thread_id(&path);
+        assert!(!path.exists());
+        clear_persisted_thread_id(&path); // idempotent
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn thread_persistence_flag_parsing() {
+        assert!(env_flag_enabled(Some("1")));
+        assert!(env_flag_enabled(Some(" True ")));
+        assert!(env_flag_enabled(Some("on")));
+        assert!(!env_flag_enabled(Some("0")));
+        assert!(!env_flag_enabled(Some("")));
+        assert!(!env_flag_enabled(None));
+    }
+
+    #[test]
+    fn resume_params_carry_the_thread_and_keep_turns() {
+        let (method, params) = thread_params(OpenThread::Resume("thr_1"), "/work", "openai");
+        assert_eq!(method, "thread/resume");
+        assert_eq!(params["threadId"], "thr_1");
+        assert_eq!(params["excludeTurns"], false);
+        assert_eq!(params["cwd"], "/work");
+        let (method, params) = thread_params(OpenThread::New, "/work", "openai");
+        assert_eq!(method, "thread/start");
+        assert!(params.get("threadId").is_none());
+        assert_eq!(params["modelProvider"], "openai");
+    }
 
     // A non-empty explicit provider override (the `--bedrock` blocks `provider`
     // field) short-circuits before any env/model heuristic, so these assertions

@@ -891,6 +891,7 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "hex",
+ "jiff",
  "reqwest",
  "serde",
  "serde_json",
