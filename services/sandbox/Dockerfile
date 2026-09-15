@@ -146,6 +146,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       echo "Skipping browser install: Chrome for Testing does not publish Linux ARM64 builds"; \
     fi
 
+# Install WebKit's OS dependencies at build time so non-root sessions can run
+# project-local Playwright browsers without needing sudo or an apt update.
+ARG PLAYWRIGHT_VERSION=1.62.1
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    npm exec --yes --package="playwright@${PLAYWRIGHT_VERSION}" -- \
+      playwright install-deps webkit
+
 USER agent
 WORKDIR /home/agent
 
