@@ -5576,8 +5576,22 @@ async fn run_stdout_pump(
             let execution_id = active_execution
                 .as_ref()
                 .map(|execution| execution.execution_id.as_str());
-            let Some(output_execution_id) = output_state.execution_for_line(execution_id, &line)
+            let active_started_at = active_execution
+                .as_ref()
+                .map(|execution| execution.started_at.unwrap_or(execution.created_at));
+            let Some(output_execution_id) =
+                output_state.execution_for_line_since(execution_id, active_started_at, &line)
             else {
+                if let Some(execution_id) = execution_id {
+                    debug!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_stdout_line_dropped",
+                        thread_key = %thread_key,
+                        execution_id,
+                        sandbox_id,
+                        "output line does not belong to the active execution; dropped"
+                    );
+                }
                 continue;
             };
             let first_token_execution = active_execution
@@ -5824,18 +5838,52 @@ struct StdoutPumpState {
     first_token_recorded_by_execution: HashSet<String>,
     turn_execution_by_id: HashMap<String, String>,
     item_execution_by_id: HashMap<String, String>,
+    /// Turn and item ids of executions this pump already finished. Codex can
+    /// deliver a finished turn's `turn/completed` (or its trailing items)
+    /// after the execution that owned it was recorded and forgotten; those
+    /// lines must never be adopted by the next execution on the same sandbox
+    /// (2026-09-14: a stale failed `turn/completed` failed the next message
+    /// with "turn completed with status failed before final answer" without
+    /// calling the model).
+    retired_turn_ids: HashSet<String>,
+    retired_item_ids: HashSet<String>,
     stdout_span_by_execution: HashMap<String, Span>,
 }
 
+/// Clock skew allowed between the sandbox's turn timestamps and the control
+/// plane's execution start time before a turn counts as predating the
+/// execution.
+const STALE_TURN_TOLERANCE_SECS: i64 = 5;
+/// Retired id sets are cleared once they grow past this many entries; a
+/// stale line only ever trails its execution by one or two turns.
+const MAX_RETIRED_OUTPUT_IDS: usize = 4096;
+
 impl StdoutPumpState {
+    #[cfg(test)]
     fn execution_for_line(
         &mut self,
         active_execution_id: Option<&str>,
         line: &str,
     ) -> Option<String> {
+        self.execution_for_line_since(active_execution_id, None, line)
+    }
+
+    /// Attribute an output line to an execution, or `None` when the line
+    /// must be dropped. `active_started_at` is when the active execution
+    /// started; a line whose turn started before that cannot belong to it.
+    fn execution_for_line_since(
+        &mut self,
+        active_execution_id: Option<&str>,
+        active_started_at: Option<time::OffsetDateTime>,
+        line: &str,
+    ) -> Option<String> {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return active_execution_id.map(ToOwned::to_owned);
         };
+
+        if self.is_retired_output(&value) {
+            return None;
+        }
 
         if let Some(known_execution_id) = self.known_execution_for_value(&value) {
             if active_execution_id == Some(known_execution_id.as_str()) {
@@ -5857,8 +5905,22 @@ impl StdoutPumpState {
         }
 
         let active_execution_id = active_execution_id?;
+        if let Some(started_at) = active_started_at
+            && turn_output_predates(&value, started_at)
+        {
+            return None;
+        }
         self.remember_value_execution(&value, active_execution_id);
         Some(active_execution_id.to_owned())
+    }
+
+    fn is_retired_output(&self, value: &Value) -> bool {
+        turn_ids(value)
+            .iter()
+            .any(|turn_id| self.retired_turn_ids.contains(turn_id))
+            || item_ids(value)
+                .iter()
+                .any(|item_id| self.retired_item_ids.contains(item_id))
     }
 
     fn observe(&mut self, execution_id: &str, line: &str) -> Option<TerminalOutput> {
@@ -5917,10 +5979,28 @@ impl StdoutPumpState {
     fn forget(&mut self, execution_id: &str) {
         self.final_answer_text_by_execution.remove(execution_id);
         self.first_token_recorded_by_execution.remove(execution_id);
+        if self.retired_turn_ids.len() + self.retired_item_ids.len() > MAX_RETIRED_OUTPUT_IDS {
+            self.retired_turn_ids.clear();
+            self.retired_item_ids.clear();
+        }
+        let retired_turn_ids = &mut self.retired_turn_ids;
         self.turn_execution_by_id
-            .retain(|_, mapped_execution_id| mapped_execution_id != execution_id);
+            .retain(|turn_id, mapped_execution_id| {
+                if mapped_execution_id == execution_id {
+                    retired_turn_ids.insert(turn_id.clone());
+                    return false;
+                }
+                true
+            });
+        let retired_item_ids = &mut self.retired_item_ids;
         self.item_execution_by_id
-            .retain(|_, mapped_execution_id| mapped_execution_id != execution_id);
+            .retain(|item_id, mapped_execution_id| {
+                if mapped_execution_id == execution_id {
+                    retired_item_ids.insert(item_id.clone());
+                    return false;
+                }
+                true
+            });
         self.stdout_span_by_execution.remove(execution_id);
     }
 
@@ -6996,6 +7076,32 @@ fn turn_ids(value: &Value) -> Vec<String> {
     .into_iter()
     .filter_map(|path| string_at_path(value, path))
     .collect()
+}
+
+/// Unix seconds at which the turn carried by a Codex app-server line started.
+fn turn_started_at_unix(value: &Value) -> Option<i64> {
+    [
+        &["turn", "startedAt"][..],
+        &["params", "turn", "startedAt"][..],
+    ]
+    .into_iter()
+    .find_map(|path| {
+        let mut current = value;
+        for key in path {
+            current = current.get(*key)?;
+        }
+        current
+            .as_i64()
+            .or_else(|| current.as_f64().map(|seconds| seconds as i64))
+    })
+}
+
+/// True when the line's turn started before `execution_started_at` (minus
+/// clock-skew tolerance), so it belongs to an earlier execution.
+fn turn_output_predates(value: &Value, execution_started_at: time::OffsetDateTime) -> bool {
+    turn_started_at_unix(value).is_some_and(|turn_started_at| {
+        turn_started_at + STALE_TURN_TOLERANCE_SECS < execution_started_at.unix_timestamp()
+    })
 }
 
 fn item_ids(value: &Value) -> Vec<String> {
@@ -8968,6 +9074,69 @@ mod tests {
         );
         assert_eq!(state.execution_for_line(None, delta), None);
         assert_eq!(state.execution_for_line(Some("exe-new"), delta), None);
+    }
+
+    #[test]
+    fn stdout_state_drops_turn_completed_from_forgotten_execution() {
+        // 2026-09-14: Codex delivered the previous turn's failed
+        // `turn/completed` after that execution was recorded as failed and
+        // forgotten. The next execution must not adopt it as its own terminal.
+        let mut state = StdoutPumpState::default();
+        let started = r#"{"method":"turn/started","params":{"threadId":"thr","turn":{"id":"turn-old","startedAt":1789417486,"status":"inProgress"}}}"#;
+        let item = r#"{"method":"item/completed","params":{"threadId":"thr","turnId":"turn-old","item":{"id":"item-old","type":"agentMessage","text":"late"}}}"#;
+        let completed = r#"{"method":"turn/completed","params":{"threadId":"thr","turn":{"id":"turn-old","startedAt":1789417486,"completedAt":1789417510,"status":"failed","error":{"message":"unexpected status 502 Bad Gateway"}}}}"#;
+        let next_started = r#"{"method":"turn/started","params":{"threadId":"thr","turn":{"id":"turn-new","startedAt":1789418545,"status":"inProgress"}}}"#;
+
+        assert_eq!(
+            state.execution_for_line(Some("exe-old"), started),
+            Some("exe-old".to_owned())
+        );
+        assert_eq!(
+            state.execution_for_line(Some("exe-old"), item),
+            Some("exe-old".to_owned())
+        );
+        state.forget("exe-old");
+
+        assert_eq!(state.execution_for_line(Some("exe-new"), completed), None);
+        assert_eq!(state.execution_for_line(Some("exe-new"), item), None);
+        assert_eq!(
+            state.execution_for_line(Some("exe-new"), next_started),
+            Some("exe-new".to_owned())
+        );
+    }
+
+    #[test]
+    fn stdout_state_drops_turn_output_that_predates_active_execution() {
+        // A turn that started while no execution was active (or before this
+        // pump state existed) is unknown to the state; its `startedAt` still
+        // proves it cannot belong to an execution that started later.
+        let mut state = StdoutPumpState::default();
+        let execution_started_at = OffsetDateTime::from_unix_timestamp(1789418545).unwrap();
+        let stale = r#"{"method":"turn/completed","params":{"threadId":"thr","turn":{"id":"turn-stale","startedAt":1789417486,"completedAt":1789417510,"status":"failed"}}}"#;
+        let skewed = r#"{"method":"turn/started","params":{"threadId":"thr","turn":{"id":"turn-skewed","startedAt":1789418542,"status":"inProgress"}}}"#;
+        let current = r#"{"method":"turn/completed","params":{"threadId":"thr","turn":{"id":"turn-current","startedAt":1789418546,"completedAt":1789418570,"status":"completed"}}}"#;
+        let untimed = r#"{"type":"turn.completed","turn":{"id":"turn-untimed","status":"completed"},"usage":null}"#;
+
+        assert_eq!(
+            state.execution_for_line_since(Some("exe-new"), Some(execution_started_at), stale),
+            None
+        );
+        assert_eq!(
+            state.execution_for_line_since(Some("exe-new"), Some(execution_started_at), skewed),
+            Some("exe-new".to_owned())
+        );
+        assert_eq!(
+            state.execution_for_line_since(Some("exe-new"), Some(execution_started_at), current),
+            Some("exe-new".to_owned())
+        );
+        assert_eq!(
+            state.execution_for_line_since(Some("exe-new"), Some(execution_started_at), untimed),
+            Some("exe-new".to_owned())
+        );
+        assert_eq!(
+            state.execution_for_line(Some("exe-new"), stale),
+            Some("exe-new".to_owned())
+        );
     }
 
     #[test]

@@ -24,12 +24,12 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "sync", "time"] }
 tokio-util = { workspace = true, features = ["codec"] }
+time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 sqlx.workspace = true
-time.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
 uuid.workspace = true
 
