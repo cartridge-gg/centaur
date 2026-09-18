@@ -253,6 +253,10 @@ secrets:
 
 overlay:
   mountPath: /app/overlay/org
+  # owner/repo slug of the org overlay repo for repo-cache delivery. When set,
+  # api-rs points sandbox CENTAUR_OVERLAY_DIR at /home/agent/github/<repo>.
+  # Also add this repo to repoCache.repositories. Leave empty for overlay-image.
+  repo: ""
   systemPrompt: ""
 
 # Ordered repo-cache-backed overlays. Each source repo is synced by repo-cache;
