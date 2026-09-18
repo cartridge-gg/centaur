@@ -40,7 +40,8 @@ inside a Centaur sandbox:
 | `HERMES_PYTHON` | Interpreter whose environment has `hermes-agent` installed. The sandbox image sets this to the baked-in `/opt/hermes/bin/python3`. |
 | `HERMES_BIN` | The `hermes` CLI used for cron ticks (default: `hermes` on PATH). |
 | `HERMES_HOME` | Hermes state root (config, sessions, memories, skills, cron). Mount a per-team volume here to persist learning across sandboxes. |
-| `HERMES_CONTINUE_SESSION_ID` | Resume a specific Hermes session id after a sandbox restart. |
+| `HERMES_CONTINUE_SESSION_ID` | Explicit durable Hermes session key to resume; takes precedence over the saved key. A failed resume is an error, never a new conversation. |
+| `CENTAUR_HERMES_SESSION_FILE` | Optional file for automatically saving and loading the durable conversation key. Use a persistent path unique to this Centaur session, alongside its persistent `HERMES_HOME`. |
 | `HERMES_CRON_TICK_SECONDS` | Cron tick interval; `0` disables the ticker. |
 | `HERMES_APPROVAL_MODE` | Defaults to `off` inside the sandbox — Centaur owns the safety boundary (isolated sandbox + iron-proxy egress). |
 
@@ -59,11 +60,33 @@ enough for turns, but not for scheduled jobs.
 
 ## Persistence model
 
+The gateway's short `session_id` is a transient handle. Centaur reports and
+persists the durable `stored_session_id`/`session_key` instead. Configure
+`CENTAUR_HERMES_SESSION_FILE` on the session's persistent volume to recover
+automatically after a gateway or harness restart. Draft sessions are not saved
+until the first submitted turn; compaction updates the saved key. Keep this file
+unique to the Centaur session, even when sharing other Hermes state. Missing
+or corrupt durable history fails explicitly instead of silently starting over.
+
 Everything Hermes learns lives under `HERMES_HOME`. With the default
 throwaway sandbox, memory and skills last only as long as the sandbox; to
 get compounding, cross-thread learning, mount a persistent volume at
 `HERMES_HOME` (per team or per deployment, matching your permission
 boundaries — a shared volume means shared memory).
+
+## Images and interruption
+
+Uploaded local images and inline image data are attached through Hermes's image
+RPCs before submitting the prompt. Hermes then uses its configured native vision
+or image-description pipeline. Remote image URLs must be staged by the caller.
+A failed attachment batch discards the gateway to avoid leaking images into the
+next turn.
+
+Interrupts preserve gateway events received before the RPC acknowledgement and
+drain the parent turn's completion. If the gateway does not settle within 30
+seconds, it is stopped so a late completion cannot end the next turn. Hermes
+deliberately preserves background terminal jobs on interruption; run delegated
+workers in the foreground if they must stop with the user turn.
 
 ## Credentials
 
