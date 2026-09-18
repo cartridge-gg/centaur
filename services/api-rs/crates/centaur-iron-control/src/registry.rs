@@ -1075,7 +1075,7 @@ transforms:
         )
         .unwrap();
         let inputs =
-            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+            secret_inputs_from_fragment("infra", &fragment, &env_policy()).unwrap();
         let SecretInput::Static(input) = &inputs[0] else {
             panic!("expected a static secret");
         };
