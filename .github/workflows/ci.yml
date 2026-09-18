@@ -241,6 +241,7 @@ jobs:
             iron_control_development
           pushd ../console
           bin/rails db:schema:load
+          bin/rails db:migrate
           bin/rails runner 'Iron::Bootstrap.run!'
           export CENTAUR_API_TOKEN="$(bin/rails runner 'print ApiServer::Jwt.encode_for_console_service')"
           bin/rails server --binding 127.0.0.1 --port 18081 > "$RUNNER_TEMP/iron-control.log" 2>&1 &
