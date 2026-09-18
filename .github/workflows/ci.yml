@@ -119,7 +119,7 @@ jobs:
 
   migration-order:
     name: Migration order
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.migration_order == 'true'
     steps:
@@ -133,7 +133,7 @@ jobs:
 
   harness-server-checks:
     name: Harness server fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.harness_server_checks == 'true'
     steps:
@@ -164,7 +164,7 @@ jobs:
 
   rust-api:
     name: Rust API fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -247,6 +247,7 @@ jobs:
             iron_control_development
           pushd ../console
           bin/rails db:schema:load
+          bin/rails db:migrate
           bin/rails runner 'Iron::Bootstrap.run!'
           export CENTAUR_API_TOKEN="$(bin/rails runner 'print ApiServer::Jwt.encode_for_console_service')"
           bin/rails server --binding 127.0.0.1 --port 18081 > "$RUNNER_TEMP/iron-control.log" 2>&1 &
@@ -374,7 +375,7 @@ jobs:
 
   slackbotv2-tests:
     name: Slackbot v2 tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.slackbotv2_tests == 'true'
     steps:
@@ -432,7 +433,7 @@ jobs:
 
   discordbot-checks:
     name: Discordbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.discordbot_checks == 'true'
     steps:
@@ -466,7 +467,7 @@ jobs:
 
   githubbot-checks:
     name: Githubbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.githubbot_checks == 'true'
     steps:
@@ -500,7 +501,7 @@ jobs:
 
   teamsbot-checks:
     name: Teamsbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.teamsbot_checks == 'true'
     steps:
