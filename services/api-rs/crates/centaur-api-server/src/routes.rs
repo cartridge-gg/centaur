@@ -38,8 +38,8 @@ use centaur_telemetry::{
     record_http_request_finished, record_http_request_started,
 };
 use centaur_workflows::{
-    CreateWorkflowRunRequest, WebhookFilter, WorkflowRuntime, WorkflowWebhookAuth,
-    WorkflowWebhookSpec, WorkflowWebhookTriggerKey,
+    CreateWorkflowRunRequest, RetryWorkflowRunRequest, WebhookFilter, WorkflowRuntime,
+    WorkflowWebhookAuth, WorkflowWebhookSpec, WorkflowWebhookTriggerKey,
 };
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, KeyInit, Mac};
@@ -269,6 +269,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/api/workflows/runs/{run_id}/cancel",
             post(cancel_workflow_run),
+        )
+        .route(
+            "/api/workflows/runs/{run_id}/retry",
+            post(retry_workflow_run),
         )
         .route("/api/workflows/events", post(emit_workflow_event))
         .route(
@@ -552,7 +556,8 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         | (&Method::GET, "/api/workflows/runs")
         | (&Method::GET, "/api/workflows/runs/{run_id}") => capability(Capability::WorkflowsRead),
         (&Method::POST, "/api/workflows/runs")
-        | (&Method::POST, "/api/workflows/runs/{run_id}/cancel") => {
+        | (&Method::POST, "/api/workflows/runs/{run_id}/cancel")
+        | (&Method::POST, "/api/workflows/runs/{run_id}/retry") => {
             capability(Capability::WorkflowsWrite)
         }
         (&Method::POST, "/api/workflows/events") => capability(Capability::WorkflowsEvents),
@@ -2100,6 +2105,7 @@ async fn start_slack_archive_import(
             idempotency_key: Some(format!("slack_archive_import:{}", import.import_id)),
             harness_type: None,
             max_attempts: Some(1),
+            retry_strategy: None,
         })
         .await?;
     let row =
@@ -2148,6 +2154,7 @@ async fn retry_slack_archive_import(
             )),
             harness_type: None,
             max_attempts: Some(1),
+            retry_strategy: None,
         })
         .await?;
     let row =
@@ -2915,6 +2922,20 @@ async fn cancel_workflow_run(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Re-arm a failed run's task with one more attempt on the same checkpoints;
+/// the next attempt resumes at the step that failed. The body is optional
+/// (`{"max_attempts": n}` raises the ceiling beyond attempts + 1).
+async fn retry_workflow_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    body: Option<Json<RetryWorkflowRunRequest>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workflows = workflow_runtime(&state)?;
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let retried = workflows.retry_run(&run_id, request).await?;
+    Ok(Json(serde_json::to_value(retried)?))
+}
+
 async fn emit_workflow_event(
     State(state): State<AppState>,
     Json(request): Json<EmitWorkflowEventRequest>,
@@ -3014,6 +3035,7 @@ async fn invoke_workflow_webhook(
         idempotency_key: Some(trigger_key),
         harness_type: None,
         max_attempts: None,
+        retry_strategy: None,
     };
     let run = workflows.create_run(request).await?;
     let status = if run.created {

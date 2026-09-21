@@ -241,8 +241,17 @@ class WorkflowContext:
         input: dict[str, Any] | None = None,
         *,
         idempotency_key: str | None = None,
+        max_attempts: int | None = None,
+        retry_strategy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Queue a child; use a stable idempotency key to prevent duplicate starts."""
+        """Queue a child; use a stable idempotency key to prevent duplicate starts.
+
+        ``max_attempts`` and ``retry_strategy`` are the engine's retry options
+        for the child (absurd's shape, e.g. ``{"kind": "exponential",
+        "base_seconds": 1800, "factor": 2, "max_seconds": 14400}``). A failed
+        attempt is re-run by the engine after the strategy's delay and resumes
+        at the durable step that failed. Omitted keys keep the engine defaults.
+        """
         request: dict[str, Any] = {
             "type": "ctx.workflow.start",
             "workflow_name": workflow_name,
@@ -250,6 +259,21 @@ class WorkflowContext:
         }
         if idempotency_key:
             request["idempotency_key"] = idempotency_key
+        if max_attempts is not None:
+            request["max_attempts"] = int(max_attempts)
+        if retry_strategy:
+            request["retry_strategy"] = dict(retry_strategy)
+        return await self._rpc.request(request)
+
+    async def retry_workflow(
+        self, run_id: str, *, max_attempts: int | None = None
+    ) -> dict[str, Any]:
+        """Re-arm a failed workflow run's task with one more attempt on the
+        same checkpoints: the next attempt resumes at the step that failed.
+        Only a run whose task is in state ``failed`` can be retried."""
+        request: dict[str, Any] = {"type": "ctx.workflow.retry", "run_id": run_id}
+        if max_attempts is not None:
+            request["max_attempts"] = int(max_attempts)
         return await self._rpc.request(request)
 
     async def slack_buttons(

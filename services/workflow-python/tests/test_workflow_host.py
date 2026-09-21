@@ -86,6 +86,13 @@ class RequestRpc(FakeRpc):
                 "run_id": "run-child",
                 "created": True,
             }
+        if message_type == "ctx.workflow.retry":
+            return {
+                "run_id": "run-retry",
+                "task_id": "task-failed",
+                "attempt": 6,
+                "created": True,
+            }
         if message_type == "ctx.post_to_slack":
             return {"channel": payload["channel"], "ts": "1710000000.000100"}
         if message_type == "ctx.sleep":
@@ -432,6 +439,71 @@ class WorkflowHostTests(unittest.TestCase):
                     "input": {"scope": "slack_thread"},
                     "idempotency_key": "company-context:slack-thread:42",
                 }
+            ],
+        )
+
+    def test_start_workflow_forwards_engine_retry_options(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+        )
+        strategy = {"kind": "exponential", "base_seconds": 1800, "factor": 2, "max_seconds": 14400}
+
+        asyncio.run(
+            ctx.start_workflow(
+                "c7e_dango_feedback_issue",
+                {"submission": {"submission_id": "abc"}},
+                idempotency_key="dango-feedback:abc",
+                max_attempts=8,
+                retry_strategy=strategy,
+            )
+        )
+        # Omitted options are omitted from the request, so an older api-rs
+        # that ignores unknown keys behaves exactly as before.
+        asyncio.run(ctx.start_workflow("c7e_dango_feedback_issue", {}))
+
+        self.assertEqual(
+            rpc.requests,
+            [
+                {
+                    "type": "ctx.workflow.start",
+                    "workflow_name": "c7e_dango_feedback_issue",
+                    "input": {"submission": {"submission_id": "abc"}},
+                    "idempotency_key": "dango-feedback:abc",
+                    "max_attempts": 8,
+                    "retry_strategy": strategy,
+                },
+                {
+                    "type": "ctx.workflow.start",
+                    "workflow_name": "c7e_dango_feedback_issue",
+                    "input": {},
+                },
+            ],
+        )
+
+    def test_retry_workflow_rearms_a_failed_run(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+        )
+
+        result = asyncio.run(ctx.retry_workflow("run-failed"))
+        asyncio.run(ctx.retry_workflow("run-failed", max_attempts=9))
+
+        self.assertEqual(result, {"run_id": "run-retry", "task_id": "task-failed", "attempt": 6, "created": True})
+        self.assertEqual(
+            rpc.requests,
+            [
+                {"type": "ctx.workflow.retry", "run_id": "run-failed"},
+                {"type": "ctx.workflow.retry", "run_id": "run-failed", "max_attempts": 9},
             ],
         )
 

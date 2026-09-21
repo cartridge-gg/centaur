@@ -139,6 +139,7 @@ pub fn verify(
         idempotency_key: Some(invocation.idempotency_key),
         harness_type: None,
         max_attempts: None,
+        retry_strategy: None,
     })
 }
 

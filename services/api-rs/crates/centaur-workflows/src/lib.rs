@@ -10,8 +10,8 @@ use std::{
 
 use absurd::{
     AwaitEventOptions, Client, ClientOptions, CreateQueueOptions, RetryKind, RetryStrategy,
-    SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, TaskResultState,
-    TaskTerminalOutcome, Worker, WorkerOptions,
+    RetryTaskOptions, SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions,
+    TaskResultState, TaskTerminalOutcome, Worker, WorkerOptions,
 };
 use centaur_iron_control::{IronControlClient, IronControlError, PrincipalInput, slugify};
 use centaur_sandbox_core::SandboxSpec;
@@ -361,6 +361,29 @@ pub struct CreateWorkflowRunRequest {
     pub harness_type: Option<HarnessType>,
     #[serde(default)]
     pub max_attempts: Option<i32>,
+    /// How the engine spaces the attempts after a failed one (absurd's
+    /// `retry_strategy`: `{"kind": "exponential", "base_seconds": 1800,
+    /// "factor": 2, "max_seconds": 14400}`). Without it the engine retries
+    /// with no delay, which is useless against an outage.
+    #[serde(default)]
+    pub retry_strategy: Option<RetryStrategy>,
+}
+
+/// `POST /api/workflows/runs/{run_id}/retry` body (every field optional).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RetryWorkflowRunRequest {
+    /// New attempt ceiling; absurd defaults it to the current attempts + 1.
+    #[serde(default)]
+    pub max_attempts: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RetryWorkflowRunResponse {
+    pub ok: bool,
+    pub run_id: String,
+    pub task_id: String,
+    pub attempt: i32,
+    pub created: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -872,6 +895,7 @@ impl WorkflowRuntime {
                 },
                 SpawnOptions {
                     max_attempts: request.max_attempts,
+                    retry_strategy: request.retry_strategy,
                     idempotency_key: request.idempotency_key,
                     ..SpawnOptions::default()
                 },
@@ -1015,6 +1039,24 @@ impl WorkflowRuntime {
         Err(WorkflowRuntimeError::NotFound(run_id.to_owned()))
     }
 
+    /// Re-arm the failed task behind `run_id` with one more attempt on the
+    /// same checkpoints (`absurd.retry_task` without `spawn_new`): the next
+    /// attempt replays every finished durable step and resumes at the one
+    /// that failed. Only a task in state `failed` can be retried.
+    pub async fn retry_run(
+        &self,
+        run_id: &str,
+        request: RetryWorkflowRunRequest,
+    ) -> Result<RetryWorkflowRunResponse, WorkflowRuntimeError> {
+        let queues = [
+            (WORKFLOW_QUEUE, &self.inner.client),
+            (WORKFLOW_SLACK_LIVE_QUEUE, &self.inner.slack_live_client),
+            (WORKFLOW_ETL_QUEUE, &self.inner.etl_client),
+            (WORKFLOW_ETL_BACKFILL_QUEUE, &self.inner.etl_backfill_client),
+        ];
+        retry_workflow_run(run_id, request.max_attempts, queues).await
+    }
+
     pub async fn emit_event(
         &self,
         event_name: &str,
@@ -1109,6 +1151,86 @@ fn queue_name_for_class(class: WorkflowQueueClass) -> &'static str {
         WorkflowQueueClass::Etl => WORKFLOW_ETL_QUEUE,
         WorkflowQueueClass::EtlBackfill => WORKFLOW_ETL_BACKFILL_QUEUE,
     }
+}
+
+/// The task behind a run id in one queue, or None when the queue has no
+/// such run. Every queue shares the one database pool.
+async fn lookup_task_for_run(
+    pool: &sqlx::PgPool,
+    queue_name: &str,
+    run_id: &str,
+) -> Result<Option<String>, WorkflowRuntimeError> {
+    let (task_table, run_table) = absurd_queue_tables(queue_name)?;
+    let row = sqlx::query(&format!(
+        "select t.task_id::text as task_id from {run_table} r \
+         join {task_table} t on t.task_id = r.task_id where r.run_id = $1::uuid",
+    ))
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| row.try_get::<String, _>("task_id"))
+        .transpose()
+        .map_err(WorkflowRuntimeError::from)
+}
+
+/// `absurd.retry_task` raises plain exceptions for the two operator
+/// mistakes; surface them as request errors rather than 500s.
+fn map_retry_task_error(err: absurd::Error, run_id: &str) -> WorkflowRuntimeError {
+    let text = err.to_string();
+    if text.contains("is not currently failed") {
+        return WorkflowRuntimeError::BadRequest(format!(
+            "workflow run {run_id} is not in state failed; only a failed run can be retried"
+        ));
+    }
+    if text.contains("must be greater than current attempts") {
+        return WorkflowRuntimeError::BadRequest(text);
+    }
+    if text.contains("not found in queue") {
+        return WorkflowRuntimeError::NotFound(run_id.to_owned());
+    }
+    WorkflowRuntimeError::Absurd(err)
+}
+
+async fn retry_workflow_run(
+    run_id: &str,
+    max_attempts: Option<i32>,
+    queues: [(&str, &Client); 4],
+) -> Result<RetryWorkflowRunResponse, WorkflowRuntimeError> {
+    let run_id = run_id.trim();
+    if run_id.is_empty() {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "run_id must not be empty".to_owned(),
+        ));
+    }
+    if matches!(max_attempts, Some(value) if value < 1) {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "max_attempts must be at least 1".to_owned(),
+        ));
+    }
+    for (queue_name, client) in queues {
+        let Some(task_id) = lookup_task_for_run(client.pool(), queue_name, run_id).await? else {
+            continue;
+        };
+        let spawn = client
+            .retry_task(
+                &task_id,
+                RetryTaskOptions {
+                    queue: Some(queue_name.to_owned()),
+                    max_attempts,
+                    spawn_new_task: false,
+                },
+            )
+            .await
+            .map_err(|err| map_retry_task_error(err, run_id))?;
+        return Ok(RetryWorkflowRunResponse {
+            ok: true,
+            run_id: spawn.run_id,
+            task_id: spawn.task_id,
+            attempt: spawn.attempt,
+            created: spawn.created,
+        });
+    }
+    Err(WorkflowRuntimeError::NotFound(run_id.to_owned()))
 }
 
 fn absurd_queue_tables(
@@ -3530,6 +3652,12 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.workflow.retry") => {
+            match retry_python_workflow_run(message, workflow_clients).await {
+                Ok(value) => Ok(value),
+                Err(error) => Err(error.to_string()),
+            }
+        }
         Some("ctx.call_tool") => match call_python_workflow_tool(message).await {
             Ok(value) => Ok(value),
             Err(error) => Err(error.to_string()),
@@ -3589,12 +3717,7 @@ async fn start_python_child_workflow(
             "ctx.workflow.start input must be an object".to_owned(),
         ));
     }
-    let idempotency_key = message
-        .get("idempotency_key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(ToOwned::to_owned);
+    let spawn_options = spawn_options_from_message(message)?;
     let target_client = match workflow_queue_class(workflow_name) {
         WorkflowQueueClass::Standard => &workflow_clients.standard,
         WorkflowQueueClass::SlackLive => &workflow_clients.slack_live,
@@ -3610,10 +3733,7 @@ async fn start_python_child_workflow(
                 harness_type: parent.harness_type.clone(),
                 slack_button_feedback: None,
             },
-            SpawnOptions {
-                idempotency_key,
-                ..SpawnOptions::default()
-            },
+            spawn_options,
         )
         .await?;
     Ok(json!({
@@ -3621,6 +3741,91 @@ async fn start_python_child_workflow(
         "task_id": spawn.task_id,
         "run_id": spawn.run_id,
         "created": spawn.created,
+    }))
+}
+
+/// The engine options a `ctx.workflow.start` message may carry: the
+/// idempotency key as before, plus `max_attempts` and `retry_strategy`
+/// (absurd's shape, e.g. `{"kind": "exponential", "base_seconds": 1800,
+/// "factor": 2, "max_seconds": 14400}`). Absent keys keep the engine
+/// defaults, so an older workflow host stays compatible.
+fn spawn_options_from_message(message: &Value) -> Result<SpawnOptions, WorkflowRuntimeError> {
+    let idempotency_key = message
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(ToOwned::to_owned);
+    let max_attempts = match message.get("max_attempts") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let attempts = value.as_i64().ok_or_else(|| {
+                WorkflowRuntimeError::BadRequest(
+                    "ctx.workflow.start max_attempts must be an integer".to_owned(),
+                )
+            })?;
+            if attempts < 1 || attempts > i32::MAX as i64 {
+                return Err(WorkflowRuntimeError::BadRequest(
+                    "ctx.workflow.start max_attempts must be at least 1".to_owned(),
+                ));
+            }
+            Some(attempts as i32)
+        }
+    };
+    let retry_strategy = match message.get("retry_strategy") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<RetryStrategy>(value.clone()).map_err(|err| {
+                WorkflowRuntimeError::BadRequest(format!(
+                    "ctx.workflow.start retry_strategy is not a valid retry strategy: {err}"
+                ))
+            })?,
+        ),
+    };
+    Ok(SpawnOptions {
+        idempotency_key,
+        max_attempts,
+        retry_strategy,
+        ..SpawnOptions::default()
+    })
+}
+
+/// `ctx.workflow.retry {run_id, max_attempts?}`: re-arm a failed run's task
+/// with one more attempt on the same checkpoints (see `retry_workflow_run`).
+async fn retry_python_workflow_run(
+    message: &Value,
+    workflow_clients: &WorkflowQueueClients,
+) -> Result<Value, WorkflowRuntimeError> {
+    let run_id = message
+        .get("run_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(
+                "ctx.workflow.retry requires a non-empty run_id".to_owned(),
+            )
+        })?;
+    let max_attempts = match message.get("max_attempts") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_i64().ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(
+                "ctx.workflow.retry max_attempts must be an integer".to_owned(),
+            )
+        })? as i32),
+    };
+    let queues = [
+        (WORKFLOW_QUEUE, &workflow_clients.standard),
+        (WORKFLOW_SLACK_LIVE_QUEUE, &workflow_clients.slack_live),
+        (WORKFLOW_ETL_QUEUE, &workflow_clients.etl),
+        (WORKFLOW_ETL_BACKFILL_QUEUE, &workflow_clients.etl_backfill),
+    ];
+    let retried = retry_workflow_run(run_id, max_attempts, queues).await?;
+    Ok(json!({
+        "run_id": retried.run_id,
+        "task_id": retried.task_id,
+        "attempt": retried.attempt,
+        "created": retried.created,
     }))
 }
 
@@ -4810,6 +5015,93 @@ mod tests {
     #[tokio::test]
     async fn host_error_does_not_wait_for_never_closing_stderr() {
         assert_structured_host_error_is_bounded("host.error").await;
+    }
+
+    #[test]
+    fn spawn_options_from_message_reads_engine_retry_options() {
+        let message = json!({
+            "type": "ctx.workflow.start",
+            "workflow_name": "c7e_dango_feedback_issue",
+            "idempotency_key": " dango-feedback:abc ",
+            "max_attempts": 8,
+            "retry_strategy": {
+                "kind": "exponential",
+                "base_seconds": 1800,
+                "factor": 2,
+                "max_seconds": 14400
+            }
+        });
+        let options = spawn_options_from_message(&message).expect("options");
+        assert_eq!(
+            options.idempotency_key.as_deref(),
+            Some("dango-feedback:abc")
+        );
+        assert_eq!(options.max_attempts, Some(8));
+        assert_eq!(
+            options.retry_strategy,
+            Some(RetryStrategy {
+                kind: RetryKind::Exponential,
+                base_seconds: Some(1800.0),
+                factor: Some(2.0),
+                max_seconds: Some(14400.0),
+            })
+        );
+        assert!(options.queue.is_none() && options.cancellation.is_none());
+    }
+
+    #[test]
+    fn spawn_options_from_message_keeps_engine_defaults_without_options() {
+        let message = json!({"type": "ctx.workflow.start", "workflow_name": "x"});
+        let options = spawn_options_from_message(&message).expect("options");
+        assert!(options.idempotency_key.is_none());
+        assert!(options.max_attempts.is_none());
+        assert!(options.retry_strategy.is_none());
+        let with_nulls =
+            json!({"max_attempts": null, "retry_strategy": null, "idempotency_key": ""});
+        let options = spawn_options_from_message(&with_nulls).expect("options");
+        assert!(options.idempotency_key.is_none() && options.max_attempts.is_none());
+    }
+
+    #[test]
+    fn spawn_options_from_message_rejects_bad_retry_options() {
+        for message in [
+            json!({"max_attempts": 0}),
+            json!({"max_attempts": "8"}),
+            json!({"retry_strategy": {"kind": "sometimes"}}),
+            json!({"retry_strategy": "exponential"}),
+        ] {
+            let err = spawn_options_from_message(&message).expect_err("rejected");
+            assert!(
+                matches!(err, WorkflowRuntimeError::BadRequest(_)),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_workflow_run_request_deserializes_retry_strategy() {
+        let request: CreateWorkflowRunRequest = serde_json::from_value(json!({
+            "workflow_name": "c7e_workflow_retry_scan",
+            "input": {"dry_run": true},
+            "max_attempts": 3,
+            "retry_strategy": {"kind": "fixed", "base_seconds": 60}
+        }))
+        .expect("request");
+        assert_eq!(request.max_attempts, Some(3));
+        assert_eq!(
+            request.retry_strategy,
+            Some(RetryStrategy {
+                kind: RetryKind::Fixed,
+                base_seconds: Some(60.0),
+                factor: None,
+                max_seconds: None,
+            })
+        );
+        let bare: CreateWorkflowRunRequest =
+            serde_json::from_value(json!({"workflow_name": "x"})).expect("request");
+        assert!(bare.retry_strategy.is_none() && bare.max_attempts.is_none());
+        let retry: RetryWorkflowRunRequest = serde_json::from_value(json!({})).expect("request");
+        assert!(retry.max_attempts.is_none());
     }
 
     #[test]
