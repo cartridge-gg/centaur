@@ -8,9 +8,12 @@
 # `github_auth_headers` tool's `token_broker` source can resolve it and the
 # broker mints/rotates the installation token out-of-band.
 #
-# Idempotent (find_or_create by namespace+foreign_id) and a no-op where the env
-# is unset (dev/test). Uses the model so client_secret is stored encrypted; a
-# failure is logged rather than raised so it never breaks a console deploy.
+# Idempotent (find_or_create by foreign_id, which is globally unique since
+# resource namespaces were removed) and a no-op where the env is unset
+# (dev/test). Uses the model so client_secret is stored encrypted; a failure is
+# logged rather than raised so it never breaks a console deploy. The seed runs
+# in a savepoint: a failed statement otherwise aborts the migration's
+# transaction, and Rails then cannot record the version.
 class SeedGithubAppBrokerCredential < ActiveRecord::Migration[8.1]
   def up
     app_id = ENV["GITHUB_APP_ID"].to_s
@@ -21,18 +24,20 @@ class SeedGithubAppBrokerCredential < ActiveRecord::Migration[8.1]
       return
     end
 
-    BrokerCredential.find_or_create_by!(namespace: "default", foreign_id: "github-app") do |c|
-      c.grant = "github_app"
-      c.client_id = app_id
-      c.token_endpoint = "https://api.github.com/app/installations/#{installation_id}/access_tokens"
-      c.client_secret = private_key_b64
+    BrokerCredential.transaction(requires_new: true) do
+      BrokerCredential.find_or_create_by!(foreign_id: "github-app") do |c|
+        c.grant = "github_app"
+        c.client_id = app_id
+        c.token_endpoint = "https://api.github.com/app/installations/#{installation_id}/access_tokens"
+        c.client_secret = private_key_b64
+      end
     end
-    say "seeded github_app broker credential (namespace=default foreign_id=github-app)"
+    say "seeded github_app broker credential (foreign_id=github-app)"
   rescue StandardError => e
     say "WARNING: github_app broker credential seed failed: #{e.class}: #{e.message}"
   end
 
   def down
-    BrokerCredential.where(namespace: "default", foreign_id: "github-app", grant: "github_app").destroy_all
+    BrokerCredential.where(foreign_id: "github-app", grant: "github_app").destroy_all
   end
 end
