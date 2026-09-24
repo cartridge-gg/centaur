@@ -37,7 +37,7 @@ By default, `centaur_session_send` waits for the turn to finish and returns `fin
 - If the result has `done: false`, call `centaur_session_read` until `done` is true. It waits up to `wait_seconds` (at most 50). Pass `after_event_id` from `next_after_event_id` to read only new progress.
 - Set `wait: false` to return at once with `session_id` and `execution_id`. In Codex, this plus repeated `centaur_session_read` calls is the way to see progress while a turn runs.
 
-Sessions are private to the principal that started them.
+Sessions are private to the principal that started them. For each tool, its arguments and results, and what Claude Code and Codex show during a call, see [Agent Sessions over MCP](../../docs/pages/operate/mcp-agent-sessions.mdx).
 
 ## Codex
 

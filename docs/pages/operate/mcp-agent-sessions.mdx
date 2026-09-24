@@ -1,0 +1,366 @@
+# Agent Sessions over MCP
+
+The Centaur MCP server can start and drive agent sessions. An agent session
+runs a harness (Codex, Claude Code, Hermes, Amp, or Nanocodex) in its own
+sandbox. You send prompts from an MCP client, such as Claude Code or Codex.
+The agent works in the sandbox and returns its answer to the MCP client.
+
+Four MCP tools control agent sessions:
+
+| Tool | Use it to |
+| --- | --- |
+| `centaur_session_send` | Start a session, or send a prompt to a session. |
+| `centaur_session_read` | Wait for a turn, and read its progress and answer. |
+| `centaur_session_interrupt` | Stop the running turn of a session. |
+| `centaur_session_list` | Find the sessions that you started. |
+
+## Terms
+
+| Term | Meaning |
+| --- | --- |
+| Session | One conversation with one agent in one sandbox. The agent keeps its conversation from prompt to prompt. The API identifies a session by `session_id`. |
+| Turn | One run of the agent for one prompt. The API identifies a turn by `execution_id`. |
+| Steer | Send a prompt into a turn that is running. The agent reads the prompt during the turn. |
+| Progress item | A short summary of one step of the agent, for example one command or one tool call. |
+| Progress line | A one-line text form of a progress item, for example `command: gh pr list → exit 0`. |
+
+## Enable the tools
+
+The tools are off by default. An operator enables them with a Helm value.
+
+```yaml
+apiRs:
+  mcpSessionsEnabled: true
+```
+
+The chart sets `CENTAUR_MCP_SESSIONS_ENABLED` on api-rs from this value. If
+the value is `false`, `tools/list` does not show the tools, and a call to a
+tool returns `unknown tool`.
+
+:::warning
+Any MCP token with the `mcp:tools` scope can start agent sandboxes. The flag
+has no role gate and no limit for each principal. Only the global
+`apiRs.sandboxRunningLimit` applies. Enable the flag only if every MCP user
+may run agents with the credentials of their own principal.
+:::
+
+## Connect an MCP client
+
+Connect the client to the `/mcp` URL of your deployment, then sign in with
+OAuth. The steps for each client are in
+[`plugins/centaur/README.md`](https://github.com/paradigmxyz/centaur/blob/main/plugins/centaur/README.md).
+
+- **Claude Code:** add the server, then open `/mcp` and authenticate `centaur`.
+  The tools show as `mcp__centaur__centaur_session_send` and so on.
+- **Codex:** run `codex mcp add centaur --url <CENTAUR_MCP_URL>`, then run
+  `codex mcp login centaur`.
+
+## Access and credentials
+
+- Each session belongs to the principal that started it. The thread key is
+  `mcp-session:<principal_id>:<session_id>`.
+- Another principal cannot read, drive, stop, or list your sessions. For
+  another principal, your session reads as `unknown session`.
+- The agent runs with the tools and credentials of your principal. These are
+  the same credentials that your MCP tool calls use.
+- A session has no Slack, GitHub, or other chat thread. Centaur tells the
+  agent not to post its reply anywhere. The answer goes only to the MCP
+  client.
+
+## centaur_session_send
+
+Use `centaur_session_send` to start a session and to send each prompt after
+that. By default, the call waits for the turn to finish and returns the
+final answer.
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `prompt` | string | required | The instruction or message for the agent. Max 200 KiB. |
+| `session_id` | string | new id | The session to continue. If no session has this id, Centaur starts a new session with this id. Use 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`. |
+| `harness` | string | deployment harness | The harness for a new session: `codex`, `claudecode`, `amp`, `hermes`, or `nanocodex`. |
+| `persona_id` | string | deployment persona | The Centaur persona for a new session. |
+| `model` | string | harness default | The model for a new turn. |
+| `wait` | boolean | `true` | If `true`, wait for the turn to finish. If `false`, return at once. |
+| `idempotency_key` | string | none | A key for this prompt. Max 128 bytes. If you send the same key again, Centaur returns the same turn and does not send the prompt again. |
+
+How the call works:
+
+1. If you omit `session_id`, Centaur starts a new session.
+2. If a turn is running, Centaur steers the prompt into that turn. The
+   result has `steered: true`. A steered prompt uses the model of the
+   running turn.
+3. If no turn is running, Centaur starts a new turn.
+4. If `wait` is `true`, the call waits for the turn. The
+   [waiting behavior](#waiting-and-streaming) depends on the MCP client.
+5. If `wait` is `false`, the call returns with `session_id` and
+   `execution_id`. Use `centaur_session_read` to follow the turn.
+
+A session keeps its harness and its persona. If you send a different
+`harness` or `persona_id` to an existing session, the call fails. Start a
+new session to use a different harness or persona.
+
+If the persona that you request is not available to your principal,
+Centaur starts the session with the deployment persona. The result then has
+`unavailable_requested_persona_id`.
+
+Use `idempotency_key` if your client can retry a call. For example, if a
+call times out, send it again with the same key. Centaur does not run the
+prompt twice.
+
+## centaur_session_read
+
+Use `centaur_session_read` to wait for a turn and to read its progress and
+answer. You need it in these cases:
+
+- The result of `centaur_session_send` has `done: false`.
+- You sent the prompt with `wait: false`.
+- Your client lost the connection during a send. The turn continues in the
+  sandbox.
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `session_id` | string | required | The session to read. |
+| `execution_id` | string | latest turn | The turn to read. |
+| `after_event_id` | integer | `0` | Return only progress after this event. Use `next_after_event_id` from the previous read. |
+| `wait_seconds` | integer | `25` | Wait up to this time for the turn to finish. Max 50. Use `0` to return at once. |
+
+To follow a turn, do these steps:
+
+1. Call `centaur_session_read` with `session_id`.
+2. Read the new items in `progress`.
+3. If `done` is `false`, call `centaur_session_read` again. Set
+   `after_event_id` to `next_after_event_id`.
+4. If `done` is `true`, read `final_answer`, `error`, or `cancel_reason`.
+
+If `has_more_progress` is `true`, more progress is ready now. Read again at
+once with the new `after_event_id`. One read returns at most 32 KiB of
+progress.
+
+If the session has no turns, the result has `status: "idle"` and
+`done: true`.
+
+## centaur_session_interrupt
+
+Use `centaur_session_interrupt` to stop the running turn of a session. The
+session stays open. You can send a new prompt after the interrupt.
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `session_id` | string | required | The session to stop. |
+| `reason` | string | `Interrupted from MCP` | A reason that Centaur records with the interrupt. |
+
+The result has `interrupted` and `execution_id`. If no turn is running,
+`interrupted` is `false` and `execution_id` is `null`.
+
+## centaur_session_list
+
+Use `centaur_session_list` to find a session that you started earlier, for
+example in another conversation.
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `limit` | integer | `20` | The maximum number of sessions. Max 50. |
+
+The result has `sessions`, with the most recently updated session first.
+Each session has `session_id`, `title`, `status`, `harness`, `persona_id`,
+`created_at`, and `updated_at`. If the deployment has title generation, api-rs
+writes a `title` from the prompts. Otherwise, `title` is empty.
+
+## Common tasks
+
+| Task | Calls |
+| --- | --- |
+| Ask one question | `centaur_session_send` with `prompt`. Read `final_answer`. |
+| Continue a conversation | `centaur_session_send` with the same `session_id`. |
+| Run a long task | `centaur_session_send`. If `done` is `false`, call `centaur_session_read` until `done` is `true`. |
+| Start a task and do other work | `centaur_session_send` with `wait: false`. Later, call `centaur_session_read`. |
+| See progress in Codex | `centaur_session_send` with `wait: false`, then `centaur_session_read` in a loop. |
+| Correct a running turn | `centaur_session_send` with the same `session_id`. Centaur steers the prompt into the turn. |
+| Stop a turn | `centaur_session_interrupt`. |
+| Find an old session | `centaur_session_list`. |
+
+## Waiting and streaming
+
+If `wait` is `true`, `centaur_session_send` waits in one of two ways.
+
+**The MCP client accepts `text/event-stream`.** Claude Code and Codex both
+accept it. Centaur answers with a stream:
+
+1. Centaur sends one MCP progress notification (`notifications/progress`)
+   for each progress item. The notification `message` is the progress line.
+2. If the agent completes no step for 30 s, Centaur sends a heartbeat:
+   `working · last step 1m30s ago`.
+3. When the turn finishes, Centaur sends the tool result and closes the
+   stream.
+4. If the turn runs longer than 30 minutes, Centaur sends the result with
+   `done: false`. Continue with `centaur_session_read`.
+5. If the client closes the connection, the turn continues in the sandbox.
+
+Centaur sends progress notifications only if the client sends a
+`progressToken` in the call. Claude Code and Codex send one.
+
+**The MCP client does not accept `text/event-stream`.** The call waits up to
+50 s. Then Centaur returns the result. If the turn is not done, the result
+has `done: false`.
+
+The model in the MCP client does not see progress notifications. The model
+sees only the tool result. For this reason, the result of a waited send
+starts with a short report:
+
+```text
+Turn completed.
+
+3 PRs are open.
+
+Progress:
+- sandbox ready
+- command: gh pr list → exit 0
+- message: 3 PRs are open.
+- turn completed
+
+session_id: 7f3c… · execution_id: exe_… · next_after_event_id: 42
+The turn is done. Call centaur_session_send with this session_id to continue the conversation.
+```
+
+The report shows the last 40 progress lines. The `structuredContent` of the
+result holds the full data. A streamed send keeps the newest 16 KiB of
+progress items. If Centaur drops older items, the result has
+`earlier_progress_omitted`. If the turn failed, the result has
+`isError: true`.
+
+## Terminal display
+
+The two clients show a waited send in different ways. The examples below
+come from Claude Code 2.1.281 and Codex 0.154.0.
+
+### Claude Code
+
+Claude Code shows one live line under the tool call. Each progress
+notification replaces the line.
+
+```text
+⏺ Calling centaur · 7s…
+  ⎿  command: gh pr list → exit 0
+```
+
+- Claude Code shows only the newest progress line. It does not keep
+  earlier lines on the screen.
+- The timer after `Calling centaur` counts the time of the call.
+- When the call ends, the line changes to `Called centaur`. Claude Code
+  collapses the tool result. The reply of the model follows.
+- Claude Code does not show MCP log messages (`notifications/message`).
+
+Claude Code stops a tool call if the server sends no response and no
+progress for 300 s. The heartbeat of Centaur prevents this stop. To change
+the limit, set `timeout` (in ms) for the server in the MCP configuration.
+You can also set `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (in ms) for all
+servers. The value `0` turns off the limit.
+
+### Codex
+
+Codex does not show progress notifications. During the call, Codex shows
+only the call and a timer:
+
+```text
+• Calling centaur.centaur_session_send({"prompt":"How many PRs are open?"})
+• Working (12s • esc to interrupt)
+```
+
+When the call ends, Codex shows the first lines of the result:
+
+```text
+• Called centaur.centaur_session_send({"prompt":"How many PRs are open?"})
+  └ Turn completed.
+    3 PRs are open.
+```
+
+`codex exec` shows only that the call started and completed. To see progress
+in Codex, send with `wait: false`. Then call `centaur_session_read` in a
+loop. Codex shows the result of each read.
+
+### Other MCP clients
+
+- If the client does not send `Accept: text/event-stream`, the send waits
+  only 50 s. Use `centaur_session_read` for longer turns.
+- If the client does not send a `progressToken`, Centaur sends no progress
+  and no heartbeat. The idle timer of the client can then stop a long call.
+  Use `wait: false` and `centaur_session_read` for such a client.
+- If a proxy between the client and Centaur buffers responses, progress
+  arrives only at the end of the call.
+
+## Result fields
+
+| Field | Tools | Meaning |
+| --- | --- | --- |
+| `session_id` | all except list | The session. |
+| `execution_id` | send, read, interrupt | The turn. |
+| `status` | send, read | The turn status: `queued`, `running`, `completed`, `failed`, or `cancelled`. |
+| `done` | waited send, read | `true` if the turn is finished and its result is stored. |
+| `final_answer` | waited send, read | The answer of the agent. Max 100,000 characters. If Centaur shortens the answer, `final_answer_truncated` is `true`. |
+| `error` | waited send, read | The error of a failed turn. |
+| `cancel_reason` | waited send, read | The reason of a cancelled turn. |
+| `progress` | waited send, read | The progress items, oldest first. |
+| `next_after_event_id` | waited send, read | The value for `after_event_id` in the next read. |
+| `has_more_progress` | waited send, read | `true` if more progress is ready now. |
+| `earlier_progress_omitted` | streamed send | The number of older progress items that Centaur dropped to stay within 16 KiB. |
+| `steered` | send | `true` if the prompt went into a running turn. |
+| `replayed` | send | `true` if the `idempotency_key` was already sent. Centaur did not send the prompt again. |
+| `created` | send | `true` if the call started a new session. |
+| `harness`, `persona_id` | send | The harness and persona of the session. |
+| `unavailable_requested_persona_id` | send | The persona that you requested, if your principal cannot use it. |
+| `next` | send, read | What to do next, as one sentence for the model. |
+
+## Progress items
+
+Each progress item has `kind` and `event_id`. Centaur drops streaming text
+deltas and model reasoning.
+
+| `kind` | Fields | Progress line |
+| --- | --- | --- |
+| `message` | `phase`, `text` | `message: Found the flaky test.` |
+| `user_message` | `text` | `prompt: Open a draft PR.` |
+| `command` | `command`, `status`, `exit_code`, `output_tail` | `command: cargo test → exit 0` |
+| `tool_call` | `server`, `tool`, `status`, `error` or `success` | `tool: centaur.slack → completed` |
+| `file_change` | `status`, `paths` | `files: a.rs, b.rs (+2 more)` |
+| `web_search` | `query` | `search: rust sse axum` |
+| `plan` | `text` | `plan updated` |
+| `image` | `status`, `saved_path` | `image generated` |
+| `subagent_call` | none | `subagent call` |
+| `context_compaction` | none | `context compacted` |
+| `error` | `message`, `will_retry` | `error: rate limited` |
+| `warning` | `event`, `error` | `warning: session.sandbox_resume_failed` |
+| `sandbox_ready` | none | `sandbox ready` |
+| `turn_started` | none | `turn started` |
+| `prompt_steered` | none | `prompt steered into the turn` |
+| `interrupt_delivered` | none | `interrupt delivered` |
+| `turn_completed`, `turn_failed`, `turn_cancelled` | none | `turn completed`, `turn failed`, `turn cancelled` |
+
+`output_tail` holds the last 800 characters of the command output.
+
+## Errors
+
+| Message | Cause | Action |
+| --- | --- | --- |
+| `unknown session` | The session does not exist, or another principal owns it. | Check the `session_id`. Use `centaur_session_list`. |
+| `turn … is still starting its agent and cannot take a new prompt yet` | The running turn has no agent output yet, so Centaur cannot steer it. | Send the prompt again after a few seconds. |
+| `the prompt was saved but could not be delivered to running turn …` | The running turn did not take the prompt. | Wait for the turn with `centaur_session_read`. Then send the prompt again with a new `idempotency_key`. |
+| `this session uses harness …` or `this session uses persona …` | A session keeps its harness and persona. | Start a new session. |
+| `The turn continues, but waiting for it failed` | The send started the turn, but the wait failed. | Call `centaur_session_read` with the `session_id` and `execution_id` in the message. |
+| `Centaur is restarting. Retry in a few seconds.` | api-rs is shutting down. | Send the call again. |
+| `sent no response or progress for 300s; aborting` (Claude Code) | Claude Code got no progress. A proxy can cause this if it buffers the stream. | Send with `wait: false` and use `centaur_session_read`, or increase the Claude Code timeout. |
+
+## Limits
+
+| Item | Limit |
+| --- | --- |
+| Prompt | 200 KiB |
+| `session_id` | 1 to 64 characters |
+| `idempotency_key` | 128 bytes |
+| Streamed send | 30 minutes, then `done: false` |
+| Waited send without a stream | 50 s |
+| Heartbeat | After 30 s without a step |
+| `wait_seconds` of a read | 50 s. The default is 25 s. |
+| Progress in one read | 32 KiB |
+| Progress in a streamed result | The newest 16 KiB |
+| `final_answer` | 100,000 characters |
+| `centaur_session_list` | 50 sessions. The default is 20. |
