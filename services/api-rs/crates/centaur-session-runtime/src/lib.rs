@@ -44,8 +44,8 @@ use dashmap::{DashMap, DashSet};
 use futures_util::{FutureExt, SinkExt, Stream, StreamExt, future::BoxFuture, stream};
 use provider_failover::{
     FailoverDirective, FailoverNotice, PROVIDER_FAILOVER_EVENT, PROVIDER_FAILOVER_METADATA_KEY,
-    can_restore_in, execution_allows_failover, failover_record, failover_target,
-    kept_after_failover, restore_pending,
+    execution_allows_failover, failover_record, failover_target, kept_after_failover,
+    switch_pending, switched_in,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2408,41 +2408,42 @@ impl SessionRuntime {
                     let current_sandbox = self.store.get_session(thread_key).await?.sandbox_id;
                     match (on_harness_conflict, existing_harness) {
                         // The user named the harness that the session left:
-                        // go back to its session from before the switch, in
-                        // the same sandbox. A restart would delete the state
-                        // volume, and that session with it.
+                        // the sandbox of the switch moves the session back.
+                        // It converts the current session, so the history of
+                        // every turn stays. A restart would delete the state
+                        // volume, and the session with it.
                         (HarnessConflictPolicy::RestartExplicit, Some(existing_harness))
                             if kept_after_failover(record.as_ref(), harness_type, &existing)
-                                && can_restore_in(record.as_ref(), current_sandbox.as_deref()) =>
+                                && switched_in(record.as_ref(), current_sandbox.as_deref()) =>
                         {
-                            let mut restore = failover_record(
+                            let mut requested = failover_record(
                                 &existing_harness,
                                 harness_type,
-                                "restore",
+                                "requested",
                                 None,
                                 None,
                                 current_sandbox.as_deref(),
                             );
-                            restore["restore_pending"] = json!(true);
+                            requested["pending"] = json!(true);
                             if self
                                 .store
                                 .fail_over_session_harness(
                                     thread_key,
                                     &existing_harness,
                                     harness_type,
-                                    &restore,
+                                    &requested,
                                 )
                                 .await?
                             {
                                 info!(
                                     component = COMPONENT_SESSION_RUNTIME,
-                                    event = "session_provider_failover_restore_requested",
+                                    event = "session_provider_failover_switch_requested",
                                     thread_key = %thread_key,
                                     from_harness = %existing_harness,
                                     to_harness = %harness_type,
-                                    "the session goes back to its session from before the switch"
+                                    "the session goes back to the harness that the user asked for"
                                 );
-                                provider_failover = Some(restore);
+                                provider_failover = Some(requested);
                             }
                             self.store
                                 .create_or_get_session(
@@ -2628,14 +2629,14 @@ impl SessionRuntime {
         let Some(other) = failover_target(&session.harness_type) else {
             return Ok((session, None));
         };
-        // The user asked to go back to this harness: its sandbox restores the
-        // session from before the switch. No proactive move in this turn.
+        // The user asked for this harness, and the sandbox did not move the
+        // session yet: no proactive move away from it in this turn.
         let record = self
             .store
             .session_metadata_value(&session.thread_key, PROVIDER_FAILOVER_METADATA_KEY)
             .await?;
-        let restore = restore_pending(record.as_ref())
-            && can_restore_in(record.as_ref(), session.sandbox_id.as_deref());
+        let requested = switch_pending(record.as_ref())
+            && switched_in(record.as_ref(), session.sandbox_id.as_deref());
         let allowed =
             config.allows(&session.thread_key) && execution_allows_failover(execution_metadata);
         let original = session.harness_type.clone();
@@ -2644,7 +2645,7 @@ impl SessionRuntime {
 
         let mut harness = original.clone();
         let mut retarget_model = None;
-        if allowed && current_exhausted && !other_exhausted && !restore {
+        if allowed && current_exhausted && !other_exhausted && !requested {
             retarget_model = Some(config.model_for(&other).map(str::to_owned));
             if session.sandbox_id.is_none() {
                 let record =
@@ -2701,7 +2702,7 @@ impl SessionRuntime {
                 enabled,
                 model,
                 retarget_model,
-                restore,
+                requested,
             }),
         ))
     }
@@ -7221,9 +7222,9 @@ async fn record_provider_failover(
         .await
     {
         Ok(true) => {}
-        // The row moved back when the user asked for the restore; the
-        // sandbox confirms it, which ends the pending restore.
-        Ok(false) if notice.mode == "restore" => {
+        // The row moved when the user asked for the harness; the sandbox
+        // confirms the move, which ends the pending switch.
+        Ok(false) if notice.mode == "requested" => {
             if let Err(error) = ctx
                 .store
                 .set_session_metadata_value(thread_key, PROVIDER_FAILOVER_METADATA_KEY, &record)
@@ -7234,12 +7235,12 @@ async fn record_provider_failover(
                     event = "session_provider_failover_record_failed",
                     thread_key = %thread_key,
                     %error,
-                    "failed to record the restored session"
+                    "failed to record the requested switch"
                 );
             }
         }
-        // The session row already names the new harness, for example after
-        // the sandbox restored the harness it had moved to earlier.
+        // The session row already names the new harness, for example after a
+        // revert of a proactive move that the row did not record.
         Ok(false) => info!(
             component = COMPONENT_SESSION_RUNTIME,
             event = "session_provider_failover_row_unchanged",
@@ -13536,8 +13537,8 @@ mod adoption_tests {
             .await;
         assert!(conflict.is_err());
 
-        // The user named Codex: back to its session from before the switch,
-        // in the same sandbox. No restart, so the state volume stays.
+        // The user named Codex: the sandbox of the switch moves the session
+        // back. No restart, so the state volume stays.
         let outcome = runtime
             .create_or_get_session(
                 &thread_key,
@@ -13547,16 +13548,16 @@ mod adoption_tests {
                 HarnessConflictPolicy::RestartExplicit,
             )
             .await
-            .expect("restore session");
+            .expect("switch back");
         assert!(!outcome.harness_switched);
         assert_eq!(outcome.session.harness_type, HarnessType::Codex);
         assert_eq!(outcome.session.sandbox_id.as_deref(), Some("sbx-kept"));
-        let restore = outcome.provider_failover.expect("the restore record");
-        assert_eq!(restore["mode"], "restore");
-        assert_eq!(restore["from"], "claudecode");
-        assert_eq!(restore["restore_pending"], true);
+        let requested = outcome.provider_failover.expect("the switch record");
+        assert_eq!(requested["mode"], "requested");
+        assert_eq!(requested["from"], "claudecode");
+        assert_eq!(requested["pending"], true);
 
-        // The next turn asks the sandbox to restore, even while the Codex
+        // The next turn asks the sandbox for Codex, even while the Codex
         // provider is known to be exhausted.
         store
             .mark_provider_exhausted(
@@ -13582,25 +13583,52 @@ mod adoption_tests {
         let directive = directive.expect("a directive");
         assert_eq!(session.harness_type, HarnessType::Codex);
         assert_eq!(directive.harness, HarnessType::Codex);
-        assert!(directive.restore);
+        assert!(directive.requested);
 
-        // The sandbox confirms the restore; later turns do not ask again.
+        // The sandbox confirms the switch; later turns can move proactively.
         let ctx = runtime.context();
         let notice = FailoverNotice::parse(&json!({"method": "centaur/providerFailover",
-            "params": {"from": "claudecode", "to": "codex", "mode": "restore", "history": "restored"}}))
+            "params": {"from": "claudecode", "to": "codex", "mode": "requested", "history": "converted"}}))
         .unwrap();
-        record_provider_failover(&ctx, &thread_key, "sbx-kept", "exec-restore", &notice).await;
+        record_provider_failover(&ctx, &thread_key, "sbx-kept", "exec-switch", &notice).await;
         let record = session_metadata(&store, &thread_key).await["provider_failover"].clone();
-        assert_eq!(record["mode"], "restore");
-        assert!(record.get("restore_pending").is_none_or(Value::is_null));
+        assert_eq!(record["mode"], "requested");
+        assert!(record.get("pending").is_none_or(Value::is_null));
         let session = store.get_session(&thread_key).await.expect("load session");
         let (_, directive) = failover_runtime
             .plan_provider_failover(session, None, None)
             .await
             .expect("plan");
-        assert!(!directive.expect("a directive").restore);
+        let directive = directive.expect("a directive");
+        assert!(!directive.requested);
+        assert_eq!(directive.harness, HarnessType::ClaudeCode);
 
-        // Without the sandbox of the switch, the original is gone: restart.
+        // Codex cannot read the converted session: the sandbox goes back to
+        // Claude Code and its session, and the row follows.
+        let notice = FailoverNotice::parse(&json!({"method": "centaur/providerFailover",
+            "params": {"from": "codex", "to": "claudecode", "mode": "revert", "stage": "resume",
+                       "history": "original", "reason": "no history"}}))
+        .unwrap();
+        record_provider_failover(&ctx, &thread_key, "sbx-kept", "exec-revert", &notice).await;
+        let session = store.get_session(&thread_key).await.expect("load session");
+        assert_eq!(session.harness_type, HarnessType::ClaudeCode);
+        assert_eq!(session.sandbox_id.as_deref(), Some("sbx-kept"));
+        let record = session_metadata(&store, &thread_key).await["provider_failover"].clone();
+        assert_eq!(record["mode"], "revert");
+        let outcome = runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({})),
+                HarnessConflictPolicy::Restart,
+            )
+            .await
+            .expect("load session");
+        assert!(!outcome.harness_switched);
+        assert_eq!(outcome.session.harness_type, HarnessType::ClaudeCode);
+
+        // Another sandbox cannot switch harness: an explicit request restarts.
         store
             .update_sandbox_id(&thread_key, Some("sbx-other"))
             .await
@@ -13608,7 +13636,7 @@ mod adoption_tests {
         let outcome = runtime
             .create_or_get_session(
                 &thread_key,
-                &HarnessType::ClaudeCode,
+                &HarnessType::Codex,
                 None,
                 Some(json!({})),
                 HarnessConflictPolicy::RestartExplicit,
@@ -13616,7 +13644,7 @@ mod adoption_tests {
             .await
             .expect("restart session");
         assert!(outcome.harness_switched);
-        assert_eq!(outcome.session.harness_type, HarnessType::ClaudeCode);
+        assert_eq!(outcome.session.harness_type, HarnessType::Codex);
         assert_eq!(outcome.provider_failover, None);
         reset_test_store(&store).await;
     }

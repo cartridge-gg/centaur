@@ -78,9 +78,9 @@ pub(crate) struct FailoverDirective {
     /// The user lines were written for another harness: their model,
     /// provider and reasoning effort do not apply.
     pub retarget_model: Option<Option<String>>,
-    /// Go back to `harness`'s own session from before its last switch,
-    /// instead of converting the current one.
-    pub restore: bool,
+    /// The user asked for `harness`: the sandbox reports the move with the
+    /// mode `requested`.
+    pub requested: bool,
 }
 
 impl FailoverDirective {
@@ -90,8 +90,8 @@ impl FailoverDirective {
             failover["model"] = json!(model);
         }
         let mut directive = json!({"harness": self.harness.as_ref(), "failover": failover});
-        if self.restore {
-            directive["restore"] = json!(true);
+        if self.requested {
+            directive["mode"] = json!("requested");
         }
         directive
     }
@@ -164,8 +164,8 @@ impl FailoverNotice {
 }
 
 /// `sessions.metadata.provider_failover`: the last switch of the session,
-/// and the sandbox it happened in (whose state volume keeps the original
-/// session).
+/// and the sandbox it happened in. The state volume of that sandbox has the
+/// session, and the sessions that each switch converted it from.
 pub(crate) fn failover_record(
     from: &HarnessType,
     to: &HarnessType,
@@ -185,20 +185,19 @@ pub(crate) fn failover_record(
     })
 }
 
-/// True when the sandbox of the last switch still serves the session, so its
-/// state volume still has the session from before the switch.
-pub(crate) fn can_restore_in(record: Option<&Value>, sandbox_id: Option<&str>) -> bool {
+/// True when the sandbox of the last switch still serves the session. That
+/// sandbox can switch harness, and its state volume has the session.
+pub(crate) fn switched_in(record: Option<&Value>, sandbox_id: Option<&str>) -> bool {
     let recorded = record
         .and_then(|record| record.get("sandbox_id"))
         .and_then(Value::as_str);
     sandbox_id.is_some() && recorded == sandbox_id
 }
 
-/// True while a restore that the control plane asked for has not reached the
-/// sandbox yet.
-pub(crate) fn restore_pending(record: Option<&Value>) -> bool {
+/// True while a switch that the user asked for has not reached the sandbox.
+pub(crate) fn switch_pending(record: Option<&Value>) -> bool {
     record
-        .and_then(|record| record.get("restore_pending"))
+        .and_then(|record| record.get("pending"))
         .and_then(Value::as_bool)
         == Some(true)
 }
@@ -269,7 +268,7 @@ mod tests {
             enabled: true,
             model: Some("gpt-5.5".to_owned()),
             retarget_model: None,
-            restore: false,
+            requested: false,
         };
         let lines = directive.apply(vec![
             json!({"type": "user", "text": "hi", "model": "claude-opus-5-5"}).to_string(),
@@ -293,7 +292,7 @@ mod tests {
             enabled: false,
             model: None,
             retarget_model: Some(Some("claude-opus-5-5".to_owned())),
-            restore: true,
+            requested: true,
         };
         let lines = directive.apply(vec![
             json!({"type": "user", "text": "hi", "model": "gpt-5.5", "provider": "p", "reasoning": "high"})
@@ -303,7 +302,7 @@ mod tests {
         assert_eq!(user["model"], "claude-opus-5-5");
         assert!(user.get("provider").is_none() && user.get("reasoning").is_none());
         assert_eq!(user["centaur"]["failover"], json!({"enabled": false}));
-        assert_eq!(user["centaur"]["restore"], true);
+        assert_eq!(user["centaur"]["mode"], "requested");
     }
 
     #[test]
@@ -337,12 +336,12 @@ mod tests {
             None,
             Some("sbx-1"),
         );
-        assert!(can_restore_in(Some(&record), Some("sbx-1")));
-        assert!(!can_restore_in(Some(&record), Some("sbx-2")));
-        assert!(!can_restore_in(Some(&record), None));
-        assert!(!can_restore_in(None, Some("sbx-1")));
-        assert!(!restore_pending(Some(&record)));
-        assert!(restore_pending(Some(&json!({"restore_pending": true}))));
+        assert!(switched_in(Some(&record), Some("sbx-1")));
+        assert!(!switched_in(Some(&record), Some("sbx-2")));
+        assert!(!switched_in(Some(&record), None));
+        assert!(!switched_in(None, Some("sbx-1")));
+        assert!(!switch_pending(Some(&record)));
+        assert!(switch_pending(Some(&json!({"pending": true}))));
         assert!(kept_after_failover(
             Some(&record),
             &HarnessType::Codex,

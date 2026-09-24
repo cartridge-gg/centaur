@@ -52,7 +52,9 @@ fn write_script(path: &Path, body: &str) {
 /// A fake `codex app-server`. `turn/start` prints the lines of
 /// `$FAKE_CODEX_TURN_LINES` (with `THREAD_ID` replaced) while that file
 /// exists, or an answer.
-/// `turn/interrupt` ends the turn as interrupted.
+/// `turn/interrupt` ends the turn as interrupted. With
+/// `FAKE_CODEX_RESUME_EMPTY=1`, `thread/resume` returns a thread with no
+/// turns, as Codex does for a rollout that it cannot parse.
 const FAKE_CODEX: &str = r#"#!/bin/sh
 if [ "${1:-}" = "app-server" ] && [ "${2:-}" = "--help" ]; then
   echo '--listen stdio://'
@@ -70,7 +72,11 @@ while IFS= read -r line; do
       printf '{"id":%s,"result":{"thread":{"id":"%s"}}}\n' "$id" "$thread" ;;
     *'"method":"thread/resume"'*)
       thread=$(printf '%s' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
-      printf '{"id":%s,"result":{"thread":{"id":"%s"}}}\n' "$id" "$thread" ;;
+      if [ "${FAKE_CODEX_RESUME_EMPTY:-}" = "1" ]; then
+        printf '{"id":%s,"result":{"thread":{"id":"%s","turns":[]}}}\n' "$id" "$thread"
+      else
+        printf '{"id":%s,"result":{"thread":{"id":"%s","turns":[{"id":"t0","items":[]}]}}}\n' "$id" "$thread"
+      fi ;;
     *'"method":"turn/start"'*)
       printf '{"id":%s,"result":{"turn":{"id":"turn-1"}}}\n' "$id"
       printf '{"method":"turn/started","params":{"threadId":"%s","turn":{"id":"turn-1","items":[],"status":"inProgress","error":null}}}\n' "$thread"
@@ -88,19 +94,28 @@ done
 "#;
 
 /// A fake `claude --print`. It logs its arguments and its input, and prints
-/// the lines of `$FAKE_CLAUDE_LINES`, or an answer.
+/// the lines of `$FAKE_CLAUDE_LINES` while that file exists, or an answer.
+/// With `FAKE_CLAUDE_RESUME_FAILS=1`, `--resume` fails as Claude Code does
+/// for a transcript that it cannot find.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 printf 'ARGS %s\n' "$*" >> "$FAKE_LOG_DIR/claude.log"
 session=""
 previous=""
+resume=""
 for arg in "$@"; do
   case "$previous" in --resume|--session-id) session="$arg" ;; esac
+  [ "$arg" = "--resume" ] && resume=1
   previous="$arg"
 done
 IFS= read -r input
 printf 'STDIN %s\n' "$input" >> "$FAKE_LOG_DIR/claude.log"
+if [ -n "$resume" ] && [ "${FAKE_CLAUDE_RESUME_FAILS:-}" = "1" ]; then
+  echo "No conversation found with session ID: $session" >&2
+  printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"%s","errors":["No conversation found with session ID: %s"]}\n' "$session" "$session"
+  exit 1
+fi
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$session"
-if [ -n "${FAKE_CLAUDE_LINES:-}" ]; then
+if [ -n "${FAKE_CLAUDE_LINES:-}" ] && [ -f "$FAKE_CLAUDE_LINES" ]; then
   cat "$FAKE_CLAUDE_LINES"
   exit 0
 fi
@@ -183,6 +198,11 @@ impl Sandbox {
             dir.join(format!(
                 "rollout-2026-09-23T10-00-00-{CODEX_SESSION_ID}.jsonl"
             )),
+        )
+        .unwrap();
+        std::fs::write(
+            self.path("codex/centaur-thread-id"),
+            format!("{CODEX_SESSION_ID}\n"),
         )
         .unwrap();
         self.set("FAKE_CODEX_THREAD_ID", CODEX_SESSION_ID);
@@ -285,19 +305,32 @@ impl Server {
 
     /// Output lines up to and including the next `turn/completed`.
     fn read_turn(&mut self) -> Vec<Value> {
+        self.read_until(|value| value["method"] == "turn/completed")
+    }
+
+    /// Output lines up to and including the line that ends the turn: its
+    /// `turn/completed`, or an `error` that is not retried.
+    fn read_until_end(&mut self) -> Vec<Value> {
+        self.read_until(|value| {
+            value["method"] == "turn/completed"
+                || (value["method"] == "error" && value["params"]["willRetry"] != true)
+        })
+    }
+
+    fn read_until(&mut self, ends: impl Fn(&Value) -> bool) -> Vec<Value> {
         let deadline = Instant::now() + TIMEOUT;
         let mut out = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let Ok(line) = self.lines.recv_timeout(remaining) else {
                 panic!(
-                    "no turn/completed in time; got {out:#?}\nstderr: {}",
+                    "no end of the turn in time; got {out:#?}\nstderr: {}",
                     self.stderr.try_iter().collect::<Vec<_>>().join("\n")
                 );
             };
             let value: Value =
                 serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON ({e}): {line}"));
-            let done = value["method"] == "turn/completed";
+            let done = ends(&value);
             out.push(value);
             if done {
                 return out;
@@ -868,8 +901,88 @@ fn real_codex_pool_exhaustion_moves_the_turn_to_claude() {
 }
 
 #[test]
-fn an_explicit_restore_resumes_the_original_session() {
-    let mut sandbox = Sandbox::new("restore");
+#[ignore = "runs the real codex binary (CODEX_BIN or codex on PATH) against a local stub"]
+fn real_codex_reports_a_converted_thread_that_it_resumes_without_history() {
+    let mut sandbox = Sandbox::new("real-empty-resume");
+    let (base_url, bodies) = stub_responses_server(|_| Reply::Answer("NO HISTORY"));
+    use_real_codex(&mut sandbox, &base_url);
+    // A valid session_meta, then lines that Codex cannot parse.
+    let meta = std::fs::read_to_string(fixture(CODEX_FIXTURE))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let dir = sandbox.path("codex/sessions/2026/09/24");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!(
+            "rollout-2026-09-24T10-00-00-{CODEX_SESSION_ID}.jsonl"
+        )),
+        format!("{meta}\n{{\"broken\":true}}\n{{\"broken\":true}}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        sandbox.path("codex/centaur-thread-id"),
+        format!("{CODEX_SESSION_ID}\n"),
+    )
+    .unwrap();
+    // The Codex child as a switch starts it.
+    sandbox.set("CENTAUR_HARNESS_SWITCHING", "0");
+    sandbox.set("CENTAUR_CODEX_THREAD_PERSIST", "1");
+    sandbox.set("CENTAUR_SESSION_RESUME_REQUIRED", "1");
+
+    let mut server = sandbox.spawn("codex");
+    server.send(user_line(PROMPT));
+    let output = server.read_until_end();
+    server.finish();
+
+    let last = output.last().unwrap();
+    assert_eq!(last["method"], "error", "{output:#?}");
+    let message = last["params"]["error"]["message"].as_str().unwrap();
+    assert!(message.contains("without its history"), "{message}");
+    // No new thread, and no model request without the history.
+    assert!(bodies.lock().unwrap().is_empty());
+    assert_eq!(
+        sandbox.read("codex/centaur-thread-id"),
+        format!("{CODEX_SESSION_ID}\n")
+    );
+}
+
+/// The rollouts under the Codex home.
+fn rollouts(sandbox: &Sandbox) -> Vec<PathBuf> {
+    walk(&sandbox.path("codex/sessions"))
+}
+
+fn journal_modes(sandbox: &Sandbox) -> Vec<Value> {
+    sandbox
+        .read("state/centaur-failover-journal.jsonl")
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["mode"].clone())
+        .collect()
+}
+
+/// Appends a turn to a Claude transcript, as Claude Code does after a turn.
+fn append_claude_turn(transcript: &Path, prompt: &str, answer: &str) {
+    let text = std::fs::read_to_string(transcript).unwrap();
+    let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    let session = last["sessionId"].clone();
+    let user = Uuid::new_v4().to_string();
+    let lines = [
+        json!({"type": "user", "uuid": user, "parentUuid": last["uuid"], "sessionId": session,
+            "cwd": last["cwd"], "message": {"role": "user", "content": prompt}}),
+        json!({"type": "assistant", "uuid": Uuid::new_v4().to_string(), "parentUuid": user,
+            "sessionId": session, "cwd": last["cwd"],
+            "message": {"id": "msg-appended", "role": "assistant", "model": "claude-opus-5-5",
+                        "content": [{"type": "text", "text": answer}]}}),
+    ];
+    let appended: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(transcript, format!("{text}{appended}")).unwrap();
+}
+
+#[test]
+fn a_requested_switch_back_converts_the_current_session() {
+    let mut sandbox = Sandbox::new("requested");
     sandbox.seed_codex_session();
     let exhausted = sandbox.lines_file("exhausted.jsonl", &codex_exhaustion(&[RETRY_NOTICE]));
     sandbox.set("FAKE_CODEX_TURN_LINES", exhausted.clone());
@@ -880,16 +993,20 @@ fn an_explicit_restore_resumes_the_original_session() {
     let [notice] = notices(&first)[..] else {
         panic!("one notice: {first:#?}");
     };
-    assert_eq!(
-        (notice["from"].as_str(), notice["to"].as_str()),
-        (Some("codex"), Some("claudecode"))
+    let claude_session = notice["sessionId"].as_str().unwrap().to_owned();
+    // The turn on Claude Code is in its transcript, and nowhere else.
+    append_claude_turn(
+        &sandbox
+            .claude_project()
+            .join(format!("{claude_session}.jsonl")),
+        "What did the test print? MARKER-ON-CLAUDE",
+        "It printed 3 passed. ANSWER-ON-CLAUDE",
     );
-    let converted = notice["sessionId"].as_str().unwrap().to_owned();
 
     // The Codex pool recovers, and the user asks for Codex again.
     std::fs::remove_file(&exhausted).unwrap();
     let mut line = user_line("Back to Codex.");
-    line["centaur"] = json!({"harness": "codex", "restore": true});
+    line["centaur"] = json!({"harness": "codex", "mode": "requested"});
     server.send(line);
     let second = server.read_turn();
     server.finish();
@@ -897,53 +1014,191 @@ fn an_explicit_restore_resumes_the_original_session() {
     let [notice] = notices(&second)[..] else {
         panic!("one notice: {second:#?}");
     };
-    assert_eq!(notice["mode"], "restore");
-    assert_eq!(notice["history"], "restored");
+    assert_eq!(notice["mode"], "requested");
+    assert_eq!(notice["history"], "converted");
     assert_eq!(
         (notice["from"].as_str(), notice["to"].as_str()),
         (Some("claudecode"), Some("codex"))
     );
-    // Codex resumes its own session, not a conversion of the Claude one.
-    assert_eq!(notice["sessionId"], CODEX_SESSION_ID);
-    assert_eq!(notice["sourceSessionId"], converted.as_str());
+    assert_eq!(notice["sourceSessionId"], claude_session.as_str());
+    // A new Codex thread with the whole history: the turns from before the
+    // failover, and the turn on Claude Code.
+    let thread_id = notice["sessionId"].as_str().unwrap();
+    assert_ne!(thread_id, CODEX_SESSION_ID);
     assert_eq!(agent_texts(&second), ["codex answer"]);
-    let resumes: Vec<String> = sandbox
+    let converted = rollouts(&sandbox)
+        .into_iter()
+        .find(|p| p.to_string_lossy().ends_with(&format!("{thread_id}.jsonl")))
+        .expect("the converted rollout");
+    let converted = std::fs::read_to_string(converted).unwrap();
+    for text in [FIRST_PROMPT, "MARKER-ON-CLAUDE", "ANSWER-ON-CLAUDE"] {
+        assert!(converted.contains(text), "{text}");
+    }
+    let resume = sandbox
         .log("codex.log")
         .lines()
-        .filter(|l| l.contains(r#""method":"thread/resume""#))
-        .map(str::to_owned)
-        .collect();
-    assert_eq!(resumes.len(), 1, "{resumes:?}");
-    assert!(resumes[0].contains(&format!(r#""threadId":"{CODEX_SESSION_ID}""#)));
+        .rfind(|l| l.contains(r#""method":"thread/resume""#))
+        .unwrap()
+        .to_owned();
+    assert!(resume.contains(thread_id), "{resume}");
+    assert_eq!(
+        sandbox.read("codex/centaur-thread-id"),
+        format!("{thread_id}\n")
+    );
+    // The original Codex session is still there, unchanged.
+    let original = rollouts(&sandbox)
+        .into_iter()
+        .find(|p| {
+            p.to_string_lossy()
+                .ends_with(&format!("{CODEX_SESSION_ID}.jsonl"))
+        })
+        .unwrap();
+    assert_eq!(
+        std::fs::read(original).unwrap(),
+        std::fs::read(fixture(CODEX_FIXTURE)).unwrap()
+    );
+    assert_eq!(journal_modes(&sandbox), ["reactive", "requested"]);
+}
+
+#[test]
+fn claude_that_cannot_read_the_conversion_sends_the_session_back_to_codex() {
+    let mut sandbox = Sandbox::new("revert-to-codex");
+    sandbox.seed_codex_session();
+    let exhausted = sandbox.lines_file("exhausted.jsonl", &codex_exhaustion(&[RETRY_NOTICE]));
+    sandbox.set("FAKE_CODEX_TURN_LINES", exhausted.clone());
+    sandbox.set("FAKE_CLAUDE_RESUME_FAILS", "1");
+
+    let mut server = sandbox.spawn("codex");
+    server.send(user_line(PROMPT));
+    let first = server.read_until_end();
+
+    let [switch, revert] = notices(&first)[..] else {
+        panic!("two notices: {first:#?}");
+    };
+    assert_eq!(switch["mode"], "reactive");
+    let claude_session = switch["sessionId"].as_str().unwrap().to_owned();
+    assert_eq!(revert["mode"], "revert");
+    assert_eq!(revert["stage"], "resume");
+    assert_eq!(revert["history"], "original");
+    assert_eq!(
+        (revert["from"].as_str(), revert["to"].as_str()),
+        (Some("claudecode"), Some("codex"))
+    );
+    assert_eq!(revert["sessionId"], CODEX_SESSION_ID);
+    assert_eq!(revert["sourceSessionId"], claude_session.as_str());
+    let reason = revert["reason"].as_str().unwrap();
+    assert!(reason.contains("No conversation found"), "{reason}");
+
+    // The turn fails as it would without the switch: the Codex pool is
+    // exhausted. The client sees why the switch did not help.
+    let last = first.last().unwrap();
+    assert_eq!(last["params"]["centaur"]["failover"]["status"], "reverted");
+    assert_eq!(
+        last["params"]["centaur"]["providerExhausted"]["signal"],
+        "poolMarker"
+    );
+    assert_eq!(sandbox.read("state/centaur-active-harness"), "codex\n");
     assert_eq!(
         sandbox.read("codex/centaur-thread-id"),
         format!("{CODEX_SESSION_ID}\n")
     );
-    assert_eq!(sandbox.read("state/centaur-active-harness"), "codex\n");
-    // No new Codex rollout was written.
-    let rollouts = std::fs::read_dir(sandbox.path("codex/sessions"))
-        .unwrap()
-        .flat_map(|year| walk(&year.unwrap().path()))
-        .count();
-    assert_eq!(rollouts, 1);
-    let journal = sandbox.read("state/centaur-failover-journal.jsonl");
-    let modes: Vec<Value> = journal
+    assert!(!sandbox.path("claude/centaur-session-id").exists());
+    // The converted session stays on disk, for a look at what went wrong.
+    assert!(
+        sandbox
+            .claude_project()
+            .join(format!("{claude_session}.jsonl"))
+            .is_file()
+    );
+
+    // The pool recovers: the next turn runs on the original Codex thread.
+    std::fs::remove_file(&exhausted).unwrap();
+    server.send(user_line("Try again."));
+    let second = server.read_turn();
+    server.finish();
+    assert!(notices(&second).is_empty(), "{second:#?}");
+    assert_eq!(agent_texts(&second), ["codex answer"]);
+    let resume = sandbox
+        .log("codex.log")
         .lines()
-        .map(|l| serde_json::from_str::<Value>(l).unwrap()["mode"].clone())
-        .collect();
-    assert_eq!(modes, ["reactive", "restore"]);
+        .rfind(|l| l.contains(r#""method":"thread/resume""#))
+        .unwrap()
+        .to_owned();
+    assert!(resume.contains(CODEX_SESSION_ID), "{resume}");
+    assert_eq!(rollouts(&sandbox).len(), 1);
+    assert_eq!(journal_modes(&sandbox), ["reactive", "revert"]);
 }
 
 #[test]
-fn a_restore_without_the_original_converts_instead() {
-    let sandbox = Sandbox::new("restore-missing");
+fn codex_that_resumes_without_the_history_sends_the_session_back_to_claude() {
+    let mut sandbox = Sandbox::new("revert-to-claude");
     sandbox.seed_claude_session();
-    std::fs::write(sandbox.path("state/centaur-active-harness"), "claudecode\n").unwrap();
+    let exhausted = sandbox.lines_file("exhausted.jsonl", &claude_exhaustion(CLAUDE_SESSION_ID));
+    sandbox.set("FAKE_CLAUDE_LINES", exhausted.clone());
+    sandbox.set("FAKE_CODEX_RESUME_EMPTY", "1");
 
-    // No journal: nothing to restore, so the Claude session is converted.
     let mut server = sandbox.spawn("claude-code");
-    let mut line = user_line("Go to Codex.");
-    line["centaur"] = json!({"harness": "codex", "restore": true});
+    server.send(user_line(PROMPT));
+    let first = server.read_until_end();
+
+    let [switch, revert] = notices(&first)[..] else {
+        panic!("two notices: {first:#?}");
+    };
+    let thread_id = switch["sessionId"].as_str().unwrap().to_owned();
+    assert_eq!(revert["mode"], "revert");
+    assert_eq!(
+        (revert["from"].as_str(), revert["to"].as_str()),
+        (Some("codex"), Some("claudecode"))
+    );
+    assert_eq!(revert["sessionId"], CLAUDE_SESSION_ID);
+    assert!(
+        revert["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("resumed session {thread_id} without its history"))
+    );
+    // Codex did not start a new thread without the history.
+    assert!(
+        !sandbox
+            .log("codex.log")
+            .contains(r#""method":"thread/start""#)
+    );
+    let last = first.last().unwrap();
+    assert_eq!(last["method"], "error");
+    assert_eq!(last["params"]["centaur"]["failover"]["status"], "reverted");
+    assert_eq!(sandbox.read("state/centaur-active-harness"), "claudecode\n");
+    assert_eq!(
+        sandbox.read("claude/centaur-session-id"),
+        format!("{CLAUDE_SESSION_ID}\n")
+    );
+    assert!(!sandbox.path("codex/centaur-thread-id").exists());
+
+    // The pool recovers: Claude Code resumes its own session.
+    std::fs::remove_file(&exhausted).unwrap();
+    server.send(user_line("Try again."));
+    let second = server.read_turn();
+    server.finish();
+    assert!(notices(&second).is_empty(), "{second:#?}");
+    assert_eq!(agent_texts(&second), ["claude answer"]);
+    let claude = sandbox.log("claude.log");
+    let last_args = claude.lines().rfind(|l| l.starts_with("ARGS")).unwrap();
+    assert!(
+        last_args.contains(&format!("--resume {CLAUDE_SESSION_ID}")),
+        "{last_args}"
+    );
+}
+
+#[test]
+fn a_session_that_cannot_move_stays_and_says_so() {
+    let mut sandbox = Sandbox::new("stay");
+    sandbox.seed_codex_session();
+    // The Claude project directory cannot be created.
+    std::fs::create_dir_all(sandbox.path("claude/projects")).unwrap();
+    std::fs::write(sandbox.claude_project(), "not a directory").unwrap();
+
+    let mut server = sandbox.spawn("codex");
+    let mut line = user_line("Switch to Claude Code.");
+    line["centaur"] = json!({"harness": "claudecode", "mode": "requested"});
     server.send(line);
     let output = server.read_turn();
     server.finish();
@@ -951,9 +1206,17 @@ fn a_restore_without_the_original_converts_instead() {
     let [notice] = notices(&output)[..] else {
         panic!("one notice: {output:#?}");
     };
-    assert_eq!(notice["mode"], "proactive");
-    assert_eq!(notice["restore"], "unavailable");
-    assert_eq!(notice["history"], "converted");
-    assert_eq!(notice["sourceSessionId"], CLAUDE_SESSION_ID);
+    assert_eq!(notice["mode"], "revert");
+    assert_eq!(notice["stage"], "convert");
+    assert_eq!(
+        (notice["from"].as_str(), notice["to"].as_str()),
+        (Some("claudecode"), Some("codex"))
+    );
+    assert_eq!(notice["sessionId"], CODEX_SESSION_ID);
+    assert!(notice["reason"].as_str().unwrap().contains("cannot write"));
+    // The turn runs on Codex, with its own session.
     assert_eq!(agent_texts(&output), ["codex answer"]);
+    assert!(sandbox.log("claude.log").is_empty());
+    assert_eq!(sandbox.read("state/centaur-active-harness"), "codex\n");
+    assert_eq!(journal_modes(&sandbox), ["revert"]);
 }

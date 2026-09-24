@@ -336,18 +336,32 @@ exhausted providers with `GET /api/provider-health`:
 `{"exhausted": {"codex": {"until": "<RFC 3339>", "reset_at": <Unix seconds>}}}`.
 A harness that is not listed is not known to be exhausted.
 
-#### Going back to the original session
+#### One transcript, and a backup
 
-A switch never changes or deletes the original native session: the new
-harness gets a new, converted copy. Each switch adds a line to
-`$CENTAUR_STATE_DIR/centaur-failover-journal.jsonl` with the session ids and
-files on both sides. A request with `harness_explicit: true` for the harness
-that the session left (for example `--codex` in Slack) goes back to that
-harness's own session from before the switch, in the same sandbox. The turns
-made on the other harness are not in its history, and the workspace keeps
-their changes. This works while the sandbox of the switch serves the
-session, because its state volume holds the original. After the sandbox is
-replaced, the request restarts the session on that harness, as before.
+A session has one transcript: the native session of the harness that it runs
+on. Each switch converts that transcript for the other harness, so the history
+of every turn goes with the session, also when it switches back. A request
+with `harness_explicit: true` for the harness that the session left (for
+example `--codex` in Slack) moves the session back in the same sandbox, with a
+conversion of the current transcript. After the sandbox is replaced, the
+request restarts the session on that harness, as before.
+
+A conversion never changes or deletes the session that it reads. That session
+is the backup for a conversion that the other harness cannot read:
+
+- Before a switch, the harness server checks the converted session. Codex
+  must parse every rollout line, and the Claude Code session must be one
+  unbroken chain of messages. If the check fails, the session stays on its
+  harness.
+- After a switch, the new harness must resume the converted session. It does
+  not start a new session without the history. If its first turn fails
+  before it reaches the model, the session goes back to the harness and the
+  session from before the switch, and the turn fails with the reason.
+
+Both cases send a `session.provider_failover` event with `mode: "revert"`,
+and Slack shows "Back on Codex" or "Stayed on Codex". Each switch and each
+revert adds a line to `$CENTAUR_STATE_DIR/centaur-failover-journal.jsonl`
+with the session ids and files on both sides.
 
 #### Provider health checks
 

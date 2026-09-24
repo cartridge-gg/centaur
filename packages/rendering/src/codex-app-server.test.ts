@@ -944,23 +944,63 @@ describe('CodexAppServerRendererEventMapper provider exhaustion', () => {
     })
   })
 
-  it('shows a restore of the original session', () => {
+  it('shows a switch that the user asked for', () => {
     const mapper = new CodexAppServerRendererEventMapper()
     const events = mapper.process({
       method: 'centaur/providerFailover',
-      params: { from: 'claudecode', to: 'codex', mode: 'restore', history: 'restored' }
+      params: { from: 'claudecode', to: 'codex', mode: 'requested', history: 'converted' }
     })
     expect(events.find(event => event.type === 'renderer.task.update')).toMatchObject({
       task: {
-        title: 'Restored the Codex session',
+        title: 'Switched to Codex',
+        details: [{ type: 'text', text: 'As requested, this session continues on Codex with its history.' }]
+      }
+    })
+  })
+
+  it('shows a revert to the session from before the switch', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const switched = { from: 'codex', to: 'claudecode', mode: 'reactive', history: 'converted' }
+    const reverted = {
+      from: 'claudecode',
+      to: 'codex',
+      mode: 'revert',
+      stage: 'resume',
+      history: 'original',
+      reason: 'No conversation found with session ID: 4dac5b9a'
+    }
+    const events = [
+      ...mapper.process({ method: 'centaur/providerFailover', params: switched }),
+      ...mapper.process({ method: 'centaur/providerFailover', params: reverted })
+    ]
+    const titles = events
+      .filter(event => event.type === 'renderer.task.update')
+      .map(event => (event as any).task.title)
+    // Each update lists every task so far.
+    expect([...new Set(titles)]).toEqual(['Switched to Claude Code', 'Back on Codex'])
+    expect(events.at(-1)).toMatchObject({
+      task: {
         details: [
           {
             type: 'text',
-            text: expect.stringContaining('its own history from before the switch to Claude Code')
+            text:
+              'Claude Code could not read the converted session (No conversation found with session ID: 4dac5b9a), ' +
+              'so this session is back on Codex with its own history.'
           }
         ]
       }
     })
+  })
+
+  it('shows a session that could not move', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      eventKind: 'session.provider_failover',
+      data: { from: 'claudecode', to: 'codex', mode: 'revert', stage: 'convert', reason: 'x'.repeat(300) }
+    })
+    const task = (events.find(event => event.type === 'renderer.task.update') as any).task
+    expect(task.title).toBe('Stayed on Codex')
+    expect(task.details[0].text).toMatch(/^The session could not be converted for Claude Code \(x{199}…\), so it stays on Codex\.$/)
   })
 
   it('keeps the upstream text for other failures', () => {
