@@ -1648,15 +1648,18 @@ version = "0.1.0"
 dependencies = [
  "allocative",
  "base64 0.23.1",
+ "chrono",
  "clap",
  "image",
  "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "regex",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
+ "session-transfer",
  "shell-words",
  "thiserror 2.0.21",
  "tokio",
@@ -4342,6 +4345,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "session-transfer"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "regex",
+ "ryu",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
 ]
 
 [[package]]

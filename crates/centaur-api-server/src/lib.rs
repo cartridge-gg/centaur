@@ -249,6 +249,10 @@ pub(crate) mod tests {
                 .uri("/api/workflows/runs")
                 .body(Body::empty())
                 .unwrap(),
+            Request::builder()
+                .uri("/api/provider-health")
+                .body(Body::empty())
+                .unwrap(),
         ] {
             let response = build_router_with_app_state(AppState::unready(test_auth()))
                 .oneshot(request)
@@ -520,6 +524,31 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), expected, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn any_caller_reads_provider_health() {
+        // Every authenticated credential reads it; an anonymous caller does not.
+        for token in [
+            Some("test-slackbot-key".to_owned()),
+            Some(admin_token()),
+            None,
+        ] {
+            let mut request = Request::builder().uri("/api/provider-health");
+            if let Some(token) = &token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            if token.is_some() {
+                assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+                assert_ne!(response.status(), StatusCode::FORBIDDEN);
+            } else {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
         }
     }
 

@@ -116,6 +116,7 @@ async fn main() -> Result<()> {
                 })),
                 on_harness_conflict: None,
                 principal: None,
+                harness_explicit: false,
             },
         )
         .await

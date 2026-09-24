@@ -572,7 +572,8 @@ export async function forwardToSessionApi(
       input.threadId,
       input.harnessType,
       input.personaId,
-      sessionRequesterMessage(input)
+      sessionRequesterMessage(input),
+      input.harnessExplicit
     ),
     sessionApiTimeoutMs(options),
     'create session'
@@ -584,6 +585,7 @@ export async function forwardToSessionApi(
   traceLog(options, 'slackbotv2_session_create_complete', input.trace, {
     harness_type: created.harnessType,
     harness_switched: created.harnessSwitched,
+    provider_failover_from: created.providerFailover?.from,
     persona_id: created.personaId,
     unavailable_requested_persona_id: created.unavailableRequestedPersonaId,
     phase_ms: elapsedMs(createStartedAtMs)
@@ -630,7 +632,8 @@ export async function forwardToSessionApi(
       input.metadataModel,
       input.metadataHarnessType,
       input.proactiveContext,
-      input.generativeUiNote
+      input.generativeUiNote,
+      input.providerFailover
     ),
     sessionApiTimeoutMs(options),
     'execute session'
@@ -950,6 +953,11 @@ type CreateSessionOutcome = {
   personaModel?: string
   /** The API restarted the thread onto the requested harness. */
   harnessSwitched: boolean
+  /**
+   * The thread left the requested harness in a provider failover and stays
+   * on `harnessType`.
+   */
+  providerFailover?: { from: string; to: string }
 }
 
 async function createSession(
@@ -957,7 +965,8 @@ async function createSession(
   threadId: string,
   harnessType?: string,
   personaId?: string,
-  message?: SlackbotV2ApiMessage
+  message?: SlackbotV2ApiMessage,
+  harnessExplicit?: boolean
 ): Promise<CreateSessionOutcome> {
   const requested = harnessType ?? options.defaultHarnessType ?? DEFAULT_HARNESS_TYPE
   if (!isHarnessEnabled(requested, options.enabledHarnesses)) {
@@ -965,13 +974,15 @@ async function createSession(
   }
   // A sticky --claude/--amp/--codex selection restarts a thread
   // pinned to another harness; the implicit default never forces a switch.
+  // After a provider failover, only a harness named in this message does.
   const response = await postCreateSession(
     options,
     threadId,
     requested,
     personaId,
     message,
-    harnessType ? 'restart' : undefined
+    harnessType ? 'restart' : undefined,
+    harnessExplicit === true && Boolean(harnessType)
   )
   if (response.ok) {
     return sessionOutcomeFromResponse(response)
@@ -1016,7 +1027,8 @@ async function postCreateSession(
   harnessType: string,
   personaId?: string,
   message?: SlackbotV2ApiMessage,
-  onHarnessConflict?: 'reject' | 'restart'
+  onHarnessConflict?: 'reject' | 'restart',
+  harnessExplicit = false
 ): Promise<Response> {
   const fetchFn = options.fetch ?? fetch
   // The conversation name becomes the session principal's display name in
@@ -1038,7 +1050,8 @@ async function postCreateSession(
       ...(conversationName ? { slack_conversation_name: conversationName } : {})
     },
     ...(personaId ? { persona_id: personaId } : {}),
-    ...(onHarnessConflict ? { on_harness_conflict: onHarnessConflict } : {})
+    ...(onHarnessConflict ? { on_harness_conflict: onHarnessConflict } : {}),
+    ...(onHarnessConflict === 'restart' && harnessExplicit ? { harness_explicit: true } : {})
   }
   return fetchSessionApi(
     fetchFn,
@@ -1070,8 +1083,14 @@ async function sessionOutcomeFromResponse(response: Response): Promise<CreateSes
       'unavailable_requested_persona_id'
     )
     const personaModel = rawSlackString(payload, 'persona_model')
+    const failover = payloadIsObject ? payload.provider_failover : undefined
+    const failoverFrom = rawSlackString(failover, 'from')
+    const failoverTo = rawSlackString(failover, 'to')
     return {
       harnessSwitched: payloadIsObject && payload.harness_switched === true,
+      ...(failoverFrom && failoverTo
+        ? { providerFailover: { from: failoverFrom, to: failoverTo } }
+        : {}),
       ...(harnessType ? { harnessType } : {}),
       ...(personaId !== undefined ? { personaId } : {}),
       ...(unavailableRequestedPersonaId ? { unavailableRequestedPersonaId } : {}),
@@ -1536,7 +1555,8 @@ async function executeSession(
   metadataModel?: string,
   metadataHarnessType?: string,
   proactiveContext?: string,
-  generativeUiNote?: string
+  generativeUiNote?: string,
+  providerFailover?: boolean
 ): Promise<SlackbotV2ExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const requesterIdentity = await resolveRequesterIdentity(options, message)
@@ -1555,7 +1575,9 @@ async function executeSession(
       {
         action: 'execute',
         ...(recordedModel ? { model: recordedModel } : {}),
-        ...(metadataHarnessType ? { harness_type: metadataHarnessType } : {})
+        ...(metadataHarnessType ? { harness_type: metadataHarnessType } : {}),
+        // Read by api-rs: the session stays on its harness if its provider fails.
+        ...(providerFailover === false ? { provider_failover: false } : {})
       },
       requesterIdentity
     ),
@@ -2214,7 +2236,9 @@ async function* parseSessionEventStream(
       event.event === 'session.activity_summary' ||
       event.event === SESSION_PROGRESS_UPDATE_EVENT ||
       event.event === SESSION_STEERING_DELIVERED_EVENT ||
-      event.event === SESSION_STEERING_FAILED_EVENT
+      event.event === SESSION_STEERING_FAILED_EVENT ||
+      // A harness switch: the renderer shows it as an activity task.
+      event.event === 'session.provider_failover'
     ) {
       yield {
         data: sessionEventData(event),

@@ -58,8 +58,8 @@ use crate::{
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
         ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
         InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
-        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
-        stream_error_sse,
+        OnHarnessConflict, ProviderHealthResponse, SessionContextResponse, SessionSseEvent,
+        SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -329,6 +329,11 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
                 (Method::PUT, Capability::SlackExternalTeamsWrite),
             ],
         )
+        .capability(
+            "/api/provider-health",
+            get(get_provider_health),
+            Capability::AnyCaller,
+        )
         .merge_guarded(slack_proxy_router(), Capability::SlackProxy)
         .methods(
             "/api/workflows/schedules",
@@ -567,6 +572,9 @@ async fn create_or_get_session(
     let harness_type = request.harness_type;
     let runtime = state.runtime()?;
     let on_harness_conflict = match request.on_harness_conflict {
+        Some(OnHarnessConflict::Restart) if request.harness_explicit => {
+            HarnessConflictPolicy::RestartExplicit
+        }
         Some(OnHarnessConflict::Restart) => HarnessConflictPolicy::Restart,
         Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
     };
@@ -614,7 +622,30 @@ async fn create_or_get_session(
         harness_switched: outcome.harness_switched,
         unavailable_requested_persona_id: outcome.unavailable_requested_persona_id,
         persona_model,
+        provider_failover: outcome.provider_failover,
     }))
+}
+
+async fn get_provider_health(
+    State(state): State<AppState>,
+) -> Result<Json<ProviderHealthResponse>, ApiError> {
+    let runtime = state.runtime()?;
+    let exhausted = runtime
+        .exhausted_providers()
+        .await?
+        .into_iter()
+        .map(|(harness, until)| {
+            let until = time::OffsetDateTime::from(until);
+            let provider = crate::types::ExhaustedProvider {
+                until: until
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                reset_at: until.unix_timestamp(),
+            };
+            (harness, provider)
+        })
+        .collect();
+    Ok(Json(ProviderHealthResponse { exhausted }))
 }
 
 async fn get_session_context(

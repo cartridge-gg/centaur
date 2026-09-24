@@ -1,0 +1,14 @@
+{
+  "direction": "codex-to-claude",
+  "fixture": "tests/fixtures/codex/sessport/rollout-2025-06-01T10-00-00-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl",
+  "options": {
+    "cwd": "/work/no-cwd",
+    "keepThinking": false,
+    "redact": false
+  },
+  "expected": {
+    "id": "aaaaaaaa-0000-4000-8000-000000000000",
+    "path": "/claude-home/projects/-work-no-cwd/aaaaaaaa-0000-4000-8000-000000000000.jsonl",
+    "resumeCommand": "cd /work/no-cwd && claude --resume aaaaaaaa-0000-4000-8000-000000000000"
+  }
+}

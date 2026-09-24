@@ -422,6 +422,9 @@ pub enum DynamicToolCallOutputContentItem {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "method", content = "params")]
+// session-transfer enables serde_json's `preserve_order`, which makes the
+// `Value` fields of `Thread` large enough to trip this lint.
+#[allow(clippy::large_enum_variant)]
 pub enum ServerNotification {
     #[serde(rename = "error")]
     Error(ErrorNotification),

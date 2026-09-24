@@ -66,6 +66,9 @@ pub(crate) enum Capability {
     SandboxOauthApps,
     // A sandbox credential that may act as the linked active Console admin.
     ConsoleDelegate,
+    /// Required by routes every authenticated caller may read (provider
+    /// health). Every credential satisfies it; no token grants it.
+    AnyCaller,
 }
 
 impl Capability {
@@ -117,6 +120,7 @@ impl Capability {
             Self::SandboxTasks => "sandbox.tasks",
             Self::SandboxOauthApps => "sandbox.oauth_apps",
             Self::ConsoleDelegate => "console.delegate",
+            Self::AnyCaller => "any_caller",
         }
     }
 
@@ -198,7 +202,8 @@ impl Capability {
             | Self::WorkflowsActions
             | Self::SlackProxy
             | Self::SlackExternalTeamsRead
-            | Self::SlackExternalTeamsWrite => Surface::ApiRs,
+            | Self::SlackExternalTeamsWrite
+            | Self::AnyCaller => Surface::ApiRs,
         }
     }
 }
@@ -297,9 +302,11 @@ impl AuthenticatedCaller {
     }
 
     pub(crate) fn has_capability(&self, capability: Capability) -> bool {
-        self.capabilities
-            .iter()
-            .any(|granted| granted.satisfies(capability))
+        capability == Capability::AnyCaller
+            || self
+                .capabilities
+                .iter()
+                .any(|granted| granted.satisfies(capability))
     }
 
     /// Adds capabilities a credential's non-token context grants.

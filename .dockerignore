@@ -84,3 +84,7 @@ logs/
 # Environment (secrets)
 .env
 .env.*
+
+# session-transfer fixtures and golden files are test data, not image inputs.
+crates/session-transfer/tests/
+crates/session-transfer/scripts/
