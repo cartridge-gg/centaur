@@ -78,6 +78,11 @@ export type SlackbotV2CreateSessionRequest = {
   on_harness_conflict?: 'reject' | 'restart'
   /** Persona requested when the thread is created; the API pins the first persisted value. */
   persona_id?: string
+  /**
+   * The harness was named in this message. Only then does a restart move a
+   * thread back to the harness it left in a provider failover.
+   */
+  harness_explicit?: boolean
 }
 
 export type SlackbotV2ExecuteSessionRequest = {
@@ -276,6 +281,8 @@ export type SlackbotV2ThreadState = {
   personaId?: string | null
   /** Last thread-level model provider selected by Slack flags. Null clears persisted state. */
   provider?: string | null
+  /** Last thread-level --no-failover (false) or --failover (true) flag. */
+  providerFailover?: boolean | null
   renderObligation?: SlackbotV2RenderObligation | null
   /**
    * When a user last stopped this thread (ms). An execution still being
@@ -334,6 +341,10 @@ export type ForwardSessionInput = {
   provider?: string
   /** Per-turn reasoning effort parsed from the `-rsn` flag (Codex/Nanocodex/Claude Code). */
   reasoning?: string
+  /** The harness was named in this message, not only sticky or a channel default. */
+  harnessExplicit?: boolean
+  /** False: the session stays on its harness when its model provider is exhausted. */
+  providerFailover?: boolean
   onEventId(eventId: number): void
   openStream: boolean
   threadId: string

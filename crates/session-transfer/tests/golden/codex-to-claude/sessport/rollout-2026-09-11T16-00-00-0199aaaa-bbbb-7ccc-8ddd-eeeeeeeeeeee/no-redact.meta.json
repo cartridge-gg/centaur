@@ -1,0 +1,13 @@
+{
+  "direction": "codex-to-claude",
+  "fixture": "tests/fixtures/codex/sessport/rollout-2026-09-11T16-00-00-0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee.jsonl",
+  "options": {
+    "keepThinking": false,
+    "redact": false
+  },
+  "expected": {
+    "id": "aaaaaaaa-0000-4000-8000-000000000000",
+    "path": "/claude-home/projects/-Users-dev-api/aaaaaaaa-0000-4000-8000-000000000000.jsonl",
+    "resumeCommand": "cd /Users/dev/api && claude --resume aaaaaaaa-0000-4000-8000-000000000000"
+  }
+}

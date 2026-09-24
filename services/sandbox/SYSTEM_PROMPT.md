@@ -29,6 +29,7 @@
 |Persona: use `--persona <persona-id>` or `--persona=<persona-id>`. Bare flags such as `--invest` are not persona selectors. A persona is pinned for the lifetime of that thread; start a new thread to change it.
 |Providers and effort: `--meta` selects Codex with the Meta provider, `--bedrock` selects Codex with the Bedrock provider, `--provider <provider-id>` selects a configured Codex provider (pair with `--model` unless it has a default), and `-rsn <effort>` sets Codex or Claude Code reasoning effort for that turn.
 |Examples: `--claude --model=fable fix this`, `--codex --model=gpt-5.2 investigate this`. Changing the harness on an existing thread may restart it on the requested harness.
+|Provider failover: when the model provider of a Codex or Claude Code thread has no capacity left, the deployment can move the thread to the other of the two harnesses with its history, and the thread stays there. `--no-failover` keeps the thread on its harness; `--failover` allows the switch again.
 
 [Research and Grounding]
 |For specialized scientific or technical strategy outside the codebase, do at least one targeted external-source pass (official docs, papers, source repos, `websearch search`, `websearch deep-research`) before a confident recommendation, and cite sources that matter. Skip this only for explicitly requested brainstorming, and say so.

@@ -249,7 +249,7 @@ describe('Slack home team API metadata', () => {
 })
 
 describe('session event streaming', () => {
-  test('passes activity summary and steering events through to the renderer source stream', async () => {
+  test('passes activity summary, steering, and failover events through to the renderer source stream', async () => {
     const encoded = new TextEncoder().encode(
       [
         'id: 1',
@@ -261,6 +261,10 @@ describe('session event streaming', () => {
         'data: {"execution_id":"exec-1","input_line_count":1}',
         '',
         'id: 3',
+        'event: session.provider_failover',
+        'data: {"from":"codex","to":"claudecode","mode":"proactive"}',
+        '',
+        'id: 4',
         'event: session.execution_completed',
         'data: {"result_text":"done"}',
         '',
@@ -299,12 +303,18 @@ describe('session event streaming', () => {
       eventId: 2,
       eventKind: 'session.steering_delivered'
     })
-    expect(events[2]).toMatchObject({
-      event: 'session.execution_completed',
+    expect(events[2]).toEqual({
+      data: { from: 'codex', to: 'claudecode', mode: 'proactive' },
+      event: 'session.provider_failover',
       eventId: 3,
+      eventKind: 'session.provider_failover'
+    })
+    expect(events[3]).toMatchObject({
+      event: 'session.execution_completed',
+      eventId: 4,
       eventKind: 'session.execution_completed'
     })
-    expect(seenEventIds).toEqual([1, 2, 3])
+    expect(seenEventIds).toEqual([1, 2, 3, 4])
   })
 
   test('uses interrupted wording for cancelled executions without error text', async () => {
@@ -790,6 +800,87 @@ describe('forwardToSessionApi overrides', () => {
 })
 
 describe('forwardToSessionApi harness restart', () => {
+  test('explicit harness override requests restart on conflict', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage('switch me'), { harnessType: 'codex' })
+    )
+    const create = requests.find(request => request.url.endsWith('.000100'))
+    expect((create?.body as { on_harness_conflict?: string }).on_harness_conflict).toBe('restart')
+  })
+
+  test('only a harness named in the message is explicit', async () => {
+    const sticky = fakeApi()
+    await forwardToSessionApi(
+      options(sticky.fetchFn),
+      forwardInput(apiMessage('continue'), { harnessType: 'codex' })
+    )
+    const stickyCreate = sticky.requests.find(request => request.url.endsWith('.000100'))
+    expect('harness_explicit' in (stickyCreate?.body as object)).toBe(false)
+
+    const explicit = fakeApi()
+    await forwardToSessionApi(
+      options(explicit.fetchFn),
+      forwardInput(apiMessage('switch me'), { harnessType: 'codex', harnessExplicit: true })
+    )
+    const explicitCreate = explicit.requests.find(request => request.url.endsWith('.000100'))
+    expect(explicitCreate?.body).toMatchObject({
+      harness_type: 'codex',
+      on_harness_conflict: 'restart',
+      harness_explicit: true
+    })
+  })
+
+  test('reports a session that stays on the harness it failed over to', async () => {
+    const { fetchFn } = fakeApi({
+      createSession: [
+        {
+          body: {
+            harness_switched: false,
+            harness_type: 'claudecode',
+            provider_failover: { from: 'codex', to: 'claudecode', mode: 'reactive' }
+          },
+          status: 200
+        }
+      ]
+    })
+    let failover: { from: string; to: string } | undefined
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage('continue'), { harnessType: 'codex' }),
+      {
+        onSessionCreated: async outcome => {
+          failover = outcome.providerFailover
+        }
+      }
+    )
+    expect(failover).toEqual({ from: 'codex', to: 'claudecode' })
+  })
+
+  test('--no-failover turns failover off in the execute metadata', async () => {
+    const off = fakeApi()
+    await forwardToSessionApi(
+      options(off.fetchFn),
+      forwardInput(apiMessage('hi'), { providerFailover: false })
+    )
+    expect(executeBody(off.requests).metadata).toMatchObject({ provider_failover: false })
+
+    const on = fakeApi()
+    await forwardToSessionApi(
+      options(on.fetchFn),
+      forwardInput(apiMessage('hi'), { providerFailover: true })
+    )
+    expect('provider_failover' in (executeBody(on.requests).metadata as object)).toBe(false)
+  })
+
+  test('default create does not request restart', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('hi')))
+    const create = requests.find(request => request.url.endsWith('.000100'))
+    expect('on_harness_conflict' in (create?.body as object)).toBe(false)
+  })
+
   test('harness_switched response fires onSessionRestarted and prepends the preamble', async () => {
     const { fetchFn, requests } = fakeApi({
       createSession: [{ body: { ok: true, harness_switched: true }, status: 200 }]

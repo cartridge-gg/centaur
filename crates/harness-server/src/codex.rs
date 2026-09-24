@@ -73,6 +73,12 @@ impl CodexHarnessServer {
     }
 }
 
+/// The model provider of a new Codex thread without a per-turn override.
+pub(crate) fn default_model_provider() -> String {
+    let config = CodexHarnessServer::codex();
+    config.model_provider_for(None, config.default_model().as_deref())
+}
+
 impl AppServerRuntime for CodexHarnessServer {
     fn run_stdio(&self) -> Result<()> {
         let bin = codex_bin();
@@ -535,12 +541,7 @@ fn thread_persistence_enabled() -> bool {
     env_flag_enabled(env::var(CODEX_THREAD_PERSIST_ENV).ok().as_deref())
 }
 
-fn env_flag_enabled(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
-}
+use crate::util::env_flag_enabled;
 
 fn persisted_thread_path() -> PathBuf {
     env::var_os("CODEX_HOME")
@@ -668,12 +669,28 @@ fn start_or_resume_thread<W: Write>(
                     if let Some(path) = persisted_path.as_deref() {
                         clear_persisted_thread_id(path);
                     }
-                    start_thread(codex, stdout, request_id, &cwd, model, model_provider, traceparent)?
+                    start_thread(
+                        codex,
+                        stdout,
+                        request_id,
+                        &cwd,
+                        model,
+                        model_provider,
+                        traceparent,
+                    )?
                 }
                 Err(error) => return Err(error),
             }
         }
-        None => start_thread(codex, stdout, request_id, &cwd, model, model_provider, traceparent)?,
+        None => start_thread(
+            codex,
+            stdout,
+            request_id,
+            &cwd,
+            model,
+            model_provider,
+            traceparent,
+        )?,
     };
     if let Some(path) = persisted_path.as_deref()
         && let Err(error) = write_persisted_thread_id(path, &started.id)

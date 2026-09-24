@@ -3,6 +3,13 @@ use serde_json::Value;
 use crate::Result;
 use crate::protocol::{JSONRPCMessage, JSONRPCNotification, ServerNotification};
 
+pub fn is_known_untyped_server_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "remoteControl/status/changed" | crate::switch::FAILOVER_METHOD
+    )
+}
+
 pub fn notification_to_jsonrpc(notification: &ServerNotification) -> Result<JSONRPCNotification> {
     let value = serde_json::to_value(notification)?;
     Ok(serde_json::from_value(value)?)

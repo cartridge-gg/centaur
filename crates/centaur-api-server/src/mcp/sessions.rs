@@ -2434,10 +2434,12 @@ mod tests {
             .await
             .expect("connect test db");
         MIGRATED
-            .get_or_init(|| async { store
+            .get_or_init(|| async {
+                store
                     .run_migrations(centaur_session_sqlx::TextSearchBackend::Postgres)
                     .await
-                    .expect("run migrations") })
+                    .expect("run migrations")
+            })
             .await;
         Some(store)
     }

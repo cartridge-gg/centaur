@@ -1,0 +1,13 @@
+{
+  "direction": "codex-to-claude",
+  "fixture": "tests/fixtures/codex/recorded-codex-0.154.jsonl",
+  "options": {
+    "keepThinking": false,
+    "redact": true
+  },
+  "expected": {
+    "id": "aaaaaaaa-0000-4000-8000-000000000000",
+    "path": "/claude-home/projects/-work-app/aaaaaaaa-0000-4000-8000-000000000000.jsonl",
+    "resumeCommand": "cd /work/app && claude --resume aaaaaaaa-0000-4000-8000-000000000000"
+  }
+}

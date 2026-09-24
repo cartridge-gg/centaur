@@ -56,8 +56,8 @@ use crate::{
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
         ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
         InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
-        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
-        stream_error_sse,
+        OnHarnessConflict, ProviderHealthResponse, SessionContextResponse, SessionSseEvent,
+        SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -233,6 +233,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             "/api/slack/external-team-ids",
             get(get_slack_external_team_ids).put(replace_slack_external_team_ids),
         )
+        .route("/api/provider-health", get(get_provider_health))
         .merge(slack_proxy_router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route(
@@ -394,6 +395,9 @@ async fn metrics(State(state): State<AppState>) -> Response {
 enum RouteAccess {
     Capability(Capability),
     PrincipalOnly,
+    /// Every authenticated caller, including a sandbox principal without
+    /// session access.
+    AnyCaller,
 }
 
 async fn authorize_api_request(
@@ -430,6 +434,7 @@ async fn authorize_api_request(
     let allowed = match access {
         RouteAccess::Capability(capability) => caller.has_capability(capability),
         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
+        RouteAccess::AnyCaller => true,
     };
     if !allowed {
         record_api_authentication(caller.class().as_str(), "forbidden");
@@ -490,6 +495,9 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         | (&Method::POST, "/api/session/{thread_key}/pause") => {
             capability(Capability::SandboxesDrain)
         }
+        // Harness names and reset times only. Sandboxes read it to avoid an
+        // exhausted provider before they start a request.
+        (&Method::GET, "/api/provider-health") => Some(RouteAccess::AnyCaller),
         (&Method::GET, "/api/workflows/schedules")
         | (&Method::GET, "/api/workflows/runs")
         | (&Method::GET, "/api/workflows/runs/{run_id}") => capability(Capability::WorkflowsRead),
@@ -579,6 +587,9 @@ async fn create_or_get_session(
     let harness_type = request.harness_type;
     let runtime = state.runtime()?;
     let on_harness_conflict = match request.on_harness_conflict {
+        Some(OnHarnessConflict::Restart) if request.harness_explicit => {
+            HarnessConflictPolicy::RestartExplicit
+        }
         Some(OnHarnessConflict::Restart) => HarnessConflictPolicy::Restart,
         Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
     };
@@ -597,7 +608,30 @@ async fn create_or_get_session(
         harness_switched: outcome.harness_switched,
         unavailable_requested_persona_id: outcome.unavailable_requested_persona_id,
         persona_model,
+        provider_failover: outcome.provider_failover,
     }))
+}
+
+async fn get_provider_health(
+    State(state): State<AppState>,
+) -> Result<Json<ProviderHealthResponse>, ApiError> {
+    let runtime = state.runtime()?;
+    let exhausted = runtime
+        .exhausted_providers()
+        .await?
+        .into_iter()
+        .map(|(harness, until)| {
+            let until = OffsetDateTime::from(until);
+            let provider = crate::types::ExhaustedProvider {
+                until: until
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                reset_at: until.unix_timestamp(),
+            };
+            (harness, provider)
+        })
+        .collect();
+    Ok(Json(ProviderHealthResponse { exhausted }))
 }
 
 async fn get_session_context(

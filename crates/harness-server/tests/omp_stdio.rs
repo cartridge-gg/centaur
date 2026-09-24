@@ -19,7 +19,10 @@ fn fake_omp(dir: &std::path::Path) -> PathBuf {
 printf '%s|%s\n' "$$" "$*" >> '@DIR@/argv'
 while IFS= read -r line; do
     printf '%s\n' "$line" >> '@DIR@/stdin'
-    kind=${line##*\"type\":\"}
+    # Nested image blocks also carry a "type"; key order follows serde_json's
+    # features, so drop them before reading the command type.
+    top=$(printf '%s\n' "$line" | sed 's/"images":\[[^]]*\]//')
+    kind=${top##*\"type\":\"}
     kind=${kind%%\"*}
     if [ "$OMP_TEST_FAULT" = "$kind" ]; then
         printf '{"type":"response","id":"centaur-%s","command":"%s","success":false,"error":"startup rejected"}\n' "$kind" "$kind"
