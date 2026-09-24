@@ -22,20 +22,20 @@ Call results include `stdout`, `stderr`, `exit_status`, and `timed_out` in both 
 The server also exposes tools that drive a Centaur agent session. The agent runs in its own harness sandbox with your principal's tools and credentials, and it keeps its conversation across prompts.
 
 ```json
-{"name": "centaur_session_send", "arguments": {"prompt": "Find the flaky test in the api-rs CI run and propose a fix."}}
-{"name": "centaur_session_send", "arguments": {"session_id": "<session_id>", "prompt": "Open a draft PR with that fix."}}
-{"name": "centaur_session_send", "arguments": {"prompt": "Run the full test suite.", "wait": false}}
-{"name": "centaur_session_read", "arguments": {"session_id": "<session_id>", "wait_seconds": 45}}
-{"name": "centaur_session_interrupt", "arguments": {"session_id": "<session_id>"}}
-{"name": "centaur_session_list", "arguments": {}}
+{"name": "session_send", "arguments": {"prompt": "Find the flaky test in the api-rs CI run and propose a fix."}}
+{"name": "session_send", "arguments": {"session_id": "<session_id>", "prompt": "Open a draft PR with that fix."}}
+{"name": "session_send", "arguments": {"prompt": "Run the full test suite.", "wait": false}}
+{"name": "session_read", "arguments": {"session_id": "<session_id>", "wait_seconds": 45}}
+{"name": "session_interrupt", "arguments": {"session_id": "<session_id>"}}
+{"name": "session_list", "arguments": {}}
 ```
 
-By default, `centaur_session_send` waits for the turn to finish and returns `final_answer`. A prompt sent while a turn runs steers that turn.
+By default, `session_send` waits for the turn to finish and returns `final_answer`. A prompt sent while a turn runs steers that turn.
 
 - Clients that accept `text/event-stream` get the response as a stream. Each agent step is sent as an MCP progress notification with a one-line `message` (for example `command: gh pr list → exit 0`), and a heartbeat follows every 30 s of silence. Claude Code shows the latest line under the tool call; Codex shows no progress. The stream follows the turn for up to 30 minutes.
 - Other clients wait up to 50 s.
-- If the result has `done: false`, call `centaur_session_read` until `done` is true. It waits up to `wait_seconds` (at most 50). Pass `after_event_id` from `next_after_event_id` to read only new progress.
-- Set `wait: false` to return at once with `session_id` and `execution_id`. In Codex, this plus repeated `centaur_session_read` calls is the way to see progress while a turn runs.
+- If the result has `done: false`, call `session_read` until `done` is true. It waits up to `wait_seconds` (at most 50). Pass `after_event_id` from `next_after_event_id` to read only new progress.
+- Set `wait: false` to return at once with `session_id` and `execution_id`. In Codex, this plus repeated `session_read` calls is the way to see progress while a turn runs.
 
 Sessions are private to the principal that started them. For each tool, its arguments and results, and what Claude Code and Codex show during a call, see [Agent Sessions over MCP](../../docs/pages/operate/mcp-agent-sessions.mdx).
 

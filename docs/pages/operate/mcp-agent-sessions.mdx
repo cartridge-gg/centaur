@@ -9,10 +9,10 @@ Four MCP tools control agent sessions:
 
 | Tool | Use it to |
 | --- | --- |
-| `centaur_session_send` | Start a session, or send a prompt to a session. |
-| `centaur_session_read` | Wait for a turn, and read its progress and answer. |
-| `centaur_session_interrupt` | Stop the running turn of a session. |
-| `centaur_session_list` | Find the sessions that you started. |
+| `session_send` | Start a session, or send a prompt to a session. |
+| `session_read` | Wait for a turn, and read its progress and answer. |
+| `session_interrupt` | Stop the running turn of a session. |
+| `session_list` | Find the sessions that you started. |
 
 ## Terms
 
@@ -42,9 +42,15 @@ OAuth. The steps for each client are in
 [`plugins/centaur/README.md`](https://github.com/paradigmxyz/centaur/blob/main/plugins/centaur/README.md).
 
 - **Claude Code:** add the server, then open `/mcp` and authenticate `centaur`.
-  The tools show as `mcp__centaur__centaur_session_send` and so on.
+  The tools show as `mcp__centaur__session_send` and so on.
 - **Codex:** run `codex mcp add centaur --url <CENTAUR_MCP_URL>`, then run
   `codex mcp login centaur`.
+
+The client puts the server name before each tool name, for example
+`mcp__<server>__session_send` in Claude Code and `<server>.session_send` in
+Codex. The examples on this page use the name `centaur`. If your team knows
+the agent by another name, register the server with that name. The tools then
+read as the tools of that agent.
 
 ## Access and credentials
 
@@ -58,9 +64,9 @@ OAuth. The steps for each client are in
   agent not to post its reply anywhere. The answer goes only to the MCP
   client.
 
-## centaur_session_send
+## session_send
 
-Use `centaur_session_send` to start a session and to send each prompt after
+Use `session_send` to start a session and to send each prompt after
 that. By default, the call waits for the turn to finish and returns the
 final answer.
 
@@ -84,7 +90,7 @@ How the call works:
 4. If `wait` is `true`, the call waits for the turn. The
    [waiting behavior](#waiting-and-streaming) depends on the MCP client.
 5. If `wait` is `false`, the call returns with `session_id` and
-   `execution_id`. Use `centaur_session_read` to follow the turn.
+   `execution_id`. Use `session_read` to follow the turn.
 
 A session keeps its harness and its persona. If you send a different
 `harness` or `persona_id` to an existing session, the call fails. Start a
@@ -98,12 +104,12 @@ Use `idempotency_key` if your client can retry a call. For example, if a
 call times out, send it again with the same key. Centaur does not run the
 prompt twice.
 
-## centaur_session_read
+## session_read
 
-Use `centaur_session_read` to wait for a turn and to read its progress and
+Use `session_read` to wait for a turn and to read its progress and
 answer. You need it in these cases:
 
-- The result of `centaur_session_send` has `done: false`.
+- The result of `session_send` has `done: false`.
 - You sent the prompt with `wait: false`.
 - Your client lost the connection during a send. The turn continues in the
   sandbox.
@@ -117,9 +123,9 @@ answer. You need it in these cases:
 
 To follow a turn, do these steps:
 
-1. Call `centaur_session_read` with `session_id`.
+1. Call `session_read` with `session_id`.
 2. Read the new items in `progress`.
-3. If `done` is `false`, call `centaur_session_read` again. Set
+3. If `done` is `false`, call `session_read` again. Set
    `after_event_id` to `next_after_event_id`.
 4. If `done` is `true`, read `final_answer`, `error`, or `cancel_reason`.
 
@@ -130,9 +136,9 @@ progress.
 If the session has no turns, the result has `status: "idle"` and
 `done: true`.
 
-## centaur_session_interrupt
+## session_interrupt
 
-Use `centaur_session_interrupt` to stop the running turn of a session. The
+Use `session_interrupt` to stop the running turn of a session. The
 session stays open. You can send a new prompt after the interrupt.
 
 | Argument | Type | Default | Meaning |
@@ -143,9 +149,9 @@ session stays open. You can send a new prompt after the interrupt.
 The result has `interrupted` and `execution_id`. If no turn is running,
 `interrupted` is `false` and `execution_id` is `null`.
 
-## centaur_session_list
+## session_list
 
-Use `centaur_session_list` to find a session that you started earlier, for
+Use `session_list` to find a session that you started earlier, for
 example in another conversation.
 
 | Argument | Type | Default | Meaning |
@@ -161,18 +167,18 @@ writes a `title` from the prompts. Otherwise, `title` is empty.
 
 | Task | Calls |
 | --- | --- |
-| Ask one question | `centaur_session_send` with `prompt`. Read `final_answer`. |
-| Continue a conversation | `centaur_session_send` with the same `session_id`. |
-| Run a long task | `centaur_session_send`. If `done` is `false`, call `centaur_session_read` until `done` is `true`. |
-| Start a task and do other work | `centaur_session_send` with `wait: false`. Later, call `centaur_session_read`. |
-| See progress in Codex | `centaur_session_send` with `wait: false`, then `centaur_session_read` in a loop. |
-| Correct a running turn | `centaur_session_send` with the same `session_id`. Centaur steers the prompt into the turn. |
-| Stop a turn | `centaur_session_interrupt`. |
-| Find an old session | `centaur_session_list`. |
+| Ask one question | `session_send` with `prompt`. Read `final_answer`. |
+| Continue a conversation | `session_send` with the same `session_id`. |
+| Run a long task | `session_send`. If `done` is `false`, call `session_read` until `done` is `true`. |
+| Start a task and do other work | `session_send` with `wait: false`. Later, call `session_read`. |
+| See progress in Codex | `session_send` with `wait: false`, then `session_read` in a loop. |
+| Correct a running turn | `session_send` with the same `session_id`. Centaur steers the prompt into the turn. |
+| Stop a turn | `session_interrupt`. |
+| Find an old session | `session_list`. |
 
 ## Waiting and streaming
 
-If `wait` is `true`, `centaur_session_send` waits in one of two ways.
+If `wait` is `true`, `session_send` waits in one of two ways.
 
 **The MCP client accepts `text/event-stream`.** Claude Code and Codex both
 accept it. Centaur answers with a stream:
@@ -184,7 +190,7 @@ accept it. Centaur answers with a stream:
 3. When the turn finishes, Centaur sends the tool result and closes the
    stream.
 4. If the turn runs longer than 30 minutes, Centaur sends the result with
-   `done: false`. Continue with `centaur_session_read`.
+   `done: false`. Continue with `session_read`.
 5. If the client closes the connection, the turn continues in the sandbox.
 
 Centaur sends progress notifications only if the client sends a
@@ -221,7 +227,7 @@ Progress:
 - turn completed
 
 session_id: 7f3c… · execution_id: exe_… · next_after_event_id: 42
-The turn is done. Call centaur_session_send with this session_id to continue the conversation.
+The turn is done. Call session_send with this session_id to continue the conversation.
 ```
 
 The report shows the last 40 progress lines. The `structuredContent` has all
@@ -271,29 +277,29 @@ Codex does not show progress notifications. During the call, Codex shows
 only the call and a timer:
 
 ```text
-• Calling centaur.centaur_session_send({"prompt":"How many PRs are open?"})
+• Calling centaur.session_send({"prompt":"How many PRs are open?"})
 • Working (12s • esc to interrupt)
 ```
 
 When the call ends, Codex shows the first lines of the result:
 
 ```text
-• Called centaur.centaur_session_send({"prompt":"How many PRs are open?"})
+• Called centaur.session_send({"prompt":"How many PRs are open?"})
   └ Turn completed.
     3 PRs are open.
 ```
 
 `codex exec` shows only that the call started and completed. To see progress
-in Codex, send with `wait: false`. Then call `centaur_session_read` in a
+in Codex, send with `wait: false`. Then call `session_read` in a
 loop. Codex shows the result of each read.
 
 ### Other MCP clients
 
 - If the client does not send `Accept: text/event-stream`, the send waits
-  only 50 s. Use `centaur_session_read` for longer turns.
+  only 50 s. Use `session_read` for longer turns.
 - If the client does not send a `progressToken`, Centaur sends no progress
   and no heartbeat. The idle timer of the client can then stop a long call.
-  Use `wait: false` and `centaur_session_read` for such a client.
+  Use `wait: false` and `session_read` for such a client.
 - If a proxy between the client and Centaur buffers responses, progress
   arrives only at the end of the call.
 
@@ -354,13 +360,13 @@ items. If a tool call has a `command` argument, the `tool_call` item has
 
 | Message | Cause | Action |
 | --- | --- | --- |
-| `unknown session` | The session does not exist, or another principal owns it. | Check the `session_id`. Use `centaur_session_list`. |
+| `unknown session` | The session does not exist, or another principal owns it. | Check the `session_id`. Use `session_list`. |
 | `turn … is still starting its agent and cannot take a new prompt yet` | The running turn has no agent output yet, so Centaur cannot steer it. | Send the prompt again after a few seconds. |
-| `the prompt was saved but could not be delivered to running turn …` | The running turn did not take the prompt. | Wait for the turn with `centaur_session_read`. Then send the prompt again with a new `idempotency_key`. |
+| `the prompt was saved but could not be delivered to running turn …` | The running turn did not take the prompt. | Wait for the turn with `session_read`. Then send the prompt again with a new `idempotency_key`. |
 | `this session uses harness …` or `this session uses persona …` | A session keeps its harness and persona. | Start a new session. |
-| `The turn continues, but waiting for it failed` | The send started the turn, but the wait failed. | Call `centaur_session_read` with the `session_id` and `execution_id` in the message. |
+| `The turn continues, but waiting for it failed` | The send started the turn, but the wait failed. | Call `session_read` with the `session_id` and `execution_id` in the message. |
 | `Centaur is restarting. Retry in a few seconds.` | api-rs is shutting down. | Send the call again. |
-| `sent no response or progress for 300s; aborting` (Claude Code) | Claude Code got no progress. A proxy can cause this if it buffers the stream. | Send with `wait: false` and use `centaur_session_read`, or increase the Claude Code timeout. |
+| `sent no response or progress for 300s; aborting` (Claude Code) | Claude Code got no progress. A proxy can cause this if it buffers the stream. | Send with `wait: false` and use `session_read`, or increase the Claude Code timeout. |
 
 ## Limits
 
@@ -376,4 +382,4 @@ items. If a tool call has a `command` argument, the `tool_call` item has
 | Progress in one read | 32 KiB |
 | Progress in a streamed result | The newest 16 KiB |
 | `final_answer` | 100,000 characters |
-| `centaur_session_list` | 50 sessions. The default is 20. |
+| `session_list` | 50 sessions. The default is 20. |
