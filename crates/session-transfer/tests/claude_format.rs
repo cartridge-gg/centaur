@@ -160,7 +160,7 @@ fn output_is_one_linear_alternating_conversation() {
 
 #[test]
 fn write_never_overwrites_a_session() {
-    let home = std::env::temp_dir().join(format!("codex2claude-write-{}", std::process::id()));
+    let home = std::env::temp_dir().join(format!("session-transfer-write-{}", std::process::id()));
     let result = render(&codex_fixtures()[0], &home);
     result.write().unwrap();
     assert_eq!(fs::read_to_string(&result.path).unwrap(), result.contents);

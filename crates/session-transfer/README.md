@@ -58,6 +58,7 @@ println!("{}", converted.resume_command);
 | Claude project directory for a cwd longer than 200 characters | The full encoded path, which Claude Code does not read | The first 200 characters, `-`, and a base-36 hash of the cwd, as Claude Code names it |
 | A cut inside a surrogate pair (an emoji) | Keeps half of the pair | Stops before the pair |
 | Codex `<recommended_plugins>` user message | A prompt: it becomes the first message and the title | Injected context: left out |
+| Claude Code record of a failed API request (`isApiErrorMessage`) | An assistant message with the error text | Left out |
 | A session that was already converted | Gets a second preamble | Keeps one preamble |
 | Compressed `.jsonl.zst` rollouts | Read on Node.js 22.15 or later | Not supported |
 

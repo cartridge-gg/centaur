@@ -149,7 +149,13 @@ impl SessionBuilder {
             {
                 self.model = Some(model.to_string());
             }
-            let parts = message.map(assistant_parts).unwrap_or_default();
+            // Claude Code saves a failed API request as an assistant message
+            // with the error text. It is not an answer of the model.
+            let parts = if record.is_api_error_message == Some(true) {
+                Vec::new()
+            } else {
+                message.map(assistant_parts).unwrap_or_default()
+            };
             let continues =
                 id.as_ref().is_some_and(|id| !id.is_empty()) && id == self.last_assistant_id;
             match self.messages.last_mut() {
@@ -296,6 +302,8 @@ struct Record {
     is_sidechain: Option<bool>,
     #[serde(deserialize_with = "lenient")]
     is_meta: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    is_api_error_message: Option<bool>,
     #[serde(deserialize_with = "lenient")]
     cwd: Option<String>,
     #[serde(deserialize_with = "lenient")]
@@ -521,5 +529,21 @@ mod tests {
         ]);
         // The chain from u2 has 1 of 3 messages, so the file order wins.
         assert_eq!(texts(&session), ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn a_failed_api_request_is_not_an_answer() {
+        let mut error = assistant("a1", "u1", "m1", "API Error: 503 no capacity");
+        error["isApiErrorMessage"] = json!(true);
+        error["message"]["model"] = json!("<synthetic>");
+        let session = parse(&[
+            user("u1", None, "hi"),
+            error,
+            user("u2", Some("a1"), "again"),
+            assistant("a2", "u2", "m2", "hello"),
+        ]);
+        // The chain goes through the error record, but the error text is left out.
+        assert_eq!(texts(&session), ["hi", "again", "hello"]);
+        assert_eq!(session.messages.len(), 3);
     }
 }

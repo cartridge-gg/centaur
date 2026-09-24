@@ -1,10 +1,12 @@
 // Shared setup for running sessport as the reference implementation.
 //
-// codex2claude differs from sessport on purpose in one place: it also drops
-// Codex-injected user messages that sessport treats as prompts (see
-// DROPPED_USER_PREFIXES). sessport ignores a record it skips, so running
-// sessport on a copy of the rollout without those records gives the output
-// that codex2claude must match byte for byte.
+// session-transfer differs from sessport on purpose in 2 input rules:
+// - It drops Codex-injected user messages that sessport treats as prompts
+//   (see DROPPED_USER_PREFIXES). sessport ignores a record it skips, so a
+//   copy of the rollout without those records gives the same output.
+// - It leaves out Claude Code records of failed API requests
+//   (`isApiErrorMessage`). The copy keeps those records, because the
+//   parentUuid chain goes through them, but without content.
 
 // Codex names rollout files in local time. Pin it so the paths are stable.
 process.env.TZ = 'UTC';
@@ -76,18 +78,31 @@ function isDroppedRecord(line) {
 
 let tempDir;
 /**
- * The rollout that sessport must read: `file` itself, or a copy without the
- * records that codex2claude drops on purpose. The copy keeps the file name,
+ * The session file that sessport must read: `file` itself, or a copy without the
+ * records that session-transfer changes on purpose. The copy keeps the file name,
  * because sessport can take the session id from it.
  */
 export function referenceInput(file, tool = 'codex') {
-  // The differences apply to the Codex reader only.
-  if (tool !== 'codex') return file;
   const lines = readFileSync(file, 'utf8').split('\n');
-  const kept = lines.filter((line) => !isDroppedRecord(line));
-  if (kept.length === lines.length) return file;
-  tempDir ??= mkdtempSync(join(tmpdir(), 'codex2claude-reference-'));
+  const kept =
+    tool === 'codex'
+      ? lines.filter((line) => !isDroppedRecord(line))
+      : lines.map(withoutApiErrorContent);
+  if (kept.every((line, i) => line === lines[i]) && kept.length === lines.length) return file;
+  tempDir ??= mkdtempSync(join(tmpdir(), 'session-transfer-reference-'));
   const copy = join(tempDir, basename(file));
   writeFileSync(copy, kept.join('\n'));
   return copy;
+}
+
+// A Claude Code record of a failed API request, with its content removed.
+function withoutApiErrorContent(line) {
+  let record;
+  try {
+    record = JSON.parse(line.trim());
+  } catch {
+    return line;
+  }
+  if (!record || record.isApiErrorMessage !== true || !record.message) return line;
+  return JSON.stringify({ ...record, message: { ...record.message, content: [] } });
 }
