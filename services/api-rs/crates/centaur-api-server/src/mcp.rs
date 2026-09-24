@@ -435,8 +435,8 @@ fn mcp_initialize_result(params: &Value) -> Value {
     }
     let sessions = concat!(
         "To hand a multi-step task to a Centaur agent that works in its own sandbox, call ",
-        "`centaur_session_send`. It waits for the turn and returns `final_answer`; if `done` ",
-        "is false, call `centaur_session_read` until it is true. Continue the conversation ",
+        "`session_send`. It waits for the turn and returns `final_answer`; if `done` ",
+        "is false, call `session_read` until it is true. Continue the conversation ",
         "by sending again with the same `session_id`."
     );
     let instructions = match result["instructions"].as_str() {
@@ -2283,10 +2283,10 @@ def search(query, limit=20):
                 .map(|tool| tool["name"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>();
             let session_tools = [
-                "centaur_session_send",
-                "centaur_session_read",
-                "centaur_session_interrupt",
-                "centaur_session_list",
+                "session_send",
+                "session_read",
+                "session_interrupt",
+                "session_list",
             ];
             let expected = if enabled {
                 [
@@ -2310,7 +2310,7 @@ def search(query, limit=20):
             assert_eq!(names, expected);
             let initialize = mcp_initialize_result(&json!({}));
             let instructions = initialize["instructions"].as_str().unwrap();
-            assert!(instructions.contains("`centaur_session_send`"));
+            assert!(instructions.contains("`session_send`"));
             if enabled {
                 assert!(instructions.contains("write it beneath `/tmp/downloads`"));
                 assert!(instructions.contains("`centaur_artifact_get`"));
@@ -2400,10 +2400,10 @@ def search(query, limit=20):
         assert_eq!(
             names,
             vec![
-                "centaur_session_send",
-                "centaur_session_read",
-                "centaur_session_interrupt",
-                "centaur_session_list",
+                "session_send",
+                "session_read",
+                "session_interrupt",
+                "session_list",
                 "centaur_whoami",
             ]
         );
@@ -2411,7 +2411,7 @@ def search(query, limit=20):
             mcp_initialize_result(&json!({}))["instructions"]
                 .as_str()
                 .unwrap()
-                .contains("`centaur_session_send`")
+                .contains("`session_send`")
         );
 
         // Invalid arguments prove the call reaches the session tools without
@@ -2434,7 +2434,7 @@ def search(query, limit=20):
                 jsonrpc: Some("2.0".to_owned()),
                 id: Some(json!(1)),
                 method: "tools/call".to_owned(),
-                params: json!({"name": "centaur_session_send", "arguments": {}}),
+                params: json!({"name": "session_send", "arguments": {}}),
             }),
         )
         .now_or_never()
@@ -2453,6 +2453,56 @@ def search(query, limit=20):
                 .unwrap()
                 .contains("invalid arguments")
         );
+    }
+
+    #[test]
+    fn catalog_tools_cannot_shadow_session_tools() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = temp_dir("centaur-api-rs-mcp-session-shadow");
+        for name in ["session_send", "demo"] {
+            let package_dir = temp.join(name);
+            fs::create_dir_all(&package_dir).unwrap();
+            fs::write(
+                package_dir.join("pyproject.toml"),
+                format!(
+                    "[project]\nname = \"{name}-tool\"\n\n[project.scripts]\n{name} = \"{name}.cli:main\"\n"
+                ),
+            )
+            .unwrap();
+            fs::write(
+                package_dir.join("client.py"),
+                "def ping():\n    return {}\n",
+            )
+            .unwrap();
+        }
+        let _env = EnvGuard::set(&[
+            ("CENTAUR_MCP_V2_ENABLED", "false"),
+            (
+                "TOOL_DIRS",
+                Box::leak(temp.display().to_string().into_boxed_str()),
+            ),
+        ]);
+        let filter = SandboxToolFilter::default();
+
+        // A catalog tool with a built-in name is dropped, so the list has one
+        // session_send, and a call to it reaches the built-in session tool.
+        let names = mcp_tool_entries(&filter)
+            .unwrap()
+            .into_iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names.iter().filter(|name| *name == "session_send").count(),
+            1
+        );
+        assert!(names.contains(&"demo".to_owned()));
+        assert!(mcp_builtin_tool_name("session_send"));
+        assert!(
+            mcp_find_centaur_tool("session_send", &filter)
+                .unwrap()
+                .is_none()
+        );
+        assert!(mcp_find_centaur_tool("demo", &filter).unwrap().is_some());
     }
 
     #[test]
@@ -2496,10 +2546,10 @@ def search(query, limit=20):
             assert_eq!(
                 names,
                 vec![
-                    "centaur_session_send",
-                    "centaur_session_read",
-                    "centaur_session_interrupt",
-                    "centaur_session_list",
+                    "session_send",
+                    "session_read",
+                    "session_interrupt",
+                    "session_list",
                     "centaur_whoami",
                     "demo",
                 ]
@@ -2518,10 +2568,10 @@ def search(query, limit=20):
                 "centaur_catalog_load",
                 "centaur_tool_call",
                 "centaur_artifact_get",
-                "centaur_session_send",
-                "centaur_session_read",
-                "centaur_session_interrupt",
-                "centaur_session_list",
+                "session_send",
+                "session_read",
+                "session_interrupt",
+                "session_list",
                 "centaur_whoami",
             ]
         );
