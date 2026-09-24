@@ -484,12 +484,7 @@ fn thread_persistence_enabled() -> bool {
     env_flag_enabled(env::var(CODEX_THREAD_PERSIST_ENV).ok().as_deref())
 }
 
-fn env_flag_enabled(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
-}
+use crate::util::env_flag_enabled;
 
 fn persisted_thread_path() -> PathBuf {
     env::var_os("CODEX_HOME")

@@ -221,6 +221,81 @@ fn fake_codex_pool_exhaustion_is_annotated_on_the_error_lines() {
 }
 
 #[test]
+fn fake_claude_session_id_persists_across_processes() {
+    let config = temp_path("claude-config");
+    std::fs::create_dir_all(&config).unwrap();
+    let args_log = temp_path("fake-claude-args.log");
+    let fake_claude = temp_path("fake-claude.sh");
+    std::fs::write(
+        &fake_claude,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nprintf '%s\\n' {} {} {}\n",
+            shell_quote(&args_log),
+            r#"'{"type":"system","subtype":"init","session_id":"claude-session-1"}'"#,
+            r#"'{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"ok"}]}}'"#,
+            r#"'{"type":"result","subtype":"success","result":"ok"}'"#,
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&fake_claude).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_claude, permissions).unwrap();
+
+    let run = || {
+        let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
+            Harness::ClaudeCode,
+            None,
+            None,
+            &[
+                ("CLAUDE_BIN", fake_claude.to_str().unwrap()),
+                ("CLAUDE_CONFIG_DIR", config.to_str().unwrap()),
+                ("CENTAUR_CLAUDE_SESSION_PERSIST", "1"),
+            ],
+        );
+        let turn = bridge.run_blocks_user_turn("say ok", Duration::from_secs(10));
+        bridge.finish_successfully();
+        assert_completed_turn(&turn);
+    };
+    let args = || std::fs::read_to_string(&args_log).unwrap();
+    let persisted = config.join("centaur-session-id");
+
+    // A new session, whose id is kept for the next process.
+    run();
+    assert!(args().lines().last().unwrap().contains("--session-id"));
+    assert_eq!(
+        std::fs::read_to_string(&persisted).unwrap(),
+        "claude-session-1\n"
+    );
+
+    // Without the transcript, the id cannot be resumed: start a new session.
+    run();
+    assert!(args().lines().last().unwrap().contains("--session-id"));
+
+    // With the transcript on the volume, the next process resumes it.
+    let project = config
+        .join("projects")
+        .join(session_transfer::claude::encode_project_dir(env!(
+            "CARGO_MANIFEST_DIR"
+        )));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("claude-session-1.jsonl"), "{}\n").unwrap();
+    run();
+    assert!(
+        args()
+            .lines()
+            .last()
+            .unwrap()
+            .contains("--resume claude-session-1"),
+        "{}",
+        args()
+    );
+
+    let _ = std::fs::remove_dir_all(&config);
+    let _ = std::fs::remove_file(&args_log);
+    let _ = std::fs::remove_file(&fake_claude);
+}
+
+#[test]
 fn fake_claude_app_server_completes_on_stop_sequence_without_result() {
     let fake_claude = concat!(
         "printf '%s\\n' ",

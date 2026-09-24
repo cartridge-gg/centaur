@@ -239,7 +239,46 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
 fn initial_blocks_thread_state<H: HarnessServer>(harness: &H) -> Result<ThreadState> {
     let cwd = env::current_dir()?;
     let params = ThreadStartParams::default();
-    Ok(harness.thread_state(&params, cwd))
+    let mut state = harness.thread_state(&params, cwd);
+    // Resume the session of an earlier process on the same state volume.
+    if let Some(file) = harness.persisted_session_file()
+        && let Some(id) = read_persisted_session_id(&file)
+    {
+        if harness.session_resumable(&id, &state.cwd) {
+            state.harness_session_id = Some(id);
+        } else {
+            eprintln!(
+                "harness-server: persisted session {id} has no transcript; starting a new session"
+            );
+            let _ = std::fs::remove_file(&file);
+        }
+    }
+    Ok(state)
+}
+
+fn read_persisted_session_id(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let id = contents.trim();
+    (!id.is_empty() && id.lines().count() == 1).then(|| id.to_owned())
+}
+
+/// Keeps the session id for the next process, when the harness persists it.
+fn persist_session_id<H: HarnessServer>(harness: &H, session_id: &str) {
+    let Some(file) = harness.persisted_session_file() else {
+        return;
+    };
+    let write = || -> std::io::Result<()> {
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&file, format!("{session_id}\n"))
+    };
+    if let Err(error) = write() {
+        eprintln!(
+            "harness-server: failed to persist session id to {}: {error}",
+            file.display()
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1352,6 +1391,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 for normalized in normalized_events {
                     telemetry.observe_normalized(&normalized);
                     if let Some(session_id) = normalized.session_id() {
+                        if state.harness_session_id.as_deref() != Some(session_id) {
+                            persist_session_id(harness, session_id);
+                        }
                         last_session_id = Some(session_id.to_string());
                         state.harness_session_id = Some(session_id.to_string());
                     }
