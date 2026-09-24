@@ -332,6 +332,14 @@ spec:
               value: {{ .Values.apiRs.sandboxResumeThreadEnabled | default false | quote }}
             - name: SESSION_PROVIDER_EXHAUSTED_MARKERS
               value: {{ .Values.apiRs.providerExhaustedMarkers | default "" | quote }}
+            {{- with .Values.apiRs.providerFailover }}
+            - name: SESSION_PROVIDER_FAILOVER_ENABLED
+              value: {{ .enabled | default false | quote }}
+            - name: SESSION_PROVIDER_FAILOVER_MODELS
+              value: {{ .models | default "" | quote }}
+            - name: SESSION_PROVIDER_FAILOVER_THREAD_PREFIXES
+              value: {{ .threadPrefixes | default "" | quote }}
+            {{- end }}
             - name: SESSION_SANDBOX_WARM_POOL_REPLENISH_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxWarmPoolReplenishIntervalSecs | quote }}
             - name: SESSION_SANDBOX_RUNNING_LIMIT

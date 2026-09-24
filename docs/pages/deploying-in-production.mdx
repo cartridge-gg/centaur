@@ -110,7 +110,8 @@ Store one secret per enabled harness credential:
 `sandbox.harnessEngine` and the selectors above apply when a session is created.
 A session records its harness and keeps it for the life of the thread, so
 changing the chart value does not move existing threads onto another harness.
-Start a new thread to pick one up.
+Start a new thread to pick one up. The one exception is
+[provider failover](#provider-failover).
 
 In normal sandbox mode, containers receive placeholder values such as
 `OPENAI_API_KEY=OPENAI_API_KEY`. [iron-proxy](https://docs.iron.sh) swaps the
@@ -300,6 +301,49 @@ unset CLAUDE_CODE_REFRESH_TOKEN
 
 The client id is Claude Code's fixed, publicly known OAuth client id. As with
 Codex, api-rs fails fast at startup if the broker credential is missing.
+
+### Provider Failover
+
+A subscription or an account pool can run out of capacity: a usage limit, or
+every account rate limited. Without failover, each turn on that harness fails
+until the provider resets. With `apiRs.providerFailover.enabled: true`, a
+Codex session continues on Claude Code, and a Claude Code session continues
+on Codex:
+
+1. The harness server in the sandbox detects the exhausted provider. Native
+   usage-limit errors always count. Set `apiRs.providerExhaustedMarkers` to
+   the error code of a proxy that pools accounts, so that its pool-exhausted
+   error counts too.
+2. It holds back the failure, converts the native session (the full history,
+   with tool calls as text), and resumes it on the other harness in the same
+   sandbox. The workspace and the state volume stay.
+3. It sends the turn again. If the turn already ran tools, it asks the new
+   harness to check the workspace and continue instead.
+4. The client gets a `session.provider_failover` event, and Slack shows
+   "Switched to Claude Code". The session stays on the new harness.
+
+A turn switches at most once, and never to a provider that is known to be
+exhausted. When a provider is exhausted, api-rs records its reset time, and
+new turns start on the other harness until then. A client that still asks for
+the old harness gets the session on the new one; only a request with
+`harness_explicit: true` restarts it on the old harness. Execution metadata
+`{"provider_failover": false}` turns failover off for one execution.
+
+```yaml
+apiRs:
+  providerExhaustedMarkers: "pool_exhausted"
+  sandboxResumeThreadEnabled: true
+  providerFailover:
+    enabled: true
+    # The model after a switch. Empty: the harness default.
+    models: "codex=gpt-5-codex,claudecode=claude-opus-5-5"
+    # Only these threads. Empty: all.
+    threadPrefixes: ""
+```
+
+Both harnesses need credentials. Only sandboxes created after the change can
+switch; a running or paused sandbox keeps its old behavior until it is
+replaced.
 
 ## 4. Configure Advanced Permissioning
 
