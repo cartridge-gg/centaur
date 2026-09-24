@@ -16,6 +16,14 @@ Use Centaur's MCP tools for actions and context exposed by the user's deployment
    - Do the work in one `centaur_execute` cell. `code` is the body of an async function: call connectors as `await tools.<connector>.<function>(args)`, run independent calls together with `Promise.all` or `Promise.allSettled` in the same cell instead of several tool calls, and `return` the JSON-serializable value you want back. `console.log` output is returned with the result. A cell has no `fetch`, no module imports, no file access, and no state between cells, and is limited to 120 s, 1000 calls and 8 concurrent calls.
 3. Summarize consequential writes and return relevant identifiers or links.
 
+## Agent sessions
+
+If `centaur_session_send` is listed, use it to hand a multi-step task to a Centaur agent that works in its own sandbox.
+
+1. Call `centaur_session_send` with the prompt. Omit `session_id` to start a new session. The call waits for the turn and returns `final_answer`.
+2. If `done` is false in the result, call `centaur_session_read` with the returned `session_id` until `done` is true. Pass `after_event_id` from `next_after_event_id` to read only new progress.
+3. Continue the conversation with `centaur_session_send` and the same `session_id`. Use `centaur_session_interrupt` to stop a running turn, and `centaur_session_list` to find earlier sessions.
+
 Centaur authorizes calls using the signed-in principal's live roles and grants. Never request, paste, print, or store Centaur OAuth tokens.
 
 ## Connection recovery
