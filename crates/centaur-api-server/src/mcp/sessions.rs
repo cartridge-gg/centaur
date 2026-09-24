@@ -1041,7 +1041,10 @@ fn progress_line(item: &Value) -> String {
                 ("", tool) => tool.to_owned(),
                 (server, tool) => format!("{server}.{tool}"),
             };
-            let mut line = format!("tool: {name}");
+            let mut line = match field("command") {
+                "" => format!("tool: {name}"),
+                command => format!("{name}: {}", first_line(command)),
+            };
             if !field("status").is_empty() {
                 line.push_str(&format!(" → {}", field("status")));
             }
@@ -1510,6 +1513,18 @@ fn thread_item_progress(item: &Value) -> Option<Map<String, Value>> {
             copy_field(item, &mut progress, "tool", "tool");
             copy_field(item, &mut progress, "status", "status");
             copy_field(item, &mut progress, "success", "success");
+            // Hermes runs shell commands through its `terminal` tool, so the
+            // command is in the arguments, not in a commandExecution item.
+            if let Some(command) = item
+                .get("arguments")
+                .and_then(|arguments| arguments.get("command"))
+                .and_then(Value::as_str)
+            {
+                progress.insert(
+                    "command".to_owned(),
+                    json!(truncate_chars(command, SHORT_TEXT_CHARS).0),
+                );
+            }
             progress
         }
         "webSearch" => {
@@ -2290,6 +2305,37 @@ mod tests {
         drop(second);
         release_send_lock(&key);
         assert!(!send_locks().lock().unwrap().contains_key(key.as_str()));
+    }
+
+    #[test]
+    fn hermes_terminal_calls_show_their_command() {
+        // harness-server projects a Hermes `terminal` call to a dynamic tool
+        // call and copies Hermes's `args` into `arguments`.
+        let event = output_event(
+            1,
+            json!({"method": "item/completed", "params": {"item": {
+                "type": "dynamicToolCall", "id": "t1", "namespace": null, "tool": "terminal",
+                "arguments": {"command": "sleep 8\necho done"}, "status": "completed",
+                "contentItems": [{"type": "inputText", "text": ""}], "success": true
+            }}}),
+        );
+        let item = progress_item(&event).unwrap();
+        assert_eq!(item["kind"], "tool_call");
+        assert_eq!(item["tool"], "terminal");
+        assert_eq!(item["command"], "sleep 8\necho done");
+        assert_eq!(progress_line(&item), "terminal: sleep 8 → completed");
+
+        // Other dynamic tools keep the generic line.
+        let read = output_event(
+            2,
+            json!({"method": "item/completed", "params": {"item": {
+                "type": "dynamicToolCall", "id": "t2", "tool": "read_file",
+                "arguments": {"path": "README.md"}, "status": "failed", "success": false
+            }}}),
+        );
+        let item = progress_item(&read).unwrap();
+        assert!(item.get("command").is_none());
+        assert_eq!(progress_line(&item), "tool: read_file → failed");
     }
 
     #[test]
