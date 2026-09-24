@@ -47,10 +47,10 @@ use super::{
 };
 use crate::{ApiError, routes::AppState};
 
-pub(super) const SESSION_SEND_TOOL: &str = "centaur_session_send";
-pub(super) const SESSION_READ_TOOL: &str = "centaur_session_read";
-pub(super) const SESSION_INTERRUPT_TOOL: &str = "centaur_session_interrupt";
-pub(super) const SESSION_LIST_TOOL: &str = "centaur_session_list";
+pub(super) const SESSION_SEND_TOOL: &str = "session_send";
+pub(super) const SESSION_READ_TOOL: &str = "session_read";
+pub(super) const SESSION_INTERRUPT_TOOL: &str = "session_interrupt";
+pub(super) const SESSION_LIST_TOOL: &str = "session_list";
 
 const THREAD_NAMESPACE: &str = "mcp-session";
 const MAX_SESSION_ID_BYTES: usize = 64;
@@ -102,7 +102,7 @@ pub(super) fn session_tools() -> Vec<Value> {
                 "is already running, the prompt steers that turn instead of starting a new one. ",
                 "By default the call waits for the turn to finish, streams its progress to ",
                 "clients that show MCP progress, and returns final_answer. If done is false in ",
-                "the result, the turn is still running: call centaur_session_read to wait. Set ",
+                "the result, the turn is still running: call session_read to wait. Set ",
                 "wait to false to return at once with session_id and execution_id."
             ),
             "inputSchema": {
@@ -161,7 +161,7 @@ pub(super) fn session_tools() -> Vec<Value> {
                 "properties": {
                     "session_id": {
                         "type": "string",
-                        "description": "Session id returned by centaur_session_send.",
+                        "description": "Session id returned by session_send.",
                     },
                     "execution_id": {
                         "type": "string",
@@ -191,7 +191,7 @@ pub(super) fn session_tools() -> Vec<Value> {
                 "properties": {
                     "session_id": {
                         "type": "string",
-                        "description": "Session id returned by centaur_session_send.",
+                        "description": "Session id returned by session_send.",
                     },
                     "reason": {
                         "type": "string",
@@ -488,7 +488,7 @@ async fn send_locked(
         && !runtime.execution_has_output(&active.execution_id).await?
     {
         return Err(caller_error(format!(
-            "turn {} is still starting its agent and cannot take a new prompt yet. Send again in a few seconds, or wait for the turn with centaur_session_read.",
+            "turn {} is still starting its agent and cannot take a new prompt yet. Send again in a few seconds, or wait for the turn with session_read.",
             active.execution_id
         )));
     }
@@ -561,7 +561,7 @@ async fn send_locked(
 
 fn undelivered_error(execution_id: &str) -> SessionToolError {
     caller_error(format!(
-        "the prompt was saved but could not be delivered to running turn {execution_id}. Wait for that turn with centaur_session_read, then send the prompt again with a new idempotency_key."
+        "the prompt was saved but could not be delivered to running turn {execution_id}. Wait for that turn with session_read, then send the prompt again with a new idempotency_key."
     ))
 }
 
@@ -671,14 +671,12 @@ fn send_result(
     created: bool,
 ) -> Value {
     let next = match delivery {
-        Delivery::NewTurn => {
-            "Call centaur_session_read with this session_id to wait for the answer."
-        }
+        Delivery::NewTurn => "Call session_read with this session_id to wait for the answer.",
         Delivery::Steered => {
-            "A turn was already running, so the prompt was sent into that turn. Call centaur_session_read to wait for its answer."
+            "A turn was already running, so the prompt was sent into that turn. Call session_read to wait for its answer."
         }
         Delivery::Replayed => {
-            "This idempotency_key was already sent, so the prompt was not sent again. Call centaur_session_read to follow the turn."
+            "This idempotency_key was already sent, so the prompt was not sent again. Call session_read to follow the turn."
         }
     };
     json!({
@@ -694,7 +692,7 @@ fn send_result(
     })
 }
 
-/// Answer a `centaur_session_send` call. Without `wait`, the result returns at
+/// Answer a `session_send` call. Without `wait`, the result returns at
 /// once. With `wait`, a client that accepts `text/event-stream` gets a stream
 /// of progress notifications and then the result; any other client waits as
 /// long as a read does.
@@ -957,7 +955,7 @@ fn started_turn_error(turn: &StartedTurn, error: SessionToolError) -> Value {
     };
     mcp_text_result(
         format!(
-            "The turn continues, but waiting for it failed: {detail}. Call centaur_session_read with session_id {} and execution_id {}.",
+            "The turn continues, but waiting for it failed: {detail}. Call session_read with session_id {} and execution_id {}.",
             turn.accepted["session_id"].as_str().unwrap_or_default(),
             turn.execution.execution_id,
         ),
@@ -1124,7 +1122,7 @@ async fn session_read(
                     "status": "idle",
                     "done": true,
                     "progress": [],
-                    "next": "This session has no turns yet. Call centaur_session_send to start one.",
+                    "next": "This session has no turns yet. Call session_send to start one.",
                 }));
             }
         },
@@ -1181,13 +1179,13 @@ fn turn_result(
 fn read_next_hint(done: bool, has_more: bool) -> &'static str {
     match (done, has_more) {
         (_, true) => {
-            "More progress is available. Call centaur_session_read again with after_event_id set to next_after_event_id."
+            "More progress is available. Call session_read again with after_event_id set to next_after_event_id."
         }
         (false, false) => {
-            "The turn is not done yet. Call centaur_session_read again with after_event_id set to next_after_event_id."
+            "The turn is not done yet. Call session_read again with after_event_id set to next_after_event_id."
         }
         (true, false) => {
-            "The turn is done. Call centaur_session_send with this session_id to continue the conversation."
+            "The turn is done. Call session_send with this session_id to continue the conversation."
         }
     }
 }
