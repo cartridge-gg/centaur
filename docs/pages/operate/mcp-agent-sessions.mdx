@@ -195,8 +195,19 @@ Centaur sends progress notifications only if the client sends a
 has `done: false`.
 
 The model in the MCP client does not see progress notifications. The model
-sees only the tool result. For this reason, the result of a waited send
-starts with a short report:
+sees only the tool result. The result of a waited send has the same data in
+2 forms:
+
+- `content`: a short text report. The report starts with the outcome and the
+  final answer, because a terminal shows only the start of the text.
+- `structuredContent`: the full data as JSON, with the fields in
+  [Result fields](#result-fields).
+
+The MCP client chooses the form that it gives to the model. Claude Code
+2.1.281 gives the model the `structuredContent` JSON. Codex 0.154.0 shows the
+text report in the terminal.
+
+The text report looks like this:
 
 ```text
 Turn completed.
@@ -213,9 +224,9 @@ session_id: 7f3c… · execution_id: exe_… · next_after_event_id: 42
 The turn is done. Call centaur_session_send with this session_id to continue the conversation.
 ```
 
-The report shows the last 40 progress lines. The `structuredContent` of the
-result holds the full data. A streamed send keeps the newest 16 KiB of
-progress items. If Centaur drops older items, the result has
+The report shows the last 40 progress lines. The `structuredContent` has all
+progress items that the result keeps. A streamed send keeps the newest 16 KiB
+of progress items. If Centaur drops older items, the result has
 `earlier_progress_omitted`. If the turn failed, the result has
 `isError: true`.
 
@@ -239,6 +250,8 @@ notification replaces the line.
 - The timer after `Calling centaur` counts the time of the call.
 - When the call ends, the line changes to `Called centaur`. Claude Code
   collapses the tool result. The reply of the model follows.
+- Claude Code gives the model the `structuredContent` JSON of the result,
+  not the text report.
 - Claude Code does not show MCP log messages (`notifications/message`).
 
 Claude Code stops a tool call if the server sends no response and no
