@@ -19,6 +19,11 @@ pub struct CreateSessionRequest {
     /// with no conversational memory).
     #[serde(default)]
     pub on_harness_conflict: Option<OnHarnessConflict>,
+    /// The user named the harness in this request. A session that left the
+    /// requested harness in a provider failover moves back only then;
+    /// otherwise it stays on its current harness.
+    #[serde(default)]
+    pub harness_explicit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -38,6 +43,11 @@ pub struct CreateSessionResponse {
     /// and the returned session uses the resolved fallback.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_requested_persona_id: Option<String>,
+    /// Present when the request named the harness that the session left in
+    /// a provider failover: `{from, to, mode, at, ...}`. The session stays on
+    /// `harness_type`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_failover: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]

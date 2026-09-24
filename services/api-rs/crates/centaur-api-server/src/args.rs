@@ -32,8 +32,9 @@ use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
-    KeepaliveConfig, PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode,
-    SessionEventRetentionConfig, SessionPrincipalAdmission, SessionSandboxCleanupConfig,
+    KeepaliveConfig, PersonaRegistry, ProviderFailoverConfig, SandboxCapacityConfig,
+    SandboxWorkloadMode, SessionEventRetentionConfig, SessionPrincipalAdmission,
+    SessionSandboxCleanupConfig,
 };
 use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
@@ -108,6 +109,10 @@ impl Args {
 
     pub(crate) fn sandbox_keepalive_config(&self) -> Result<Option<KeepaliveConfig>, ServerError> {
         self.sandbox.sandbox_keepalive_config()
+    }
+
+    pub(crate) fn provider_failover_config(&self) -> Result<ProviderFailoverConfig, ServerError> {
+        self.sandbox.provider_failover_config()
     }
 
     pub(crate) fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
@@ -678,6 +683,35 @@ struct SandboxArgs {
         default_value = ""
     )]
     provider_exhausted_markers: String,
+    /// Continue a Codex or Claude Code session on the other harness when the
+    /// model provider of its harness has no capacity left. Sandboxes get
+    /// CENTAUR_HARNESS_SWITCHING=1, and the harness server converts the
+    /// session. Sandboxes created before this setting keep their old
+    /// behavior.
+    #[arg(
+        long = "session-provider-failover-enabled",
+        env = "SESSION_PROVIDER_FAILOVER_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    provider_failover_enabled: bool,
+    /// The model of a session after it moves to a harness, as comma-separated
+    /// `harness=model` pairs, for example `codex=gpt-5-codex`. Without a
+    /// pair, the harness uses its default model.
+    #[arg(
+        long = "session-provider-failover-models",
+        env = "SESSION_PROVIDER_FAILOVER_MODELS",
+        default_value = ""
+    )]
+    provider_failover_models: String,
+    /// Comma-separated thread key prefixes of the sessions that can fail
+    /// over, for example `chat:`. Empty: all sessions.
+    #[arg(
+        long = "session-provider-failover-thread-prefixes",
+        env = "SESSION_PROVIDER_FAILOVER_THREAD_PREFIXES",
+        value_delimiter = ','
+    )]
+    provider_failover_thread_prefixes: Vec<String>,
     #[arg(
         long = "session-sandbox-image-pull-secrets",
         env = "SESSION_SANDBOX_IMAGE_PULL_SECRETS",
@@ -1204,6 +1238,11 @@ impl SandboxArgs {
             // The same for the Claude Code session id (claude.rs).
             envs.push((CLAUDE_SESSION_PERSIST_ENV.to_owned(), "1".to_owned()));
         }
+        if self.provider_failover_enabled {
+            // Read by the harness server (crates/harness-server/src/switch.rs).
+            // The switch keeps each harness's session id next to its config.
+            envs.push((HARNESS_SWITCHING_ENV.to_owned(), "1".to_owned()));
+        }
         let markers = self.provider_exhausted_markers.trim();
         if !markers.is_empty() {
             // Read by the harness server (crates/harness-server/src/failover.rs).
@@ -1672,6 +1711,38 @@ impl SandboxArgs {
         }))
     }
 
+    fn provider_failover_config(&self) -> Result<ProviderFailoverConfig, ServerError> {
+        let mut models = std::collections::HashMap::new();
+        for pair in self
+            .provider_failover_models
+            .split(',')
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty())
+        {
+            let parsed = pair.split_once('=').and_then(|(harness, model)| {
+                let harness = harness.trim().parse::<HarnessType>().ok()?;
+                let model = model.trim();
+                (!model.is_empty()).then(|| (harness, model.to_owned()))
+            });
+            let Some((harness, model)) = parsed else {
+                return Err(ServerError::UnsupportedConfig(format!(
+                    "SESSION_PROVIDER_FAILOVER_MODELS: `{pair}` is not `harness=model`"
+                )));
+            };
+            models.insert(harness, model);
+        }
+        Ok(ProviderFailoverConfig {
+            enabled: self.provider_failover_enabled,
+            models,
+            thread_prefixes: self
+                .provider_failover_thread_prefixes
+                .iter()
+                .map(|prefix| prefix.trim().to_owned())
+                .filter(|prefix| !prefix.is_empty())
+                .collect(),
+        })
+    }
+
     fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
         let duration = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
         SessionSandboxCleanupConfig {
@@ -1829,6 +1900,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
 const CODEX_THREAD_PERSIST_ENV: &str = "CENTAUR_CODEX_THREAD_PERSIST";
 const CLAUDE_SESSION_PERSIST_ENV: &str = "CENTAUR_CLAUDE_SESSION_PERSIST";
 const PROVIDER_EXHAUSTED_MARKERS_ENV: &str = "CENTAUR_PROVIDER_EXHAUSTED_MARKERS";
+const HARNESS_SWITCHING_ENV: &str = "CENTAUR_HARNESS_SWITCHING";
 
 #[derive(Debug, ClapArgs)]
 struct ToolsArgs {
@@ -2887,6 +2959,66 @@ mod tests {
                     "pool_exhausted,usage_cap".to_owned()
                 ))
         );
+    }
+
+    #[test]
+    fn provider_failover_turns_on_harness_switching_in_sandboxes() {
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ];
+        let args = Args::try_parse_from(base).unwrap();
+        let config = args.provider_failover_config().unwrap();
+        assert!(!config.enabled);
+        assert!(
+            !args
+                .sandbox
+                .codex_app_server_env_template()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == HARNESS_SWITCHING_ENV)
+        );
+
+        let args = Args::try_parse_from(base.iter().copied().chain([
+            "--session-provider-failover-enabled",
+            "true",
+            "--session-provider-failover-models",
+            " codex=gpt-5-codex , claudecode=claude-x ",
+            "--session-provider-failover-thread-prefixes",
+            "chat:,slack:",
+        ]))
+        .unwrap();
+        let config = args.provider_failover_config().unwrap();
+        assert!(config.enabled);
+        assert_eq!(
+            config.models.get(&HarnessType::Codex).map(String::as_str),
+            Some("gpt-5-codex")
+        );
+        assert_eq!(
+            config
+                .models
+                .get(&HarnessType::ClaudeCode)
+                .map(String::as_str),
+            Some("claude-x")
+        );
+        assert_eq!(config.thread_prefixes, ["chat:", "slack:"]);
+        assert!(
+            args.sandbox
+                .codex_app_server_env_template()
+                .unwrap()
+                .contains(&(HARNESS_SWITCHING_ENV.to_owned(), "1".to_owned()))
+        );
+
+        for models in ["codex", "gemini=g-1", "codex="] {
+            let args = Args::try_parse_from(
+                base.iter()
+                    .copied()
+                    .chain(["--session-provider-failover-models", models]),
+            )
+            .unwrap();
+            assert!(args.provider_failover_config().is_err(), "{models}");
+        }
     }
 
     #[test]

@@ -635,6 +635,9 @@ async fn create_or_get_session(
     let harness_type = request.harness_type;
     let runtime = state.runtime()?;
     let on_harness_conflict = match request.on_harness_conflict {
+        Some(OnHarnessConflict::Restart) if request.harness_explicit => {
+            HarnessConflictPolicy::RestartExplicit
+        }
         Some(OnHarnessConflict::Restart) => HarnessConflictPolicy::Restart,
         Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
     };
@@ -651,6 +654,7 @@ async fn create_or_get_session(
         session: outcome.session,
         harness_switched: outcome.harness_switched,
         unavailable_requested_persona_id: outcome.unavailable_requested_persona_id,
+        provider_failover: outcome.provider_failover,
     }))
 }
 

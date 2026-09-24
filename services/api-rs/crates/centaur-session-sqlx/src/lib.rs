@@ -1899,6 +1899,36 @@ impl PgSessionStore {
         Ok(())
     }
 
+    /// Moves a session to the harness it failed over to. `harness_type`
+    /// changes only while it is still `from`, and `metadata.provider_failover`
+    /// gets `record`. The sandbox stays: the harness changed inside it.
+    /// Returns false when the session is not on `from`.
+    pub async fn fail_over_session_harness(
+        &self,
+        thread_key: &ThreadKey,
+        from: &HarnessType,
+        to: &HarnessType,
+        record: &Value,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update sessions
+            set harness_type = $3,
+                harness_thread_id = null,
+                metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{provider_failover}', $4::jsonb, true),
+                updated_at = now()
+            where thread_key = $1 and harness_type = $2
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(from.as_ref())
+        .bind(to.as_ref())
+        .bind(record)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Records that the model provider of `harness` has no capacity until
     /// `until`. A later reset time already on record wins.
     pub async fn mark_provider_exhausted(
