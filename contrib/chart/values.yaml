@@ -506,10 +506,6 @@ apiRs:
   sessionPrincipalAdmission: automatic
   # Expose the experimental centaur MCP dispatcher (currently action=list).
   mcpV2Enabled: false
-  # Expose centaur_session_* MCP tools. They start and drive agent sessions in
-  # full harness sandboxes bound to the calling MCP principal, so each MCP
-  # user can run agents with that principal's tools and credentials.
-  mcpSessionsEnabled: false
   sandboxBackend: agent-k8s
   sandboxWorkload: codex-app-server
   sandboxReadyTimeoutSecs: 90

@@ -24,24 +24,15 @@ Four MCP tools control agent sessions:
 | Progress item | A short summary of one step of the agent, for example one command or one tool call. |
 | Progress line | A one-line text form of a progress item, for example `command: gh pr list → exit 0`. |
 
-## Enable the tools
+## Availability
 
-The tools are off by default. An operator enables them with a Helm value.
-
-```yaml
-apiRs:
-  mcpSessionsEnabled: true
-```
-
-The chart sets `CENTAUR_MCP_SESSIONS_ENABLED` on api-rs from this value. If
-the value is `false`, `tools/list` does not show the tools, and a call to a
-tool returns `unknown tool`.
+Every Centaur deployment shows the 4 tools. No setting turns the tools off.
 
 :::warning
-Any MCP token with the `mcp:tools` scope can start agent sandboxes. The flag
-has no role gate and no limit for each principal. Only the global
-`apiRs.sandboxRunningLimit` applies. Enable the flag only if every MCP user
-may run agents with the credentials of their own principal.
+Any MCP token with the `mcp:tools` scope can start agent sandboxes. The tools
+have no role gate and no limit for each principal. Only the global
+`apiRs.sandboxRunningLimit` applies. Give MCP access only to users who may
+run agents with the credentials of their own principal.
 :::
 
 ## Connect an MCP client

@@ -2673,7 +2673,6 @@ mod tests {
             ("CENTAUR_JWT_SIGNING_SECRET", "test-secret"),
             ("CENTAUR_MCP_PUBLIC_URL", "http://localhost:3000/mcp"),
             ("CENTAUR_CONSOLE_PUBLIC_URL", "http://localhost:3001"),
-            ("CENTAUR_MCP_SESSIONS_ENABLED", "true"),
         ]);
         let store = PgSessionStore::connect(&url)
             .await

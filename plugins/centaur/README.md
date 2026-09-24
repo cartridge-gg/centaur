@@ -19,7 +19,7 @@ Call results include `stdout`, `stderr`, `exit_status`, and `timed_out` in both 
 
 ## Agent sessions
 
-Deployments with `CENTAUR_MCP_SESSIONS_ENABLED=true` also expose tools that drive a Centaur agent session. The agent runs in its own harness sandbox with your principal's tools and credentials, and it keeps its conversation across prompts.
+The server also exposes tools that drive a Centaur agent session. The agent runs in its own harness sandbox with your principal's tools and credentials, and it keeps its conversation across prompts.
 
 ```json
 {"name": "centaur_session_send", "arguments": {"prompt": "Find the flaky test in the api-rs CI run and propose a fix."}}
