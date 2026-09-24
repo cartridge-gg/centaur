@@ -269,6 +269,10 @@ spec:
             - name: CENTAUR_MCP_V2_ENABLED
               value: {{ .Values.apiRs.mcpV2Enabled | quote }}
 {{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_MCP_SESSIONS_ENABLED") }}
+            - name: CENTAUR_MCP_SESSIONS_ENABLED
+              value: {{ .Values.apiRs.mcpSessionsEnabled | quote }}
+{{- end }}
             - name: IRON_CONTROL_SYNC_INFRA_SECRETS
               value: {{ .Values.apiRs.syncInfraSecrets | quote }}
             - name: RUST_LOG

@@ -1115,6 +1115,137 @@ impl SessionRuntime {
         Ok(self.store.get_session(thread_key).await?)
     }
 
+    /// The harness a new session gets when its caller does not choose one:
+    /// the warm-pool harness, so first turns can claim a warm sandbox.
+    pub fn default_session_harness(&self) -> HarnessType {
+        self.sandbox_runtime
+            .warm_harness
+            .clone()
+            .unwrap_or(HarnessType::Codex)
+    }
+
+    /// The queued or running execution of a thread, if any. A thread has at
+    /// most one; new input for a busy thread steers it instead.
+    pub async fn active_execution(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Option<SessionExecution>, SessionRuntimeError> {
+        Ok(self.store.active_execution_for_thread(thread_key).await?)
+    }
+
+    pub async fn latest_execution(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Option<SessionExecution>, SessionRuntimeError> {
+        Ok(self.store.latest_execution_for_thread(thread_key).await?)
+    }
+
+    /// Load one execution of a thread; an execution of another thread reads
+    /// as not found.
+    pub async fn thread_execution(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+    ) -> Result<SessionExecution, SessionRuntimeError> {
+        Ok(self
+            .store
+            .thread_execution(thread_key, execution_id)
+            .await?)
+    }
+
+    /// The terminal event (`session.execution_completed`, `_failed`, or
+    /// `_cancelled`) of an execution, once one is recorded. Its payload holds
+    /// the final answer or the error.
+    pub async fn execution_terminal_event(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<SessionEvent>, SessionRuntimeError> {
+        self.latest_execution_event(
+            execution_id,
+            &[
+                "session.execution_completed",
+                "session.execution_failed",
+                "session.execution_cancelled",
+            ],
+        )
+        .await
+    }
+
+    /// Whether the harness has written output for an execution. Steering can
+    /// reach a turn only after its harness is running.
+    pub async fn execution_has_output(
+        &self,
+        execution_id: &str,
+    ) -> Result<bool, SessionRuntimeError> {
+        Ok(self
+            .store
+            .execution_event_exists(execution_id, SESSION_OUTPUT_LINE_EVENT)
+            .await?)
+    }
+
+    /// Whether a message with this client id was already appended to a thread.
+    pub async fn has_client_message(
+        &self,
+        thread_key: &ThreadKey,
+        client_message_id: &str,
+    ) -> Result<bool, SessionRuntimeError> {
+        Ok(self
+            .store
+            .client_message_exists(thread_key, client_message_id)
+            .await?)
+    }
+
+    /// The newest event of one of `event_types` recorded for an execution.
+    pub async fn latest_execution_event(
+        &self,
+        execution_id: &str,
+        event_types: &[&str],
+    ) -> Result<Option<SessionEvent>, SessionRuntimeError> {
+        Ok(self
+            .store
+            .latest_execution_event_of_types(execution_id, event_types)
+            .await?)
+    }
+
+    /// A page of durable events after `after_event_id`, optionally scoped to
+    /// one execution. Unlike [`Self::stream_events`], this returns at once.
+    pub async fn list_events(
+        &self,
+        thread_key: &ThreadKey,
+        after_event_id: i64,
+        execution_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionEvent>, SessionRuntimeError> {
+        if limit <= 0 {
+            return Err(SessionRuntimeError::BadRequest(
+                "limit must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(self
+            .store
+            .list_events_after(thread_key, after_event_id, execution_id, limit)
+            .await?)
+    }
+
+    /// Sessions bound to a principal under one thread-key namespace, most
+    /// recently updated first.
+    pub async fn list_principal_sessions(
+        &self,
+        thread_key_prefix: &str,
+        iron_control_principal: &str,
+        limit: i64,
+    ) -> Result<Vec<Session>, SessionRuntimeError> {
+        if limit <= 0 {
+            return Err(SessionRuntimeError::BadRequest(
+                "limit must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(self
+            .store
+            .list_principal_sessions_with_prefix(thread_key_prefix, iron_control_principal, limit)
+            .await?)
+    }
+
     fn resolve_stored_persona(
         &self,
         persona_id: Option<&str>,
@@ -1886,7 +2017,9 @@ impl SessionRuntime {
         Ok(SessionKeepaliveReceipt {
             thread_key: request.thread_key.as_str().to_owned(),
             sandbox_id: session.sandbox_id,
-            until: retention.effective_until().map(sandbox_retention::format_time),
+            until: retention
+                .effective_until()
+                .map(sandbox_retention::format_time),
             hard_deadline: Some(retention.hard_deadline.clone()),
             applied: outcome.applied,
             active_leases: retention.active_leases(),
@@ -10321,6 +10454,172 @@ mod adoption_tests {
                 .iter()
                 .any(|event| event.event_type == "session.harness_switched")
         );
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn principal_bound_sessions_expose_their_turn_state() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let principal = format!("prn_{}", uuid::Uuid::new_v4().simple());
+        let prefix = format!("mcp-session:{principal}:");
+        let thread_key = ThreadKey::parse(format!("{prefix}s1")).unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+
+        let outcome = runtime
+            .create_or_get_session_with_principal(
+                &thread_key,
+                &runtime.default_session_harness(),
+                None,
+                Some(json!({"source": "mcp"})),
+                HarnessConflictPolicy::Reject,
+                Some(&principal),
+            )
+            .await
+            .expect("create principal-bound session");
+        assert_eq!(
+            outcome.session.iron_control_principal.as_deref(),
+            Some(principal.as_str())
+        );
+        let listed = runtime
+            .list_principal_sessions(&prefix, &principal, 10)
+            .await
+            .expect("list sessions");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].thread_key, thread_key);
+        assert!(
+            runtime
+                .active_execution(&thread_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let execution_id = store
+            .create_execution(&thread_key, Some("msg-1"), json!({}))
+            .await
+            .expect("create execution")
+            .execution
+            .execution_id;
+        assert_eq!(
+            runtime
+                .active_execution(&thread_key)
+                .await
+                .unwrap()
+                .map(|execution| execution.execution_id),
+            Some(execution_id.clone())
+        );
+        assert!(
+            runtime
+                .execution_terminal_event(&execution_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!runtime.execution_has_output(&execution_id).await.unwrap());
+        assert!(
+            !runtime
+                .has_client_message(&thread_key, "msg-1")
+                .await
+                .unwrap()
+        );
+        store
+            .append_messages(
+                &thread_key,
+                &[SessionMessageInput {
+                    client_message_id: Some("msg-1".to_owned()),
+                    role: MessageRole::User,
+                    parts: vec![json!({"type": "text", "text": "hello"})],
+                    metadata: json!({}),
+                }],
+            )
+            .await
+            .expect("append message");
+        assert!(
+            runtime
+                .has_client_message(&thread_key, "msg-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !runtime
+                .has_client_message(&thread_key, "msg-2")
+                .await
+                .unwrap()
+        );
+
+        store
+            .append_event(
+                &thread_key,
+                Some(&execution_id),
+                SESSION_OUTPUT_LINE_EVENT,
+                json!("working"),
+            )
+            .await
+            .expect("append output");
+        assert!(runtime.execution_has_output(&execution_id).await.unwrap());
+        store
+            .append_event(
+                &thread_key,
+                Some(&execution_id),
+                "session.execution_completed",
+                json!({"result_text": "done"}),
+            )
+            .await
+            .expect("append terminal event");
+        store
+            .complete_execution(&execution_id)
+            .await
+            .expect("complete execution");
+
+        assert!(
+            runtime
+                .active_execution(&thread_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let latest = runtime
+            .latest_execution(&thread_key)
+            .await
+            .unwrap()
+            .expect("latest execution");
+        assert_eq!(latest.execution_id, execution_id);
+        assert_eq!(latest.idempotency_key.as_deref(), Some("msg-1"));
+        assert_eq!(
+            runtime
+                .thread_execution(&thread_key, &execution_id)
+                .await
+                .expect("load execution")
+                .status,
+            ExecutionStatus::Completed
+        );
+        let terminal = runtime
+            .execution_terminal_event(&execution_id)
+            .await
+            .unwrap()
+            .expect("terminal event");
+        assert_eq!(terminal.payload["result_text"], "done");
+        let events = runtime
+            .list_events(&thread_key, 0, Some(&execution_id), 10)
+            .await
+            .expect("list events");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![SESSION_OUTPUT_LINE_EVENT, "session.execution_completed"]
+        );
+        assert!(matches!(
+            runtime
+                .list_events(&thread_key, 0, Some(&execution_id), 0)
+                .await,
+            Err(SessionRuntimeError::BadRequest(_))
+        ));
         reset_test_store(&store).await;
     }
 

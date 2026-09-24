@@ -33,6 +33,7 @@ use crate::{
 };
 
 mod search;
+mod sessions;
 
 #[cfg(test)]
 pub(crate) static MCP_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -164,6 +165,9 @@ pub(crate) async fn mcp_post(
             if mcp_v2_tool_name(&params.name) && !mcp_v2_enabled() {
                 return Ok(mcp_json_error(id, -32602, "unknown tool"));
             }
+            if sessions::session_tool_name(&params.name) && !mcp_sessions_enabled() {
+                return Ok(mcp_json_error(id, -32602, "unknown tool"));
+            }
             let tool = if mcp_builtin_tool_name(&params.name) {
                 None
             } else {
@@ -240,6 +244,9 @@ async fn mcp_tool_call_result(
                         timed_out: false,
                     }
                 }),
+                name if sessions::session_tool_name(name) => {
+                    sessions::session_tool_result(state, principal, name, params.arguments).await
+                }
                 _ => unreachable!("non-builtin MCP tools are resolved before dispatch"),
             }
         };
@@ -382,6 +389,18 @@ fn mcp_initialize_result(params: &Value) -> Value {
             .to_owned(),
         );
     }
+    if mcp_sessions_enabled() {
+        let sessions = concat!(
+            "To hand a multi-step task to a Centaur agent that works in its own sandbox, call ",
+            "`centaur_session_send`, then `centaur_session_read` until `done` is true. Continue ",
+            "the conversation by sending again with the same `session_id`."
+        );
+        let instructions = match result["instructions"].as_str() {
+            Some(existing) => format!("{existing} {sessions}"),
+            None => sessions.to_owned(),
+        };
+        result["instructions"] = Value::String(instructions);
+    }
     result
 }
 
@@ -390,6 +409,9 @@ fn mcp_builtin_tools() -> Vec<Value> {
     if mcp_v2_enabled() {
         tools.extend(mcp_v2_tools());
         tools.push(mcp_artifact_get_tool());
+    }
+    if mcp_sessions_enabled() {
+        tools.extend(sessions::session_tools());
     }
     tools.push(mcp_whoami_tool());
     tools
@@ -414,7 +436,9 @@ fn mcp_v2_tool_name(name: &str) -> bool {
 }
 
 fn mcp_builtin_tool_name(name: &str) -> bool {
-    mcp_v2_tool_name(name) || matches!(name, "centaur_artifact_get" | "centaur_whoami")
+    mcp_v2_tool_name(name)
+        || sessions::session_tool_name(name)
+        || matches!(name, "centaur_artifact_get" | "centaur_whoami")
 }
 
 fn mcp_v2_tools() -> Vec<Value> {
@@ -1612,6 +1636,12 @@ fn mcp_v2_enabled() -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
+fn mcp_sessions_enabled() -> bool {
+    static CELL: OnceLock<Option<String>> = OnceLock::new();
+    static_env(&CELL, "CENTAUR_MCP_SESSIONS_ENABLED")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+}
+
 fn console_public_url_env() -> Option<String> {
     static CELL: OnceLock<Option<String>> = OnceLock::new();
     static_env(&CELL, "CENTAUR_CONSOLE_PUBLIC_URL")
@@ -2251,6 +2281,101 @@ def search(query, limit=20):
                     id: Some(json!(1)),
                     method: "tools/call".to_owned(),
                     params: json!({"name": "centaur_catalog_search", "arguments": {}}),
+                }),
+            )
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            if enabled {
+                assert!(mcp_result_is_error(&body["result"]));
+                assert!(
+                    body["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("invalid arguments")
+                );
+            } else {
+                assert_eq!(
+                    body["error"],
+                    json!({"code": -32602, "message": "unknown tool"})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_sessions_feature_flag_gates_discovery_and_calls() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("CENTAUR_JWT_SIGNING_SECRET", "test-secret"),
+            ("CENTAUR_MCP_PUBLIC_URL", "http://localhost:3000/mcp"),
+            ("CENTAUR_CONSOLE_PUBLIC_URL", "http://localhost:3001"),
+            ("CENTAUR_MCP_V2_ENABLED", "false"),
+            ("CENTAUR_MCP_SESSIONS_ENABLED", ""),
+        ]);
+        // SAFETY: ENV_LOCK is held, and the guard restores the original value.
+        unsafe { env::remove_var("CENTAUR_MCP_SESSIONS_ENABLED") };
+        assert!(!mcp_sessions_enabled());
+
+        let state = AppState::unready(crate::auth::ApiAuthConfig::testing("test-secret"));
+        let token = test_jwt(
+            "test-secret",
+            json!({
+                "iss": "http://localhost:3001",
+                "aud": "http://localhost:3000/mcp",
+                "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                "principal_id": "prn_test",
+                "scope": "mcp:tools",
+            }),
+        );
+        for (flag, enabled) in [("", false), ("false", false), ("true", true)] {
+            let _flag = EnvGuard::set(&[("CENTAUR_MCP_SESSIONS_ENABLED", flag)]);
+            let names = mcp_builtin_tools()
+                .into_iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                if enabled {
+                    vec![
+                        "centaur_session_send",
+                        "centaur_session_read",
+                        "centaur_session_interrupt",
+                        "centaur_session_list",
+                        "centaur_whoami",
+                    ]
+                } else {
+                    vec!["centaur_whoami"]
+                }
+            );
+            let initialize = mcp_initialize_result(&json!({}));
+            if enabled {
+                assert!(
+                    initialize["instructions"]
+                        .as_str()
+                        .unwrap()
+                        .contains("`centaur_session_send`")
+                );
+            } else {
+                assert!(initialize.get("instructions").is_none());
+            }
+
+            // Invalid arguments prove enabled calls reach the session tools
+            // without requiring a runtime. Disabled calls fail earlier.
+            let response = mcp_post(
+                State(state.clone()),
+                mcp_auth_headers(&token),
+                Json(McpJsonRpcRequest {
+                    jsonrpc: Some("2.0".to_owned()),
+                    id: Some(json!(1)),
+                    method: "tools/call".to_owned(),
+                    params: json!({"name": "centaur_session_send", "arguments": {}}),
                 }),
             )
             .now_or_never()

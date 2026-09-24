@@ -17,6 +17,20 @@ Search the catalog, load the selected tool's current description and top-level C
 
 Call results include `stdout`, `stderr`, `exit_status`, and `timed_out` in both text and structured content. Plain-text help and JSON output are supported. Nonzero exits and timeouts set MCP `isError`. Calls have a 120-second execution timeout. Existing v1 tools with `method` and `arguments` remain callable for cached clients.
 
+## Agent sessions
+
+Deployments with `CENTAUR_MCP_SESSIONS_ENABLED=true` also expose tools that drive a Centaur agent session. The agent runs in its own harness sandbox with your principal's tools and credentials, and it keeps its conversation across prompts.
+
+```json
+{"name": "centaur_session_send", "arguments": {"prompt": "Find the flaky test in the api-rs CI run and propose a fix."}}
+{"name": "centaur_session_read", "arguments": {"session_id": "<session_id>", "wait_seconds": 45}}
+{"name": "centaur_session_send", "arguments": {"session_id": "<session_id>", "prompt": "Open a draft PR with that fix."}}
+{"name": "centaur_session_interrupt", "arguments": {"session_id": "<session_id>"}}
+{"name": "centaur_session_list", "arguments": {}}
+```
+
+`centaur_session_send` returns at once with `session_id` and `execution_id`. A prompt sent while a turn runs steers that turn. `centaur_session_read` waits up to `wait_seconds` (at most 50) for the turn to finish. It returns a compact progress list and, when `done` is true, `final_answer`. If `done` is false, call it again with `after_event_id` set to `next_after_event_id`. Sessions are private to the principal that started them.
+
 ## Codex
 
 Add this repository as a marketplace and install the plugin:
