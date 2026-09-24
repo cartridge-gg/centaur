@@ -363,8 +363,8 @@ fn mcp_initialize_result(params: &Value) -> Value {
                 "and no state between calls, and is limited to 120 s, 1000 calls and 8 concurrent ",
                 "calls. ",
                 "To hand a multi-step task to a Centaur agent that works in its own sandbox, call ",
-                "`centaur_session_send`. It waits for the turn and returns `final_answer`; if `done` ",
-                "is false, call `centaur_session_read` until it is true. Continue the conversation ",
+                "`session_send`. It waits for the turn and returns `final_answer`; if `done` ",
+                "is false, call `session_read` until it is true. Continue the conversation ",
                 "by sending again with the same `session_id`."
         ),
     })
@@ -1244,10 +1244,10 @@ mod mcp_tests {
                 "centaur_catalog_search",
                 "centaur_catalog_load",
                 "centaur_execute",
-                "centaur_session_send",
-                "centaur_session_read",
-                "centaur_session_interrupt",
-                "centaur_session_list",
+                "session_send",
+                "session_read",
+                "session_interrupt",
+                "session_list",
                 "centaur_whoami",
             ]
         );
@@ -1258,7 +1258,7 @@ mod mcp_tests {
         for expected in [
             "centaur_execute",
             "await tools.<connector>.<function>(args)",
-            "`centaur_session_send`",
+            "`session_send`",
         ] {
             assert!(instructions.contains(expected), "missing {expected}");
         }
@@ -1408,7 +1408,7 @@ mod mcp_tests {
                 jsonrpc: Some("2.0".to_owned()),
                 id: Some(json!(1)),
                 method: "tools/call".to_owned(),
-                params: json!({"name": "centaur_session_send", "arguments": {}}),
+                params: json!({"name": "session_send", "arguments": {}}),
             }),
         )
         .now_or_never()
