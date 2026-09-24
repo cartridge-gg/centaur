@@ -71,4 +71,6 @@ pub enum HarnessServerError {
     CodexStderrUnavailable,
     #[error("codex app-server exited with status {status}")]
     CodexExited { status: ExitStatus },
+    #[error("session transfer failed: {0}")]
+    Transcript(#[from] session_transfer::Error),
 }

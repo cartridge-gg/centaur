@@ -9,6 +9,7 @@ mod nanocodex_subagents;
 mod otel;
 mod server;
 mod traits;
+pub mod transcript;
 mod turn;
 mod util;
 mod validation;
