@@ -694,6 +694,9 @@ fn start_or_resume_thread<W: Write>(
         Some((thread_id, source)) => (OpenThread::Resume(thread_id), *source),
         None => (open, ResumeSource::Explicit),
     };
+    // A thread that a harness switch converted: without its history, the
+    // switch goes back to the session it came from.
+    let required = crate::switch::resume_required();
     let started = match open_thread(
         codex,
         stdout,
@@ -702,10 +705,11 @@ fn start_or_resume_thread<W: Write>(
         model,
         model_provider,
         open,
+        required,
         traceparent,
     ) {
         Ok(started) => started,
-        Err(error) if source == ResumeSource::Persisted => {
+        Err(error) if source == ResumeSource::Persisted && !required => {
             // The rollout for the persisted id is gone or unreadable (a
             // harness upgrade, a wiped CODEX_HOME, a corrupt file). Start a
             // fresh thread on this pod rather than failing the turn: the
@@ -726,6 +730,7 @@ fn start_or_resume_thread<W: Write>(
                 model,
                 model_provider,
                 OpenThread::New,
+                false,
                 traceparent,
             )?
         }
@@ -751,8 +756,13 @@ fn open_thread<W: Write>(
     model: Option<&str>,
     model_provider: &str,
     open: OpenThread<'_>,
+    require_history: bool,
     traceparent: Option<&str>,
 ) -> Result<StartedCodexThread> {
+    let resumed_id = match open {
+        OpenThread::Resume(thread_id) => Some(thread_id.to_owned()),
+        _ => None,
+    };
     let (method, mut params) = thread_params(open, cwd, model_provider);
     // Start the thread on the model its first turn runs. Without this, the
     // thread starts on config.toml's `model` and switches on its first turn,
@@ -774,6 +784,17 @@ fn open_thread<W: Write>(
     let id = next_request_id(request_id);
     codex.send_request(id, method, params, traceparent)?;
     let result = codex.read_response_or_forward(id, stdout, None)?;
+    // Codex resumes a rollout whose lines it cannot parse as a thread with no
+    // turns, and reports no error.
+    if require_history
+        && let Some(session_id) = resumed_id
+        && result
+            .pointer("/thread/turns")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    {
+        return Err(HarnessServerError::ResumedWithoutHistory { session_id });
+    }
     started_codex_thread_from_response(&result, method)
 }
 
