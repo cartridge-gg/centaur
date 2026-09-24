@@ -327,10 +327,43 @@ on Codex:
 
 A turn switches at most once, and never to a provider that is known to be
 exhausted. When a provider is exhausted, api-rs records its reset time, and
-new turns start on the other harness until then. Any authenticated caller,
-including a sandbox, can read that record with `GET /api/provider-health`:
+new turns start on the other harness until then. A client that still asks
+for the old harness gets the session on the new one. Execution metadata
+`{"provider_failover": false}` turns failover off for one execution.
+
+Any authenticated caller, including a sandbox, can read the record of
+exhausted providers with `GET /api/provider-health`:
 `{"exhausted": {"codex": {"until": "<RFC 3339>", "reset_at": <Unix seconds>}}}`.
 A harness that is not listed is not known to be exhausted.
+
+#### One transcript, and a backup
+
+A session has one transcript: the native session of the harness that it runs
+on. Each switch converts that transcript for the other harness, so the history
+of every turn goes with the session, also when it switches back. A request
+with `harness_explicit: true` for the harness that the session left (for
+example `--codex` in Slack) moves the session back in the same sandbox, with a
+conversion of the current transcript. After the sandbox is replaced, the
+request restarts the session on that harness, as before.
+
+A conversion never changes or deletes the session that it reads. That session
+is the backup for a conversion that the other harness cannot read:
+
+- Before a switch, the harness server checks the converted session. Codex
+  must parse every rollout line, and the Claude Code session must be one
+  unbroken chain of messages. If the check fails, the session stays on its
+  harness.
+- After a switch, the new harness must resume the converted session. It does
+  not start a new session without the history. If its first turn fails
+  before it reaches the model, the session goes back to the harness and the
+  session from before the switch, and the turn fails with the reason.
+
+Both cases send a `session.provider_failover` event with `mode: "revert"`,
+and Slack shows "Back on Codex" or "Stayed on Codex". Each switch and each
+revert adds a line to `$CENTAUR_STATE_DIR/centaur-failover-journal.jsonl`
+with the session ids and files on both sides.
+
+#### Provider health checks
 
 api-rs learns about an exhausted provider from failed turns. When the
 provider can report its own capacity, set `apiRs.providerHealth.urls` so that
@@ -346,10 +379,9 @@ apiRs:
   providerHealth:
     urls: "codex=https://pool.example/openai/pool-health,claudecode=https://pool.example/anthropic/pool-health"
     intervalSecs: 60
-``` A client that still asks for
-the old harness gets the session on the new one; only a request with
-`harness_explicit: true` restarts it on the old harness. Execution metadata
-`{"provider_failover": false}` turns failover off for one execution.
+```
+
+#### Settings
 
 ```yaml
 apiRs:

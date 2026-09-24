@@ -574,6 +574,9 @@ fn start_or_resume_thread<W: Write>(
         .ok();
     let persisted_id = persisted_path.as_deref().and_then(read_persisted_thread_id);
     let target = resume_target(env_id.as_deref(), persisted_id.as_deref());
+    // A thread that a harness switch converted: without its history, the
+    // switch goes back to the session it came from.
+    let required = crate::switch::resume_required();
 
     let started = match target {
         Some((thread_id, source)) => {
@@ -585,8 +588,21 @@ fn start_or_resume_thread<W: Write>(
                 traceparent,
             )?;
             match codex.read_response_or_forward(id, stdout) {
+                // Codex resumes a rollout whose lines it cannot parse as a
+                // thread with no turns, and reports no error.
+                Ok(result)
+                    if required
+                        && result
+                            .pointer("/thread/turns")
+                            .and_then(Value::as_array)
+                            .is_some_and(Vec::is_empty) =>
+                {
+                    return Err(HarnessServerError::ResumedWithoutHistory {
+                        session_id: thread_id,
+                    });
+                }
                 Ok(result) => started_codex_thread_from_response(&result, "thread/resume")?,
-                Err(error) if source == ResumeSource::Persisted => {
+                Err(error) if source == ResumeSource::Persisted && !required => {
                     // The rollout for the persisted id is gone or unreadable
                     // (a harness upgrade, a wiped CODEX_HOME, a corrupt file).
                     // Start a fresh thread on this pod rather than failing the

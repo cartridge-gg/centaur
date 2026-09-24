@@ -28,7 +28,7 @@
 {"timestamp": "2026-09-20T10:00:00.000Z", "type": "response_item", "payload": {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "rust regex lookbehind"}}}
 {"timestamp": "2026-09-20T10:00:00.000Z", "type": "response_item", "payload": {"type": "web_search_call", "status": "completed"}}
 {"timestamp": "2026-09-20T10:00:00.000Z", "type": "response_item", "payload": {"type": "tool_search_call", "id": "ts_1"}}
-{"timestamp": "x", "type": 
+{"timestamp": "x", "type":
 
 42
 {"timestamp": "2026-09-20T10:00:00.000Z", "type": "response_item", "payload": null}

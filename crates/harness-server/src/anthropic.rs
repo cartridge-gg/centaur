@@ -45,6 +45,10 @@ pub enum AnthropicStreamEvent {
         is_error: bool,
         error: Option<Value>,
         message: Option<String>,
+        /// The errors of an `error_during_execution` result, for example
+        /// "No conversation found with session ID: ...".
+        #[serde(default)]
+        errors: Vec<Value>,
         usage: Option<Value>,
     },
     Error {
@@ -282,9 +286,10 @@ impl AnthropicEventNormalizer {
                 is_error,
                 error,
                 message,
+                errors,
                 usage: _,
             } => NormalizedEvent::Result {
-                error: result_error_text(subtype, is_error, error, message, result),
+                error: result_error_text(subtype, is_error, error, message, result, &errors),
             },
             AnthropicStreamEvent::Error {
                 error,
@@ -430,12 +435,15 @@ fn result_error_text(
     error: Option<Value>,
     message: Option<String>,
     result: Option<String>,
+    errors: &[Value],
 ) -> Option<String> {
     let subtype_is_error = subtype
         .as_deref()
         .is_some_and(|subtype| !matches!(subtype, "" | "success"));
     if is_error || subtype_is_error {
+        let errors: Vec<&str> = errors.iter().filter_map(Value::as_str).collect();
         event_error_text(error, message, result)
+            .or_else(|| (!errors.is_empty()).then(|| errors.join("; ")))
             .or_else(|| Some("harness reported an error".to_string()))
     } else {
         None
@@ -634,5 +642,21 @@ mod tests {
             panic!("the result fails the turn: {:?}", events[1]);
         };
         assert!(error.starts_with("API Error: 503"), "{error}");
+    }
+
+    #[test]
+    fn a_result_names_its_errors() {
+        // Recorded from Claude Code 2.1.281: `--resume` of a missing session.
+        let line = r#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"11111111-2222-4333-8444-000000000000","errors":["No conversation found with session ID: 11111111-2222-4333-8444-000000000000"],"result_index":0}"#;
+        let event = AnthropicStreamEvent::parse_json_line(line).unwrap();
+        let NormalizedEvent::Result { error: Some(error) } =
+            AnthropicEventNormalizer::default().normalize(event)
+        else {
+            panic!("the result fails the turn");
+        };
+        assert_eq!(
+            error,
+            "No conversation found with session ID: 11111111-2222-4333-8444-000000000000"
+        );
     }
 }

@@ -181,7 +181,7 @@ export class CodexAppServerRendererEventMapper
     // A switch in the sandbox arrives twice: as its output line and as the
     // control plane's session event. Show it once.
     const failover = providerFailoverTask(event, `task-${this.state.stepCounter + 1}`)
-    const failoverKey = `${event?.from}->${event?.to}`
+    const failoverKey = `${event?.from}->${event?.to}:${event?.mode}`
     if (failover && !this.state.providerFailovers.has(failoverKey)) {
       this.state.providerFailovers.add(failoverKey)
       this.state.stepCounter += 1
@@ -828,29 +828,51 @@ function harnessLabel(name: unknown): string {
   return typeof name === 'string' ? (HARNESS_LABELS[name] ?? name) : 'another harness'
 }
 
+/** The reason of a revert, cut to a length that fits a task line. */
+function revertReason(reason: unknown): string {
+  if (typeof reason !== 'string' || !reason.trim()) return ''
+  const text = reason.trim()
+  return ` (${text.length > 200 ? `${text.slice(0, 199)}…` : text})`
+}
+
 /**
  * A completed task that tells the user that the session moved to another
- * harness because its model provider had no capacity left (harness-server
- * switch.rs prints `centaur/providerFailover`).
+ * harness (harness-server switch.rs prints `centaur/providerFailover`): its
+ * model provider had no capacity left, or the user asked for the harness. A
+ * revert says that the other harness could not use the converted session, so
+ * the session continues with its own history.
  */
 function providerFailoverTask(event: any, id: string): HarnessTask | null {
   if (event?.type !== 'centaur.providerFailover') return null
   const from = harnessLabel(event.from)
   const to = harnessLabel(event.to)
-  const history =
-    event.history === 'empty' ? '' : ' with its history'
-  return {
+  const task = (title: string, text: string): HarnessTask => ({
     id,
-    title: `Switched to ${to}`,
+    title,
     status: 'complete',
-    details: [
-      {
-        type: 'text',
-        text: `${from} has no model capacity left${untilText(event.providerExhausted)}, so this session continues on ${to}${history}.`
-      }
-    ],
+    details: [{ type: 'text', text }],
     output: []
+  })
+  if (event.mode === 'revert') {
+    const reason = revertReason(event.reason)
+    return event.stage === 'convert'
+      ? task(
+          `Stayed on ${to}`,
+          `The session could not be converted for ${from}${reason}, so it stays on ${to}.`
+        )
+      : task(
+          `Back on ${to}`,
+          `${from} could not read the converted session${reason}, so this session is back on ${to} with its own history.`
+        )
   }
+  const history = event.history === 'empty' ? '' : ' with its history'
+  if (event.mode === 'requested') {
+    return task(`Switched to ${to}`, `As requested, this session continues on ${to}${history}.`)
+  }
+  return task(
+    `Switched to ${to}`,
+    `${from} has no model capacity left${untilText(event.providerExhausted)}, so this session continues on ${to}${history}.`
+  )
 }
 
 /** Codex reconnects dropped model streams and emits `error` with `willRetry: true`. */
