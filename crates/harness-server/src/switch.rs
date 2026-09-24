@@ -20,12 +20,32 @@
 //! directive to a user line:
 //!
 //! ```json
-//! {"type": "user", "centaur": {"harness": "claudecode", "failover": {"enabled": true, "model": "..."}}}
+//! {"type": "user", "centaur": {"harness": "claudecode", "mode": "requested", "failover": {"enabled": true, "model": "..."}}}
 //! ```
 //!
 //! If `harness` is not the active harness, the session moves before the turn
-//! starts. `failover.enabled: false` turns off the switch for the turn, and
-//! `failover.model` is the model for the turn after a switch.
+//! starts. `mode: "requested"` says that the user asked for the harness; the
+//! notice then has that mode instead of `proactive`. `failover.enabled: false`
+//! turns off the switch for the turn, and `failover.model` is the model for
+//! the turn after a switch.
+//!
+//! The session has one transcript: the one of the active harness. Each switch
+//! converts it, so the history of every turn goes with the session. The
+//! conversion never changes or deletes the session that it reads. That
+//! session is the backup for a conversion that the other harness cannot read:
+//!
+//! - Before a switch, the converted session must pass
+//!   [`check_converted`](crate::transcript::check_converted). If it does not,
+//!   the session stays where it is.
+//! - The new harness must resume the converted session
+//!   (`CENTAUR_SESSION_RESUME_REQUIRED`); it does not start a new session
+//!   without the history. If its first turn fails before it reaches the
+//!   model, the session goes back to the harness and session from before the
+//!   switch (`mode: "revert"`), and the turn ends with the failure.
+//!
+//! Every switch, and every revert, appends a line to
+//! `$CENTAUR_STATE_DIR/centaur-failover-journal.jsonl` with the session ids
+//! and files on both sides.
 
 use std::collections::VecDeque;
 use std::env;
@@ -57,7 +77,12 @@ pub const SWITCHING_ENV: &str = "CENTAUR_HARNESS_SWITCHING";
 pub const FAILOVER_METHOD: &str = "centaur/providerFailover";
 /// Names the active harness, so that a new process continues on it.
 const ACTIVE_HARNESS_FILE: &str = "centaur-active-harness";
+/// One JSON line per switch, next to the active-harness file.
+const JOURNAL_FILE: &str = "centaur-failover-journal.jsonl";
 const STATE_DIR_ENV: &str = "CENTAUR_STATE_DIR";
+/// Set on a harness child that starts on a converted session: it fails when
+/// it cannot resume that session, instead of starting a new one.
+pub(crate) const RESUME_REQUIRED_ENV: &str = "CENTAUR_SESSION_RESUME_REQUIRED";
 /// How long a turn that stops for a switch can take to end.
 const TURN_STOP_GRACE: Duration = Duration::from_secs(20);
 /// How long a child can take to exit after its stdin closes.
@@ -65,6 +90,11 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 
 pub fn switching_enabled() -> bool {
     env_flag_enabled(env::var(SWITCHING_ENV).ok().as_deref())
+}
+
+/// True in a harness child that must resume its persisted session.
+pub(crate) fn resume_required() -> bool {
+    env_flag_enabled(env::var(RESUME_REQUIRED_ENV).ok().as_deref())
 }
 
 /// Runs the blocks server of `requested` (or of the harness that the session
@@ -111,6 +141,42 @@ fn persisted_id_file(tool: Tool, homes: &Homes) -> PathBuf {
     }
 }
 
+/// The file of session `id` of `tool`, found by its name: Codex names a
+/// rollout after its thread id, Claude Code a transcript after its session id.
+fn session_file(tool: Tool, id: &str, homes: &Homes) -> Option<PathBuf> {
+    fn walk(dir: &Path, matches: &dyn Fn(&str) -> bool, depth: usize) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() && depth > 0 {
+                if let Some(found) = walk(&path, matches, depth - 1) {
+                    return Some(found);
+                }
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(matches)
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+    match tool {
+        Tool::Codex => {
+            let suffix = format!("-{id}.jsonl");
+            walk(
+                &homes.codex.join("sessions"),
+                &|name| name.starts_with("rollout-") && name.ends_with(&suffix),
+                3,
+            )
+        }
+        Tool::Claude => {
+            let name = format!("{id}.jsonl");
+            walk(&homes.claude.join("projects"), &|file| file == name, 1)
+        }
+    }
+}
+
 fn read_line_file(path: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
     let line = contents.trim();
@@ -144,7 +210,19 @@ impl Default for FailoverDirective {
 #[serde(default)]
 struct Directive {
     harness: Option<String>,
+    /// `requested` when the user asked for `harness`.
+    mode: Option<String>,
     failover: FailoverDirective,
+}
+
+impl Directive {
+    /// The mode of a switch to `harness` before the turn.
+    fn switch_mode(&self) -> &'static str {
+        match self.mode.as_deref() {
+            Some("requested") => "requested",
+            _ => "proactive",
+        }
+    }
 }
 
 /// Removes the `centaur` directive from a user line and returns it.
@@ -202,6 +280,31 @@ fn reports_on_turn(value: &Value, turn_id: Option<&str>) -> bool {
     notification_method(value) == Some("error") || ends_turn(value, turn_id)
 }
 
+fn turn_status(value: &Value) -> Option<&str> {
+    value.pointer("/params/turn/status").and_then(Value::as_str)
+}
+
+/// True for a line that ends a turn with a failure: an `error` that is not
+/// retried, or a failed turn.
+fn ends_in_failure(value: &Value) -> bool {
+    match notification_method(value) {
+        Some("error") => !will_retry(value),
+        Some("turn/failed") => true,
+        Some("turn/completed") => turn_status(value) == Some("failed"),
+        _ => false,
+    }
+}
+
+/// The error text of a failure line.
+fn failure_message(value: &Value) -> String {
+    value
+        .pointer("/params/error/message")
+        .or_else(|| value.pointer("/params/turn/error/message"))
+        .and_then(Value::as_str)
+        .unwrap_or("the turn failed")
+        .to_owned()
+}
+
 /// True for an item that shows work of the model: an answer, a tool call or
 /// a file change. Such work is in the history, so the turn must not run again.
 fn is_work_item(value: &Value) -> bool {
@@ -252,18 +355,24 @@ fn continue_line(original: Option<&Value>, from: Tool, to: Tool) -> Value {
     line
 }
 
-/// Adds `params.centaur.failover` to a line that the switch did not replace.
-fn mark_failover_unavailable(line: &mut Value, error: &str) {
+/// Sets `params.centaur.<key>` on a line that reaches the client.
+fn annotate(line: &mut Value, key: &str, value: Value) {
     let Some(params) = line.get_mut("params").and_then(Value::as_object_mut) else {
         return;
     };
     let centaur = params.entry("centaur").or_insert_with(|| json!({}));
     if let Some(centaur) = centaur.as_object_mut() {
-        centaur.insert(
-            "failover".to_string(),
-            json!({"status": "unavailable", "error": error}),
-        );
+        centaur.insert(key.to_string(), value);
     }
+}
+
+/// Adds `params.centaur.failover` to a line that the switch did not replace.
+fn mark_failover_unavailable(line: &mut Value, error: &str) {
+    annotate(
+        line,
+        "failover",
+        json!({"status": "unavailable", "error": error}),
+    );
 }
 
 enum Event {
@@ -283,17 +392,28 @@ struct HarnessChild {
 
 impl HarnessChild {
     /// `moved`: the session came from another harness, so an operator's
-    /// thread to continue does not apply.
-    fn spawn(tool: Tool, generation: u64, events: &Sender<Event>, moved: bool) -> Result<Self> {
+    /// thread to continue does not apply. `converted`: the child starts on a
+    /// converted session and must resume it.
+    fn spawn(
+        tool: Tool,
+        generation: u64,
+        events: &Sender<Event>,
+        moved: bool,
+        converted: bool,
+    ) -> Result<Self> {
         let mut command = Command::new(env::current_exe()?);
         command
             .arg(subcommand(tool))
             .env_remove(SWITCHING_ENV)
+            .env_remove(RESUME_REQUIRED_ENV)
             .env(CODEX_THREAD_PERSIST_ENV, "1")
             .env(CLAUDE_SESSION_PERSIST_ENV, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        if converted {
+            command.env(RESUME_REQUIRED_ENV, "1");
+        }
         if moved {
             command
                 .env_remove("CODEX_CONTINUE_THREAD_ID")
@@ -399,11 +519,77 @@ struct Turn {
     may_fail_over: bool,
 }
 
-/// The converted history for the next harness.
+/// The session that the next harness resumes, and where it came from.
 struct History {
+    /// `converted`, `empty` (a new session) or `original` (the session from
+    /// before a switch that did not work).
+    kind: &'static str,
     source_id: Option<String>,
-    /// `None` if the source session has nothing to carry over.
-    converted: Option<Converted>,
+    source_path: Option<PathBuf>,
+    session_id: Option<String>,
+    session_path: Option<PathBuf>,
+}
+
+impl History {
+    fn empty(source_id: Option<String>, source_path: Option<PathBuf>) -> Self {
+        Self {
+            kind: "empty",
+            source_id,
+            source_path,
+            session_id: None,
+            session_path: None,
+        }
+    }
+
+    fn converted(source_id: String, source_path: Option<PathBuf>, converted: &Converted) -> Self {
+        Self {
+            kind: "converted",
+            source_id: Some(source_id),
+            source_path,
+            session_id: Some(converted.id.to_string()),
+            session_path: Some(converted.path.clone()),
+        }
+    }
+}
+
+/// Why the session cannot move to the other harness.
+enum MoveError {
+    /// The active harness has no session yet.
+    NoSession,
+    /// The conversion failed, or the other harness cannot read its result.
+    Failed(String),
+}
+
+impl From<session_transfer::Error> for MoveError {
+    fn from(error: session_transfer::Error) -> Self {
+        match error {
+            session_transfer::Error::NotFound { .. } => Self::NoSession,
+            error => Self::Failed(error.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for MoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSession => f.write_str("the active harness has no session yet"),
+            Self::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// A child that started on a converted session and did not show yet that it
+/// can read it. It has shown that when its turn reaches the model.
+struct Probation {
+    /// The harness and session to go back to.
+    original: Tool,
+    original_id: Option<String>,
+    original_path: Option<PathBuf>,
+    converted_id: Option<String>,
+    converted_path: Option<PathBuf>,
+    /// The exhaustion that caused a reactive switch. The turn ends with it
+    /// if the session goes back.
+    exhausted: Option<Value>,
 }
 
 struct Supervisor {
@@ -420,16 +606,19 @@ struct Supervisor {
     cwd: PathBuf,
     homes: Homes,
     marker: PathBuf,
+    journal: PathBuf,
+    probation: Option<Probation>,
 }
 
 impl Supervisor {
     fn start(requested: Tool) -> Result<Self> {
         let homes = Homes::from_env();
-        let marker = env::var_os(STATE_DIR_ENV)
+        let state_dir = env::var_os(STATE_DIR_ENV)
             .filter(|dir| !dir.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| homes.codex.clone())
-            .join(ACTIVE_HARNESS_FILE);
+            .unwrap_or_else(|| homes.codex.clone());
+        let marker = state_dir.join(ACTIVE_HARNESS_FILE);
+        let journal = state_dir.join(JOURNAL_FILE);
         // The session moved in an earlier process: continue where it is.
         let active = read_line_file(&marker)
             .as_deref()
@@ -444,7 +633,7 @@ impl Supervisor {
         }
         let (events_tx, events) = mpsc::channel();
         spawn_stdin_reader(events_tx.clone());
-        let child = HarnessChild::spawn(active, 0, &events_tx, active != requested)?;
+        let child = HarnessChild::spawn(active, 0, &events_tx, active != requested, false)?;
         let supervisor = Self {
             events_tx,
             events,
@@ -458,6 +647,8 @@ impl Supervisor {
             cwd: env::current_dir()?,
             homes,
             marker,
+            journal,
+            probation: None,
         };
         supervisor.write_marker();
         Ok(supervisor)
@@ -524,7 +715,7 @@ impl Supervisor {
                                 self.child.tool.label()
                             );
                         } else {
-                            self.switch_before_turn(to)?;
+                            self.switch_before_turn(to, directive.switch_mode())?;
                         }
                     }
                     self.queued.push_back(TurnInput {
@@ -569,6 +760,18 @@ impl Supervisor {
         }
 
         let exhausted = value.pointer("/params/centaur/providerExhausted");
+        if self.probation.is_some() {
+            // Model output, or an answer of the model provider: the child
+            // read the session.
+            if exhausted.is_some()
+                || is_work_item(&value)
+                || turn_status(&value) == Some("completed")
+            {
+                self.probation = None;
+            } else if ends_in_failure(&value) {
+                return self.revert(value);
+            }
+        }
         if let (Some(exhausted), Some(turn)) = (exhausted, &self.turn)
             && turn.may_fail_over
             && reports_on_turn(&value, turn.id.as_deref())
@@ -633,6 +836,9 @@ impl Supervisor {
                 "providerExhausted": exhausted,
             }),
         )?;
+        if let Some(probation) = &mut self.probation {
+            probation.exhausted = Some(exhausted);
+        }
 
         let failover = turn
             .input
@@ -666,48 +872,142 @@ impl Supervisor {
     }
 
     /// The control plane asked for another harness: move before the turn.
-    fn switch_before_turn(&mut self, to: Tool) -> Result<()> {
+    /// If the session cannot move, it stays, and the notice says so.
+    fn switch_before_turn(&mut self, to: Tool, mode: &str) -> Result<()> {
         let from = self.child.tool;
         let history = match self.prepare_history(from, to, TrailingPrompt::Keep) {
             Ok(history) => history,
             // No session yet: the new harness starts one.
-            Err(session_transfer::Error::NotFound { .. }) => History {
-                source_id: None,
-                converted: None,
-            },
-            Err(error) => {
+            Err(MoveError::NoSession) => History::empty(None, None),
+            Err(MoveError::Failed(reason)) => {
                 eprintln!(
-                    "harness-server: cannot move the session from {} to {}; staying on {}: {error}",
+                    "harness-server: cannot move the session from {} to {}; staying on {}: {reason}",
                     from.label(),
                     to.label(),
                     from.label()
                 );
-                return Ok(());
+                return self.report_stay(to, &reason);
             }
         };
-        self.switch_child(to, &history, json!({"mode": "proactive"}))
+        self.switch_child(to, &history, json!({"mode": mode}))
     }
 
-    /// Converts the active session and writes it for `to`. Nothing changes
-    /// for the running child.
+    /// The session could not move to `to` and stays on the active harness,
+    /// with its own session. The control plane can have recorded the move
+    /// already (a switch that the user asked for), so the notice reports a
+    /// revert from `to`.
+    fn report_stay(&mut self, to: Tool, reason: &str) -> Result<()> {
+        let active = self.child.tool;
+        let session_id = read_line_file(&persisted_id_file(active, &self.homes));
+        let session_path = session_id
+            .as_deref()
+            .and_then(|id| session_file(active, id, &self.homes));
+        let params = json!({
+            "from": harness_name(to),
+            "to": harness_name(active),
+            "mode": "revert",
+            "stage": "convert",
+            "reason": reason,
+            "history": "original",
+            "sessionId": session_id,
+            "sourceSessionId": null,
+        });
+        let mut entry = params.clone();
+        entry["at"] = json!(Local::now().to_rfc3339());
+        entry["path"] = json!(session_path);
+        self.append_journal(&entry);
+        self.emit_value(&json!({"method": FAILOVER_METHOD, "params": params}))
+    }
+
+    /// The child could not read the converted session: the session goes back
+    /// to the harness and the session from before the switch, which the
+    /// conversion did not change. The turn ends with `trigger`, the failure.
+    fn revert(&mut self, mut trigger: Value) -> Result<()> {
+        let probation = self.probation.take().expect("a child on probation");
+        let failed = self.child.tool;
+        let original = probation.original;
+        let reason = failure_message(&trigger);
+        eprintln!(
+            "harness-server: {} cannot continue the converted session; going back to {}: {reason}",
+            failed.label(),
+            original.label()
+        );
+        // The failed turn ends here. If it did not start, its input is the
+        // first one that the child had.
+        if self.turn.take().is_none() {
+            self.queued.pop_front();
+        }
+        // Nothing resumes the converted session again. Its file stays.
+        let converted_id_file = persisted_id_file(failed, &self.homes);
+        if let Err(error) = std::fs::remove_file(&converted_id_file)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "harness-server: cannot remove {}: {error}",
+                converted_id_file.display()
+            );
+        }
+        if let Some(id) = &probation.original_id
+            && let Err(error) = write_line_file(&persisted_id_file(original, &self.homes), id)
+        {
+            eprintln!(
+                "harness-server: cannot point {} at its session again: {error}",
+                original.label()
+            );
+        }
+        let waiting: Vec<TurnInput> = self.queued.drain(..).collect();
+        let history = History {
+            kind: "original",
+            source_id: probation.converted_id,
+            source_path: probation.converted_path,
+            session_id: probation.original_id,
+            session_path: probation.original_path,
+        };
+        self.switch_child(
+            original,
+            &history,
+            json!({"mode": "revert", "stage": "resume", "reason": reason}),
+        )?;
+        // Turns that waited go to the original harness, and do not switch.
+        for input in waiting {
+            let line = for_other_harness(input.line);
+            self.child.send_value(&line);
+            self.queued.push_back(TurnInput {
+                line,
+                replayed: true,
+                ..input
+            });
+        }
+        if self.stdin_closed {
+            self.child.close_stdin();
+        }
+        annotate(
+            &mut trigger,
+            "failover",
+            json!({"status": "reverted", "error": reason}),
+        );
+        if let Some(exhausted) = probation.exhausted {
+            annotate(&mut trigger, "providerExhausted", exhausted);
+        }
+        self.emit_value(&trigger)
+    }
+
+    /// Converts the active session, checks that `to` can read the result,
+    /// and writes it for `to`. Nothing changes for the running child.
     fn prepare_history(
         &self,
         from: Tool,
         to: Tool,
         trailing_prompt: TrailingPrompt,
-    ) -> std::result::Result<History, session_transfer::Error> {
+    ) -> std::result::Result<History, MoveError> {
         let id_file = persisted_id_file(from, &self.homes);
-        let source_id =
-            read_line_file(&id_file).ok_or_else(|| session_transfer::Error::NotFound {
-                tool: from,
-                reference: "the active session".to_string(),
-                dir: id_file.clone(),
-            })?;
+        let source_id = read_line_file(&id_file).ok_or(MoveError::NoSession)?;
         let session = resolve_session(
             from,
             &SessionRef::Query(source_id.clone()),
             self.homes.get(from),
         )?;
+        let source_path = session_file(from, &source_id, &self.homes);
         let target = Target {
             home: self.homes.get(to).to_path_buf(),
             cwd: self.cwd.to_string_lossy().into_owned(),
@@ -723,31 +1023,31 @@ impl Supervisor {
             codex_model_provider: crate::codex::default_model_provider(),
         };
         let target_id_file = persisted_id_file(to, &self.homes);
-        let write_error = |source| session_transfer::Error::Write {
-            path: target_id_file.clone(),
-            source,
+        let write_error = |error: io::Error| {
+            MoveError::Failed(format!(
+                "cannot write {}: {error}",
+                target_id_file.display()
+            ))
         };
-        let converted = match convert(&session, to, &target, &options) {
+        match convert(&session, to, &target, &options) {
             Ok(converted) => {
+                crate::transcript::check_converted(&converted)
+                    .map_err(|error| MoveError::Failed(error.to_string()))?;
                 converted.write()?;
                 write_line_file(&target_id_file, &converted.id.to_string()).map_err(write_error)?;
-                Some(converted)
+                Ok(History::converted(source_id, source_path, &converted))
             }
             // Only a prompt that failed: the new harness starts a new session.
             Err(session_transfer::Error::EmptySession { .. }) => {
                 match std::fs::remove_file(&target_id_file) {
                     Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                        return Err(write_error(error));
+                        Err(write_error(error))
                     }
-                    _ => None,
+                    _ => Ok(History::empty(Some(source_id), source_path)),
                 }
             }
-            Err(error) => return Err(error),
-        };
-        Ok(History {
-            source_id: Some(source_id),
-            converted,
-        })
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Interrupts the running turn and waits for its end. Stdin that arrives
@@ -776,29 +1076,69 @@ impl Supervisor {
         }
     }
 
-    /// Replaces the child with one for `to`, which resumes the converted
-    /// session, and prints the notification.
+    /// Replaces the child with one for `to`, which resumes the session of
+    /// `history`, records the switch in the journal, and prints the
+    /// notification. A child on a converted session starts on probation.
     fn switch_child(&mut self, to: Tool, history: &History, details: Value) -> Result<()> {
         let from = self.child.tool;
+        let converted = history.kind == "converted";
         self.child.stop();
-        self.child = HarnessChild::spawn(to, self.child.generation + 1, &self.events_tx, true)?;
+        self.child = HarnessChild::spawn(
+            to,
+            self.child.generation + 1,
+            &self.events_tx,
+            true,
+            converted,
+        )?;
+        self.probation = converted.then(|| Probation {
+            original: from,
+            original_id: history.source_id.clone(),
+            original_path: history.source_path.clone(),
+            converted_id: history.session_id.clone(),
+            converted_path: history.session_path.clone(),
+            exhausted: None,
+        });
         self.write_marker();
         let mut params = json!({
             "from": harness_name(from),
             "to": harness_name(to),
-            "history": if history.converted.is_some() { "converted" } else { "empty" },
-            "sessionId": history.converted.as_ref().map(|c| c.id.to_string()),
+            "history": history.kind,
+            "sessionId": history.session_id,
             "sourceSessionId": history.source_id,
         });
         if let (Some(params), Some(details)) = (params.as_object_mut(), details.as_object()) {
             params.extend(details.clone());
         }
+        let mut entry = params.clone();
+        entry["at"] = json!(Local::now().to_rfc3339());
+        entry["sourcePath"] = json!(history.source_path);
+        entry["path"] = json!(history.session_path);
+        self.append_journal(&entry);
         eprintln!(
             "harness-server: the session moved from {} to {}",
             from.label(),
             to.label()
         );
         self.emit_value(&json!({"method": FAILOVER_METHOD, "params": params}))
+    }
+
+    fn append_journal(&self, entry: &Value) {
+        let append = || -> io::Result<()> {
+            if let Some(dir) = self.journal.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.journal)?;
+            writeln!(file, "{entry}")
+        };
+        if let Err(error) = append() {
+            eprintln!(
+                "harness-server: cannot write {}: {error}",
+                self.journal.display()
+            );
+        }
     }
 
     fn write_marker(&self) {
@@ -854,16 +1194,19 @@ mod tests {
 
     #[test]
     fn the_directive_is_taken_out_of_the_line() {
-        let mut line = json!({"type": "user", "text": "hi", "centaur": {"harness": "claudecode", "failover": {"enabled": false, "model": "m"}}});
+        let mut line = json!({"type": "user", "text": "hi", "centaur": {"harness": "claudecode", "mode": "requested", "failover": {"enabled": false, "model": "m"}}});
         let directive = take_directive(&mut line);
         assert_eq!(line, json!({"type": "user", "text": "hi"}));
         assert_eq!(directive.harness.as_deref(), Some("claudecode"));
+        assert_eq!(directive.switch_mode(), "requested");
         assert!(!directive.failover.enabled);
         assert_eq!(directive.failover.model.as_deref(), Some("m"));
 
         // No directive, or a broken one: failover stays on.
         let mut line = json!({"type": "user", "centaur": {"failover": "yes"}});
         assert!(take_directive(&mut line).failover.enabled);
+        let mut line = json!({"type": "user", "centaur": {"harness": "codex", "mode": "other"}});
+        assert_eq!(take_directive(&mut line).switch_mode(), "proactive");
         assert!(
             take_directive(&mut json!({"type": "user"}))
                 .failover
@@ -923,6 +1266,54 @@ mod tests {
         let text = line["message"]["content"].as_str().unwrap();
         assert!(text.starts_with("[Centaur]"), "{text}");
         assert!(text.contains("from Codex CLI") && text.contains("to Claude Code"));
+    }
+
+    #[test]
+    fn a_failure_ends_a_turn_and_names_its_error() {
+        let failed = json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "failed", "error": {"message": "No conversation found"}}}});
+        assert!(ends_in_failure(&failed));
+        assert_eq!(failure_message(&failed), "No conversation found");
+        let error = json!({"method": "error", "params": {"error": {"message": "no history"}, "willRetry": false}});
+        assert!(ends_in_failure(&error));
+        assert_eq!(failure_message(&error), "no history");
+        assert!(!ends_in_failure(
+            &json!({"method": "error", "params": {"willRetry": true}})
+        ));
+        assert!(!ends_in_failure(
+            &json!({"method": "turn/completed", "params": {"turn": {"status": "interrupted"}}})
+        ));
+        assert!(!ends_in_failure(
+            &json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+        ));
+        assert_eq!(
+            failure_message(&json!({"method": "turn/failed", "params": {}})),
+            "the turn failed"
+        );
+    }
+
+    #[test]
+    fn session_files_are_found_by_their_names() {
+        let root = std::env::temp_dir().join(format!("switch-files-{}", Uuid::new_v4().simple()));
+        let homes = Homes {
+            codex: root.join("codex"),
+            claude: root.join("claude"),
+        };
+        let rollout = homes
+            .codex
+            .join("sessions/2026/09/24/rollout-2026-09-24T10-00-00-thread-7.jsonl");
+        let transcript = homes.claude.join("projects/-work-app/session-7.jsonl");
+        for file in [&rollout, &transcript] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "{}\n").unwrap();
+        }
+        assert_eq!(session_file(Tool::Codex, "thread-7", &homes), Some(rollout));
+        assert_eq!(
+            session_file(Tool::Claude, "session-7", &homes),
+            Some(transcript)
+        );
+        assert_eq!(session_file(Tool::Codex, "thread-8", &homes), None);
+        assert_eq!(session_file(Tool::Claude, "session", &homes), None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
