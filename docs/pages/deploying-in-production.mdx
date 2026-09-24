@@ -313,7 +313,10 @@ on Codex:
 1. The harness server in the sandbox detects the exhausted provider. Native
    usage-limit errors always count. Set `apiRs.providerExhaustedMarkers` to
    the error code of a proxy that pools accounts, so that its pool-exhausted
-   error counts too.
+   error counts too. Put the code in the error message: Codex keeps only the
+   message. For Claude Code, return a `rate_limit_error` or `api_error` body
+   with `x-should-retry: false`. Claude Code retries an `overloaded_error`
+   and then shows a generic overload text without the proxy's message.
 2. It holds back the failure, converts the native session (the full history,
    with tool calls as text), and resumes it on the other harness in the same
    sandbox. The workspace and the state volume stay.
