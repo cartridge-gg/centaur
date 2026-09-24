@@ -74,6 +74,22 @@ updates:
         patterns:
           - "*"
 
+  - package-ecosystem: cargo
+    directory: /crates/session-transfer
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Denver
+    commit-message:
+      prefix: chore
+      include: scope
+    open-pull-requests-limit: 5
+    groups:
+      session-transfer-dependencies:
+        patterns:
+          - "*"
+
   - package-ecosystem: npm
     directories:
       - /

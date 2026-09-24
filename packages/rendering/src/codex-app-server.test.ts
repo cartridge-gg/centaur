@@ -833,6 +833,129 @@ describe('isRetryableCodexErrorNotification', () => {
   })
 })
 
+describe('CodexAppServerRendererEventMapper provider exhaustion', () => {
+  const exhausted = {
+    resetAt: 1790220376,
+    signal: 'poolMarker',
+    detail: 'unexpected status 503: pool_exhausted'
+  }
+
+  it('explains a Codex error from an exhausted provider', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      method: 'error',
+      params: {
+        error: { message: 'unexpected status 503: pool_exhausted', codexErrorInfo: 'other' },
+        willRetry: false,
+        centaur: { providerExhausted: exhausted }
+      }
+    })
+    const done = events.find(event => event.type === 'renderer.done')
+    expect(done).toMatchObject({
+      type: 'renderer.done',
+      error: expect.stringContaining('no capacity left until 2026-09-24 03:26 UTC')
+    })
+  })
+
+  it('explains a failed Claude turn from an exhausted provider, without a reset time', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      method: 'turn/completed',
+      params: {
+        turn: { id: 't', status: 'failed', error: { message: 'API Error: 503 pool_exhausted' } },
+        centaur: { providerExhausted: { signal: 'usageLimit', detail: 'usage limit reached' } }
+      }
+    })
+    const done = events.find(event => event.type === 'renderer.done')
+    expect(done).toMatchObject({
+      type: 'renderer.done',
+      error: expect.stringMatching(/^The model provider has no capacity left: /)
+    })
+  })
+
+  it('shows a switch to another harness as a completed task', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      method: 'centaur/providerFailover',
+      params: {
+        from: 'codex',
+        to: 'claudecode',
+        mode: 'reactive',
+        resume: 'replay',
+        history: 'converted',
+        sessionId: '00000000-0000-4000-8000-000000000001',
+        providerExhausted: exhausted
+      }
+    })
+    const update = events.find(event => event.type === 'renderer.task.update')
+    expect(update).toMatchObject({
+      task: {
+        id: 'task-1',
+        title: 'Switched to Claude Code',
+        details: [
+          {
+            type: 'text',
+            text:
+              'Codex has no model capacity left until 2026-09-24 03:26 UTC, so this session ' +
+              'continues on Claude Code with its history.'
+          }
+        ]
+      }
+    })
+    expect(mapper.isDone()).toBe(false)
+    expect(mapper.threadId()).toBe('')
+    // The turn goes on; its end shows the task as complete.
+    expect(mapper.flush()).toContainEqual(
+      expect.objectContaining({
+        type: 'renderer.task.update',
+        task: expect.objectContaining({ id: 'task-1', status: 'complete' })
+      })
+    )
+  })
+
+  it('shows a switch once when both the line and the session event arrive', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const params = { from: 'codex', to: 'claudecode', mode: 'reactive', history: 'converted' }
+    const first = mapper.process({
+      eventKind: 'session.output.line',
+      data: JSON.stringify({ method: 'centaur/providerFailover', params })
+    })
+    const second = mapper.process({
+      eventKind: 'session.provider_failover',
+      data: { ...params, execution_id: 'exec-1' }
+    })
+    const tasks = [...first, ...second].filter(event => event.type === 'renderer.task.update')
+    expect(tasks).toHaveLength(1)
+  })
+
+  it('shows a switch that the control plane made before the turn', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      eventKind: 'session.provider_failover',
+      data: { from: 'codex', to: 'claudecode', mode: 'proactive', history: 'empty' }
+    })
+    expect(events.find(event => event.type === 'renderer.task.update')).toMatchObject({
+      task: {
+        title: 'Switched to Claude Code',
+        details: [
+          { type: 'text', text: 'Codex has no model capacity left, so this session continues on Claude Code.' }
+        ]
+      }
+    })
+  })
+
+  it('keeps the upstream text for other failures', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      method: 'error',
+      params: { error: { message: 'model error' }, willRetry: false }
+    })
+    expect(events.find(event => event.type === 'renderer.done')).toMatchObject({
+      error: 'model error'
+    })
+  })
+})
+
 describe('CodexAppServerRendererEventMapper retryable errors', () => {
   it('does not fail the mapper on retryable Codex error notifications', () => {
     const mapper = new CodexAppServerRendererEventMapper()

@@ -64,6 +64,8 @@ type CodexMapperState = {
   emittedActivityRunByTaskId: Map<string, string>
   emittedActivityOutputByTaskId: Map<string, string>
   emittedActivitySignatureByTaskId: Map<string, string>
+  /** `from->to` of each harness switch already shown. */
+  providerFailovers: Set<string>
   done: boolean
 }
 
@@ -175,6 +177,17 @@ export class CodexAppServerRendererEventMapper
 
     const title = threadTitleUpdate(event)
     if (title) out.push({ type: 'renderer.title.update', title })
+
+    // A switch in the sandbox arrives twice: as its output line and as the
+    // control plane's session event. Show it once.
+    const failover = providerFailoverTask(event, `task-${this.state.stepCounter + 1}`)
+    const failoverKey = `${event?.from}->${event?.to}`
+    if (failover && !this.state.providerFailovers.has(failoverKey)) {
+      this.state.providerFailovers.add(failoverKey)
+      this.state.stepCounter += 1
+      this.state.taskByUseId.set(failover.id, failover)
+      this.emitActivitySummary(out)
+    }
 
     trackAgentMessageLifecycle(event, this.state)
     ensureCommentarySegmentBreak(event, this.state)
@@ -661,6 +674,13 @@ export function rustSessionEventToServerNotification(source: unknown): RustSessi
     }
   }
 
+  // The control plane moved the session before the turn, or recorded a move
+  // that the sandbox reported (the same fields as `centaur/providerFailover`).
+  if (eventKind === 'session.provider_failover') {
+    const data = isRecord(source.data) ? source.data : {}
+    return { kind: 'notification', notification: { ...data, type: 'centaur.providerFailover' } }
+  }
+
   if (eventKind === 'session.activity_summary') {
     const data = isRecord(source.data) ? source.data : source
     const status = String(data.summary ?? data.status ?? '').trim()
@@ -730,6 +750,7 @@ function newState(): CodexMapperState {
     emittedActivityRunByTaskId: new Map(),
     emittedActivityOutputByTaskId: new Map(),
     emittedActivitySignatureByTaskId: new Map(),
+    providerFailovers: new Set(),
     done: false
   }
 }
@@ -762,15 +783,74 @@ function parseServerNotificationLine(line: string): ServerNotification | null {
 function errorMessage(event: any): string {
   const eventType = String(event?.type ?? '')
   if (eventType === 'turn.completed' && isFailedTurn(event)) {
-    return messageFromError(event?.turn?.error ?? event?.error, event?.message, 'turn failed')
+    return (
+      providerExhaustedMessage(event) ??
+      messageFromError(event?.turn?.error ?? event?.error, event?.message, 'turn failed')
+    )
   }
   if (eventType !== 'error' && eventType !== 'turn.failed') return ''
   if (isRetryableCodexErrorNotification(event)) return ''
-  return messageFromError(
-    event?.error,
-    event?.message,
-    eventType === 'turn.failed' ? 'turn failed' : 'Execution failed'
+  return (
+    providerExhaustedMessage(event) ??
+    messageFromError(
+      event?.error,
+      event?.message,
+      eventType === 'turn.failed' ? 'turn failed' : 'Execution failed'
+    )
   )
+}
+
+/**
+ * A clear message when the model provider has no capacity left: a usage
+ * limit, or an account pool where every account is rate limited. The harness
+ * adds `centaur.providerExhausted` to such errors (harness-server failover.rs).
+ */
+function providerExhaustedMessage(event: any): string | null {
+  const exhausted = event?.centaur?.providerExhausted
+  if (!isRecord(exhausted)) return null
+  return (
+    `The model provider has no capacity left${untilText(exhausted)}: its usage limit is reached ` +
+    'or all its accounts are rate limited. Try again later, or continue with another harness.'
+  )
+}
+
+/** ` until YYYY-MM-DD HH:MM UTC` for a known reset time, or ''. */
+function untilText(exhausted: unknown): string {
+  if (!isRecord(exhausted) || typeof exhausted.resetAt !== 'number') return ''
+  const resetAt = new Date(exhausted.resetAt * 1000)
+  if (Number.isNaN(resetAt.getTime())) return ''
+  return ` until ${resetAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`
+}
+
+const HARNESS_LABELS: Record<string, string> = { codex: 'Codex', claudecode: 'Claude Code' }
+
+function harnessLabel(name: unknown): string {
+  return typeof name === 'string' ? (HARNESS_LABELS[name] ?? name) : 'another harness'
+}
+
+/**
+ * A completed task that tells the user that the session moved to another
+ * harness because its model provider had no capacity left (harness-server
+ * switch.rs prints `centaur/providerFailover`).
+ */
+function providerFailoverTask(event: any, id: string): HarnessTask | null {
+  if (event?.type !== 'centaur.providerFailover') return null
+  const from = harnessLabel(event.from)
+  const to = harnessLabel(event.to)
+  const history =
+    event.history === 'empty' ? '' : ' with its history'
+  return {
+    id,
+    title: `Switched to ${to}`,
+    status: 'complete',
+    details: [
+      {
+        type: 'text',
+        text: `${from} has no model capacity left${untilText(event.providerExhausted)}, so this session continues on ${to}${history}.`
+      }
+    ],
+    output: []
+  }
 }
 
 /** Codex reconnects dropped model streams and emits `error` with `willRetry: true`. */

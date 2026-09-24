@@ -46,8 +46,19 @@ pub(crate) fn user_input_to_anthropic_content(input: &[UserInput]) -> Vec<Value>
         .collect()
 }
 
+/// True for an env flag set to 1, true, yes or on.
+pub(crate) fn env_flag_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 pub(crate) fn write_value<W: Write>(stdout: &mut W, value: &Value) -> Result<()> {
-    serde_json::to_writer(&mut *stdout, value)?;
+    // Every output line passes here, so this is where a provider exhaustion
+    // gets its machine-readable annotation.
+    let annotated = crate::failover::annotate(value);
+    serde_json::to_writer(&mut *stdout, annotated.as_ref().unwrap_or(value))?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())

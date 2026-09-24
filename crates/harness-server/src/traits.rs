@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command as ProcessCommand};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -83,6 +83,18 @@ pub trait HarnessServer {
     /// while still completing when the result never comes.
     fn terminal_assistant_stop_settle(&self) -> Option<Duration> {
         None
+    }
+
+    /// File that keeps the harness session id across process restarts, when
+    /// the control plane turns persistence on. `None`: nothing is persisted.
+    fn persisted_session_file(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// True when the harness can still resume `session_id`, for example
+    /// because its transcript exists.
+    fn session_resumable(&self, _session_id: &str, _cwd: &Path) -> bool {
+        true
     }
 
     fn thread_state(&self, params: &ThreadStartParams, cwd: PathBuf) -> ThreadState {

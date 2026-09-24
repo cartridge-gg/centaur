@@ -32,8 +32,9 @@ use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
-    KeepaliveConfig, PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode,
-    SessionEventRetentionConfig, SessionPrincipalAdmission, SessionSandboxCleanupConfig,
+    KeepaliveConfig, PersonaRegistry, ProviderFailoverConfig, ProviderHealthProbeConfig,
+    SandboxCapacityConfig, SandboxWorkloadMode, SessionEventRetentionConfig,
+    SessionPrincipalAdmission, SessionSandboxCleanupConfig,
 };
 use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
@@ -108,6 +109,16 @@ impl Args {
 
     pub(crate) fn sandbox_keepalive_config(&self) -> Result<Option<KeepaliveConfig>, ServerError> {
         self.sandbox.sandbox_keepalive_config()
+    }
+
+    pub(crate) fn provider_failover_config(&self) -> Result<ProviderFailoverConfig, ServerError> {
+        self.sandbox.provider_failover_config()
+    }
+
+    pub(crate) fn provider_health_probe_config(
+        &self,
+    ) -> Result<ProviderHealthProbeConfig, ServerError> {
+        self.sandbox.provider_health_probe_config()
     }
 
     pub(crate) fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
@@ -667,6 +678,68 @@ struct SandboxArgs {
         action = clap::ArgAction::Set
     )]
     resume_thread_enabled: bool,
+    /// Comma-separated texts that mark an exhausted model provider in a
+    /// harness error, for example the error code of a subscription proxy whose
+    /// account pool is empty. The harness reports such a failure as
+    /// `provider_exhausted`, next to the native usage-limit errors it always
+    /// recognizes.
+    #[arg(
+        long = "session-provider-exhausted-markers",
+        env = "SESSION_PROVIDER_EXHAUSTED_MARKERS",
+        default_value = ""
+    )]
+    provider_exhausted_markers: String,
+    /// Continue a Codex or Claude Code session on the other harness when the
+    /// model provider of its harness has no capacity left. Sandboxes get
+    /// CENTAUR_HARNESS_SWITCHING=1, and the harness server converts the
+    /// session. Sandboxes created before this setting keep their old
+    /// behavior.
+    #[arg(
+        long = "session-provider-failover-enabled",
+        env = "SESSION_PROVIDER_FAILOVER_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    provider_failover_enabled: bool,
+    /// The model of a session after it moves to a harness, as comma-separated
+    /// `harness=model` pairs, for example `codex=gpt-5-codex`. Without a
+    /// pair, the harness uses its default model.
+    #[arg(
+        long = "session-provider-failover-models",
+        env = "SESSION_PROVIDER_FAILOVER_MODELS",
+        default_value = ""
+    )]
+    provider_failover_models: String,
+    /// Comma-separated thread key prefixes of the sessions that can fail
+    /// over, for example `chat:`. Empty: all sessions.
+    #[arg(
+        long = "session-provider-failover-thread-prefixes",
+        env = "SESSION_PROVIDER_FAILOVER_THREAD_PREFIXES",
+        value_delimiter = ','
+    )]
+    provider_failover_thread_prefixes: Vec<String>,
+    /// The health URL of each harness's model provider, as comma-separated
+    /// `harness=url` pairs. api-rs checks them on an interval: an answer of
+    /// `{"exhausted": true, "reset_at": <Unix seconds>}` marks the provider
+    /// exhausted, and `{"exhausted": false}` clears it early.
+    #[arg(
+        long = "session-provider-health-urls",
+        env = "SESSION_PROVIDER_HEALTH_URLS",
+        default_value = ""
+    )]
+    provider_health_urls: String,
+    /// Bearer token for the health URLs.
+    #[arg(
+        long = "session-provider-health-token",
+        env = "SESSION_PROVIDER_HEALTH_TOKEN"
+    )]
+    provider_health_token: Option<String>,
+    #[arg(
+        long = "session-provider-health-interval-secs",
+        env = "SESSION_PROVIDER_HEALTH_INTERVAL_SECS",
+        default_value_t = 60
+    )]
+    provider_health_interval_secs: u64,
     #[arg(
         long = "session-sandbox-image-pull-secrets",
         env = "SESSION_SANDBOX_IMAGE_PULL_SECRETS",
@@ -1190,6 +1263,21 @@ impl SandboxArgs {
             // persist the Codex thread id under CODEX_HOME (on the state
             // volume) and resume it on the next start.
             envs.push((CODEX_THREAD_PERSIST_ENV.to_owned(), "1".to_owned()));
+            // The same for the Claude Code session id (claude.rs).
+            envs.push((CLAUDE_SESSION_PERSIST_ENV.to_owned(), "1".to_owned()));
+        }
+        if self.provider_failover_enabled {
+            // Read by the harness server (crates/harness-server/src/switch.rs).
+            // The switch keeps each harness's session id next to its config.
+            envs.push((HARNESS_SWITCHING_ENV.to_owned(), "1".to_owned()));
+        }
+        let markers = self.provider_exhausted_markers.trim();
+        if !markers.is_empty() {
+            // Read by the harness server (crates/harness-server/src/failover.rs).
+            envs.push((
+                PROVIDER_EXHAUSTED_MARKERS_ENV.to_owned(),
+                markers.to_owned(),
+            ));
         }
 
         // Single source of truth: propagate this control plane's harness auth
@@ -1651,6 +1739,71 @@ impl SandboxArgs {
         }))
     }
 
+    fn provider_failover_config(&self) -> Result<ProviderFailoverConfig, ServerError> {
+        let mut models = std::collections::HashMap::new();
+        for pair in self
+            .provider_failover_models
+            .split(',')
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty())
+        {
+            let parsed = pair.split_once('=').and_then(|(harness, model)| {
+                let harness = harness.trim().parse::<HarnessType>().ok()?;
+                let model = model.trim();
+                (!model.is_empty()).then(|| (harness, model.to_owned()))
+            });
+            let Some((harness, model)) = parsed else {
+                return Err(ServerError::UnsupportedConfig(format!(
+                    "SESSION_PROVIDER_FAILOVER_MODELS: `{pair}` is not `harness=model`"
+                )));
+            };
+            models.insert(harness, model);
+        }
+        Ok(ProviderFailoverConfig {
+            enabled: self.provider_failover_enabled,
+            models,
+            thread_prefixes: self
+                .provider_failover_thread_prefixes
+                .iter()
+                .map(|prefix| prefix.trim().to_owned())
+                .filter(|prefix| !prefix.is_empty())
+                .collect(),
+        })
+    }
+
+    fn provider_health_probe_config(&self) -> Result<ProviderHealthProbeConfig, ServerError> {
+        let mut endpoints = Vec::new();
+        for pair in self
+            .provider_health_urls
+            .split(',')
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty())
+        {
+            let parsed = pair.split_once('=').and_then(|(harness, url)| {
+                let harness = harness.trim().parse::<HarnessType>().ok()?;
+                let url = url.trim();
+                (url.starts_with("https://") || url.starts_with("http://"))
+                    .then(|| (harness, url.to_owned()))
+            });
+            let Some(endpoint) = parsed else {
+                return Err(ServerError::UnsupportedConfig(format!(
+                    "SESSION_PROVIDER_HEALTH_URLS: `{pair}` is not `harness=http(s)://...`"
+                )));
+            };
+            endpoints.push(endpoint);
+        }
+        if !endpoints.is_empty() && self.provider_health_interval_secs == 0 {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_PROVIDER_HEALTH_INTERVAL_SECS must be above 0".to_owned(),
+            ));
+        }
+        Ok(ProviderHealthProbeConfig {
+            interval: Duration::from_secs(self.provider_health_interval_secs),
+            endpoints,
+            bearer_token: clean_optional_value(self.provider_health_token.as_deref()),
+        })
+    }
+
     fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
         let duration = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
         SessionSandboxCleanupConfig {
@@ -1806,6 +1959,9 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
 /// Sandbox env the harness server reads to persist and resume its Codex
 /// thread across a pause (see `crates/harness-server/src/codex.rs`).
 const CODEX_THREAD_PERSIST_ENV: &str = "CENTAUR_CODEX_THREAD_PERSIST";
+const CLAUDE_SESSION_PERSIST_ENV: &str = "CENTAUR_CLAUDE_SESSION_PERSIST";
+const PROVIDER_EXHAUSTED_MARKERS_ENV: &str = "CENTAUR_PROVIDER_EXHAUSTED_MARKERS";
+const HARNESS_SWITCHING_ENV: &str = "CENTAUR_HARNESS_SWITCHING";
 
 #[derive(Debug, ClapArgs)]
 struct ToolsArgs {
@@ -2814,6 +2970,7 @@ mod tests {
         args.sandbox.validate_resume_thread().unwrap();
         let envs = args.sandbox.codex_app_server_env_template().unwrap();
         assert!(envs.contains(&(CODEX_THREAD_PERSIST_ENV.to_owned(), "1".to_owned())));
+        assert!(envs.contains(&(CLAUDE_SESSION_PERSIST_ENV.to_owned(), "1".to_owned())));
 
         // Off by default, and the state volume alone does not turn it on.
         let args = Args::try_parse_from(
@@ -2830,6 +2987,160 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name == CODEX_THREAD_PERSIST_ENV)
         );
+    }
+
+    #[test]
+    fn provider_exhausted_markers_reach_the_sandbox_only_when_set() {
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ];
+        let args = Args::try_parse_from(base).unwrap();
+        assert!(
+            !args
+                .sandbox
+                .codex_app_server_env_template()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == PROVIDER_EXHAUSTED_MARKERS_ENV)
+        );
+
+        let args = Args::try_parse_from(base.iter().copied().chain([
+            "--session-provider-exhausted-markers",
+            " pool_exhausted,usage_cap ",
+        ]))
+        .unwrap();
+        assert!(
+            args.sandbox
+                .codex_app_server_env_template()
+                .unwrap()
+                .contains(&(
+                    PROVIDER_EXHAUSTED_MARKERS_ENV.to_owned(),
+                    "pool_exhausted,usage_cap".to_owned()
+                ))
+        );
+    }
+
+    #[test]
+    fn provider_failover_turns_on_harness_switching_in_sandboxes() {
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ];
+        let args = Args::try_parse_from(base).unwrap();
+        let config = args.provider_failover_config().unwrap();
+        assert!(!config.enabled);
+        assert!(
+            !args
+                .sandbox
+                .codex_app_server_env_template()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == HARNESS_SWITCHING_ENV)
+        );
+
+        let args = Args::try_parse_from(base.iter().copied().chain([
+            "--session-provider-failover-enabled",
+            "true",
+            "--session-provider-failover-models",
+            " codex=gpt-5-codex , claudecode=claude-x ",
+            "--session-provider-failover-thread-prefixes",
+            "chat:,slack:",
+        ]))
+        .unwrap();
+        let config = args.provider_failover_config().unwrap();
+        assert!(config.enabled);
+        assert_eq!(
+            config.models.get(&HarnessType::Codex).map(String::as_str),
+            Some("gpt-5-codex")
+        );
+        assert_eq!(
+            config
+                .models
+                .get(&HarnessType::ClaudeCode)
+                .map(String::as_str),
+            Some("claude-x")
+        );
+        assert_eq!(config.thread_prefixes, ["chat:", "slack:"]);
+        assert!(
+            args.sandbox
+                .codex_app_server_env_template()
+                .unwrap()
+                .contains(&(HARNESS_SWITCHING_ENV.to_owned(), "1".to_owned()))
+        );
+
+        for models in ["codex", "gemini=g-1", "codex="] {
+            let args = Args::try_parse_from(
+                base.iter()
+                    .copied()
+                    .chain(["--session-provider-failover-models", models]),
+            )
+            .unwrap();
+            assert!(args.provider_failover_config().is_err(), "{models}");
+        }
+    }
+
+    #[test]
+    fn provider_health_urls_parse_by_harness() {
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ];
+        let config = Args::try_parse_from(base)
+            .unwrap()
+            .provider_health_probe_config()
+            .unwrap();
+        assert!(config.endpoints.is_empty());
+        assert_eq!(config.bearer_token, None);
+
+        let config = Args::try_parse_from(base.iter().copied().chain([
+            "--session-provider-health-urls",
+            "codex=https://pool.example/openai/pool-health, claudecode=https://pool.example/anthropic/pool-health",
+            "--session-provider-health-token",
+            " key-1 ",
+            "--session-provider-health-interval-secs",
+            "30",
+        ]))
+        .unwrap()
+        .provider_health_probe_config()
+        .unwrap();
+        assert_eq!(
+            config.endpoints,
+            [
+                (
+                    HarnessType::Codex,
+                    "https://pool.example/openai/pool-health".to_owned()
+                ),
+                (
+                    HarnessType::ClaudeCode,
+                    "https://pool.example/anthropic/pool-health".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(config.bearer_token.as_deref(), Some("key-1"));
+        assert_eq!(config.interval, Duration::from_secs(30));
+
+        for (urls, interval) in [
+            ("codex", "60"),
+            ("gemini=https://pool.example", "60"),
+            ("codex=pool.example/health", "60"),
+            ("codex=https://pool.example", "0"),
+        ] {
+            let args = Args::try_parse_from(base.iter().copied().chain([
+                "--session-provider-health-urls",
+                urls,
+                "--session-provider-health-interval-secs",
+                interval,
+            ]))
+            .unwrap();
+            assert!(
+                args.provider_health_probe_config().is_err(),
+                "{urls} {interval}"
+            );
+        }
     }
 
     #[test]

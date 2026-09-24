@@ -1,4 +1,6 @@
 mod cleanup;
+mod provider_failover;
+mod provider_health;
 mod retention;
 mod sandbox_retention;
 mod title_generator;
@@ -36,10 +38,14 @@ use centaur_session_sqlx::{
 use centaur_telemetry::{
     record_sandbox_warm_pool_claim, record_session_execution_finished,
     record_session_execution_started, record_session_failure, record_session_first_token_latency,
-    set_span_parent_from_traceparent,
+    record_session_provider_failover, set_span_parent_from_traceparent,
 };
 use dashmap::{DashMap, DashSet};
 use futures_util::{FutureExt, SinkExt, Stream, StreamExt, future::BoxFuture, stream};
+use provider_failover::{
+    FailoverDirective, FailoverNotice, PROVIDER_FAILOVER_EVENT, PROVIDER_FAILOVER_METADATA_KEY,
+    execution_allows_failover, failover_record, failover_target, kept_after_failover,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -54,6 +60,8 @@ use tracing::{Instrument, Span, debug, error, info, info_span, warn};
 use uuid::Uuid;
 
 pub use cleanup::SessionSandboxCleanupConfig;
+pub use provider_failover::ProviderFailoverConfig;
+pub use provider_health::ProviderHealthProbeConfig;
 pub use retention::SessionEventRetentionConfig;
 pub use sandbox_retention::{
     KeepaliveOutcome, Lease, LeaseClose, LeaseState, RETENTION_METADATA_KEY, Retention,
@@ -183,6 +191,7 @@ pub struct SessionRuntime {
     /// Session sandbox retention (`session_keepalive` / `stop_session_sandbox`);
     /// None refuses both.
     keepalive: Option<KeepaliveConfig>,
+    provider_failover: ProviderFailoverConfig,
     stdout_owner_id: String,
     /// Set once a shutdown handoff begins; fences new stdout-owner claims
     /// so an execution cannot start on a control plane that is about to
@@ -418,8 +427,12 @@ pub enum HarnessConflictPolicy {
     Reject,
     /// Restart the thread on the requested harness: stop the old sandbox,
     /// clear the harness thread state, and switch the session row over. The
-    /// new harness starts with no conversational memory.
+    /// new harness starts with no conversational memory. A session that left
+    /// the requested harness in a provider failover stays where it is.
     Restart,
+    /// Like `Restart`, also after a provider failover: the user named the
+    /// harness in this request.
+    RestartExplicit,
 }
 
 /// Result of [`SessionRuntime::create_or_get_session`].
@@ -432,6 +445,10 @@ pub struct CreateOrGetSessionOutcome {
     /// Set only when a new-session request named an unavailable persona and
     /// the returned session uses this request's resolved fallback.
     pub unavailable_requested_persona_id: Option<String>,
+    /// `sessions.metadata.provider_failover`, set when the request named the
+    /// harness that the session left in a provider failover. The session
+    /// stays on its current harness.
+    pub provider_failover: Option<Value>,
 }
 
 /// Outcome of [`SessionRuntime::drain`]: the sandboxes that were stopped and
@@ -1059,6 +1076,7 @@ impl SessionRuntime {
             session_principal_admission: SessionPrincipalAdmission::default(),
             warm_pool: None,
             keepalive: None,
+            provider_failover: ProviderFailoverConfig::default(),
             personas: None,
             session_title_generator: None,
             session_title_in_flight: Arc::new(DashSet::new()),
@@ -1100,6 +1118,20 @@ impl SessionRuntime {
 
     pub fn with_personas(mut self, personas: PersonaRegistry) -> Self {
         self.personas = Some(Arc::new(personas));
+        self
+    }
+
+    pub fn with_provider_failover(mut self, config: ProviderFailoverConfig) -> Self {
+        self.provider_failover = config;
+        self
+    }
+
+    /// Checks the configured provider health URLs on an interval and keeps
+    /// `provider_health` in step with them. No endpoints: no checks.
+    pub fn with_provider_health_probe(self, config: ProviderHealthProbeConfig) -> Self {
+        if !config.endpoints.is_empty() {
+            provider_health::ProviderHealthProbe::new(self.store.clone(), config).spawn();
+        }
         self
     }
 
@@ -2310,6 +2342,7 @@ impl SessionRuntime {
                 "creating or loading session"
             );
             let mut harness_switched = false;
+            let mut provider_failover = None;
             let mut session_metadata = default_metadata(metadata);
             let proxy_labels = proxy_labels_from_session_metadata(thread_key, &session_metadata);
             let registered_principal = match principal_foreign_id {
@@ -2361,14 +2394,53 @@ impl SessionRuntime {
                 .await
             {
                 Ok(session) => session,
-                Err(SessionStoreError::HarnessConflict { existing, .. })
-                    if on_harness_conflict == HarnessConflictPolicy::Restart =>
-                {
-                    let session = self
-                        .restart_session_on_harness(thread_key, harness_type, &existing)
+                Err(SessionStoreError::HarnessConflict {
+                    existing,
+                    requested,
+                    thread_key: key,
+                }) => {
+                    let record = self
+                        .store
+                        .session_metadata_value(thread_key, PROVIDER_FAILOVER_METADATA_KEY)
                         .await?;
-                    harness_switched = true;
-                    session
+                    let existing_harness = existing.parse::<HarnessType>().ok();
+                    match (on_harness_conflict, existing_harness) {
+                        // A client that did not see the provider failover:
+                        // continue on the harness the session moved to.
+                        (
+                            HarnessConflictPolicy::Reject | HarnessConflictPolicy::Restart,
+                            Some(existing_harness),
+                        ) if kept_after_failover(record.as_ref(), harness_type, &existing) => {
+                            provider_failover = record;
+                            self.store
+                                .create_or_get_session(
+                                    thread_key,
+                                    &existing_harness,
+                                    persona_resolution.persona_id.as_deref(),
+                                    session_metadata.clone(),
+                                    proxy_labels.clone(),
+                                )
+                                .await?
+                        }
+                        (
+                            HarnessConflictPolicy::Restart | HarnessConflictPolicy::RestartExplicit,
+                            _,
+                        ) => {
+                            let session = self
+                                .restart_session_on_harness(thread_key, harness_type, &existing)
+                                .await?;
+                            harness_switched = true;
+                            session
+                        }
+                        (HarnessConflictPolicy::Reject, _) => {
+                            return Err(SessionStoreError::HarnessConflict {
+                                thread_key: key,
+                                existing,
+                                requested,
+                            }
+                            .into());
+                        }
+                    }
                 }
                 Err(error) => return Err(error.into()),
             };
@@ -2416,6 +2488,7 @@ impl SessionRuntime {
                 session,
                 harness_switched,
                 unavailable_requested_persona_id,
+                provider_failover,
             })
         }
         .instrument(span)
@@ -2485,6 +2558,119 @@ impl SessionRuntime {
             "restarted session on a new harness"
         );
         Ok(session)
+    }
+
+    /// Decides what the sandbox may do if the model provider of the session's
+    /// harness has no capacity left, and returns the directive for the user
+    /// lines. When the provider is already known to be exhausted, the session
+    /// moves before the turn: a session without a sandbox starts on the other
+    /// harness; a sandbox is asked to move the session itself.
+    async fn plan_provider_failover(
+        &self,
+        mut session: Session,
+        execution_metadata: Option<&Value>,
+        execution_id: Option<&str>,
+    ) -> Result<(Session, Option<FailoverDirective>), SessionRuntimeError> {
+        let config = &self.provider_failover;
+        // Without the deployment setting, sandboxes cannot switch.
+        if !config.enabled {
+            return Ok((session, None));
+        }
+        let Some(other) = failover_target(&session.harness_type) else {
+            return Ok((session, None));
+        };
+        let allowed =
+            config.allows(&session.thread_key) && execution_allows_failover(execution_metadata);
+        let original = session.harness_type.clone();
+        let current_exhausted = self.provider_exhausted(&original).await;
+        let other_exhausted = self.provider_exhausted(&other).await;
+
+        let mut harness = original.clone();
+        let mut retarget_model = None;
+        if allowed && current_exhausted && !other_exhausted {
+            retarget_model = Some(config.model_for(&other).map(str::to_owned));
+            if session.sandbox_id.is_none() {
+                let record = failover_record(&harness, &other, "proactive", execution_id, None);
+                if self
+                    .store
+                    .fail_over_session_harness(&session.thread_key, &harness, &other, &record)
+                    .await?
+                {
+                    self.store
+                        .append_event(
+                            &session.thread_key,
+                            execution_id,
+                            PROVIDER_FAILOVER_EVENT,
+                            json!({
+                                "from": harness.as_ref(),
+                                "to": other.as_ref(),
+                                "mode": "proactive",
+                                "history": "empty",
+                                "execution_id": execution_id,
+                            }),
+                        )
+                        .await?;
+                    record_session_provider_failover(harness.as_ref(), other.as_ref(), "proactive");
+                    info!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_provider_failover",
+                        thread_key = %session.thread_key,
+                        from_harness = %harness,
+                        to_harness = %other,
+                        mode = "proactive",
+                        "the session starts on another harness: its model provider has no capacity left"
+                    );
+                    session = self.store.get_session(&session.thread_key).await?;
+                }
+            }
+            // The sandbox moves the session and reports it; the session row
+            // changes then.
+            harness = other;
+        }
+        // Never fail over to a provider that is known to be exhausted.
+        let target_exhausted = if harness == original {
+            other_exhausted
+        } else {
+            current_exhausted
+        };
+        let enabled = allowed && !target_exhausted;
+        let model = failover_target(&harness)
+            .and_then(|target| config.model_for(&target).map(str::to_owned));
+        Ok((
+            session,
+            Some(FailoverDirective {
+                harness,
+                enabled,
+                model,
+                retarget_model,
+            }),
+        ))
+    }
+
+    /// Every model provider that is exhausted now, by harness, with its reset
+    /// time. Clients use it to avoid an exhausted provider before a request.
+    pub async fn exhausted_providers(
+        &self,
+    ) -> Result<Vec<(String, std::time::SystemTime)>, SessionRuntimeError> {
+        Ok(self.store.exhausted_providers().await?)
+    }
+
+    /// True while the model provider of `harness` is known to be exhausted.
+    /// A failed lookup counts as healthy.
+    async fn provider_exhausted(&self, harness: &HarnessType) -> bool {
+        match self.store.provider_exhausted_until(harness).await {
+            Ok(until) => until.is_some(),
+            Err(error) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "provider_health_lookup_failed",
+                    harness = %harness,
+                    %error,
+                    "failed to read model provider health"
+                );
+                false
+            }
+        }
     }
 
     pub async fn append_messages(
@@ -2844,7 +3030,6 @@ impl SessionRuntime {
             );
             let session = self.store.get_session(thread_key).await?;
             correlation_sandbox_id = session.sandbox_id.clone();
-            let harness_label = session.harness_type.to_string();
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
             let requester_metadata = metadata.clone();
@@ -2915,6 +3100,24 @@ impl SessionRuntime {
                 return Err(error);
             }
             drop(admission);
+            // After the claim, so that a switch before the turn is an event of
+            // this execution; before the sandbox, which runs the new harness.
+            let (session, failover) = match self
+                .plan_provider_failover(
+                    session,
+                    requester_metadata.as_ref(),
+                    Some(&execution.execution_id),
+                )
+                .await
+            {
+                Ok(planned) => planned,
+                Err(error) => {
+                    self.record_execution_failure(thread_key, &execution.execution_id, &error)
+                        .await;
+                    return Err(error);
+                }
+            };
+            let harness_label = session.harness_type.to_string();
             let execution_trace_span = info_span!(
                 parent: None,
                 "centaur.api_rs.session.execution",
@@ -3026,7 +3229,10 @@ impl SessionRuntime {
                 traceparent.or_else(|| execution_traceparent(&execution).map(ToOwned::to_owned)),
                 Some(&execution.execution_id),
             );
-            let input_lines = input_lines_with_session_context(thread_key, &trace, &input_lines);
+            let mut input_lines = input_lines_with_session_context(thread_key, &trace, &input_lines);
+            if let Some(failover) = &failover {
+                input_lines = failover.apply(input_lines);
+            }
             if let Err(error) = write_input_lines(
                 &pipe,
                 &input_lines,
@@ -4647,7 +4853,10 @@ impl SessionRuntime {
             thread_key,
             sandbox_id,
             execution_id,
-            TerminalOutput::Failed { error },
+            TerminalOutput::Failed {
+                error,
+                provider_exhausted: None,
+            },
         )
         .await
         {
@@ -5642,7 +5851,10 @@ async fn fail_detached_execution(
         thread_key,
         sandbox_id,
         execution_id,
-        TerminalOutput::Failed { error },
+        TerminalOutput::Failed {
+            error,
+            provider_exhausted: None,
+        },
     )
     .await
     {
@@ -5769,6 +5981,9 @@ async fn run_stdout_pump(
                     "stdout pump resumed execution output after ownership changed"
                 );
             }
+            if let Some(notice) = output_value.as_ref().and_then(FailoverNotice::parse) {
+                record_provider_failover(&ctx, &thread_key, &output_execution_id, &notice).await;
+            }
             if let Some(execution) = first_token_execution {
                 record_first_token_observation(
                     &ctx,
@@ -5855,7 +6070,10 @@ async fn record_stdout_pump_failure(
             thread_key,
             sandbox_id,
             &execution.execution_id,
-            TerminalOutput::Failed { error },
+            TerminalOutput::Failed {
+                error,
+                provider_exhausted: None,
+            },
         )
         .await?;
     }
@@ -6144,6 +6362,9 @@ enum TerminalOutput {
     },
     Failed {
         error: String,
+        /// `params.centaur.providerExhausted` of the terminal line: the model
+        /// provider had no capacity left (see harness-server failover.rs).
+        provider_exhausted: Option<Value>,
     },
 }
 
@@ -6213,8 +6434,15 @@ async fn record_terminal_output(
                 .await?;
             (execution, "cancelled")
         }
-        TerminalOutput::Failed { error } => {
-            failure_class = Some(terminal_failure_class(&error));
+        TerminalOutput::Failed {
+            error,
+            provider_exhausted,
+        } => {
+            failure_class = Some(if provider_exhausted.is_some() {
+                PROVIDER_EXHAUSTED_FAILURE_CLASS
+            } else {
+                terminal_failure_class(&error)
+            });
             let Some(execution) = ctx
                 .store
                 .fail_execution_if_active_and_stdout_owner(
@@ -6235,9 +6463,31 @@ async fn record_terminal_output(
                         "execution_id": execution_id,
                         "thread_key": thread_key.as_str(),
                         "error": error.as_str(),
+                        "failure_class": failure_class,
+                        "provider_exhausted": provider_exhausted,
                     }),
                 )
                 .await?;
+            if let Some(exhausted) = &provider_exhausted {
+                match ctx.store.get_session(thread_key).await {
+                    Ok(session) => {
+                        record_provider_exhausted(
+                            &ctx.store,
+                            thread_key,
+                            &session.harness_type,
+                            exhausted,
+                        )
+                        .await;
+                    }
+                    Err(error) => warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "provider_exhausted_record_failed",
+                        thread_key = %thread_key,
+                        %error,
+                        "failed to record an exhausted model provider"
+                    ),
+                }
+            }
             (execution, "failed")
         }
     };
@@ -6862,6 +7112,131 @@ fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
     }
 }
 
+/// Failure class of a turn whose model provider had no capacity left.
+const PROVIDER_EXHAUSTED_FAILURE_CLASS: &str = "provider_exhausted";
+
+/// How long a provider counts as exhausted when the error names no reset time.
+pub(crate) const PROVIDER_EXHAUSTED_DEFAULT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+/// The provider-exhaustion annotation of a harness terminal line, if any.
+fn provider_exhausted_annotation(value: &Value) -> Option<Value> {
+    value
+        .pointer("/params/centaur/providerExhausted")
+        .filter(|annotation| annotation.is_object())
+        .cloned()
+}
+
+/// Records a switch that the sandbox reported: the session row follows the
+/// harness, the left provider counts as exhausted, and clients get a
+/// `session.provider_failover` event. Failures are only logged: the sandbox
+/// already runs the new harness.
+async fn record_provider_failover(
+    ctx: &RuntimeContext,
+    thread_key: &ThreadKey,
+    execution_id: &str,
+    notice: &FailoverNotice,
+) {
+    let exhausted = notice.provider_exhausted();
+    let reset_at = exhausted
+        .and_then(|exhausted| exhausted.get("resetAt"))
+        .and_then(Value::as_i64);
+    let record = failover_record(
+        &notice.from,
+        &notice.to,
+        &notice.mode,
+        Some(execution_id),
+        reset_at,
+    );
+    match ctx
+        .store
+        .fail_over_session_harness(thread_key, &notice.from, &notice.to, &record)
+        .await
+    {
+        Ok(true) => {}
+        // The session row already names the new harness, for example after
+        // the sandbox restored the harness it had moved to earlier.
+        Ok(false) => info!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_provider_failover_row_unchanged",
+            thread_key = %thread_key,
+            from_harness = %notice.from,
+            to_harness = %notice.to,
+            "the session was not on the harness that the sandbox left"
+        ),
+        Err(error) => warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_provider_failover_record_failed",
+            thread_key = %thread_key,
+            %error,
+            "failed to move the session row to the new harness"
+        ),
+    }
+    if let Some(exhausted) = exhausted {
+        record_provider_exhausted(&ctx.store, thread_key, &notice.from, exhausted).await;
+    }
+    let mut payload = notice.params.clone();
+    payload["execution_id"] = json!(execution_id);
+    if let Err(error) = ctx
+        .store
+        .append_event(
+            thread_key,
+            Some(execution_id),
+            PROVIDER_FAILOVER_EVENT,
+            payload,
+        )
+        .await
+    {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_provider_failover_record_failed",
+            thread_key = %thread_key,
+            %error,
+            "failed to append the provider failover event"
+        );
+    }
+    record_session_provider_failover(notice.from.as_ref(), notice.to.as_ref(), &notice.mode);
+    info!(
+        component = COMPONENT_SESSION_RUNTIME,
+        event = "session_provider_failover",
+        thread_key = %thread_key,
+        execution_id,
+        from_harness = %notice.from,
+        to_harness = %notice.to,
+        mode = %notice.mode,
+        "the sandbox moved the session to another harness"
+    );
+}
+
+/// Remembers until when the provider of `harness` is exhausted, so that
+/// later turns can avoid it. A failure here only loses that hint.
+async fn record_provider_exhausted(
+    store: &PgSessionStore,
+    thread_key: &ThreadKey,
+    harness: &HarnessType,
+    exhausted: &Value,
+) {
+    let now = std::time::SystemTime::now();
+    let until = exhausted
+        .get("resetAt")
+        .and_then(Value::as_u64)
+        .and_then(|reset| std::time::UNIX_EPOCH.checked_add(Duration::from_secs(reset)))
+        .filter(|reset| *reset > now)
+        .unwrap_or(now + PROVIDER_EXHAUSTED_DEFAULT_COOLDOWN);
+    let detail = exhausted
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if let Err(error) = store.mark_provider_exhausted(harness, until, detail).await {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "provider_exhausted_record_failed",
+            thread_key = %thread_key,
+            %error,
+            "failed to record an exhausted model provider"
+        );
+    }
+}
+
 fn terminal_failure_class(error: &str) -> &'static str {
     let error = error.to_ascii_lowercase();
     // Capacity deaths are checked first because they arrive wrapped in the
@@ -6954,6 +7329,7 @@ fn terminal_output(value: &Value, prior_final_answer_text: &str) -> Option<Termi
         }
         return Some(TerminalOutput::Failed {
             error: terminal_error_text(value),
+            provider_exhausted: provider_exhausted_annotation(value),
         });
     }
 
@@ -6979,6 +7355,7 @@ fn terminal_output(value: &Value, prior_final_answer_text: &str) -> Option<Termi
             if result_is_failure(value) {
                 Some(TerminalOutput::Failed {
                     error: terminal_error_text(value),
+                    provider_exhausted: provider_exhausted_annotation(value),
                 })
             } else {
                 Some(completed_terminal_output(value, "result"))
@@ -7011,6 +7388,7 @@ fn completed_turn_terminal_output(value: &Value, prior_final_answer_text: &str) 
         }
         Some(status) => TerminalOutput::Failed {
             error: format!("turn completed with status {status} before final answer"),
+            provider_exhausted: provider_exhausted_annotation(value),
         },
     }
 }
@@ -8644,7 +9022,8 @@ mod tests {
         assert_eq!(
             terminal_output(&terminal, ""),
             Some(TerminalOutput::Failed {
-                error: "terminal harness output reported failure".to_owned()
+                error: "terminal harness output reported failure".to_owned(),
+                provider_exhausted: None,
             })
         );
     }
@@ -8769,7 +9148,8 @@ mod tests {
         assert_eq!(
             terminal_output(&event, ""),
             Some(TerminalOutput::Failed {
-                error: "sandbox exited".to_owned()
+                error: "sandbox exited".to_owned(),
+                provider_exhausted: None,
             })
         );
     }
@@ -8812,7 +9192,8 @@ mod tests {
             terminal_output(&event, ""),
             Some(TerminalOutput::Failed {
                 error: "Reconnecting... 5/5: stream disconnected before completion: provider error"
-                    .to_owned()
+                    .to_owned(),
+                provider_exhausted: None,
             })
         );
     }
@@ -8850,6 +9231,55 @@ mod tests {
         assert!(!state.should_record_first_token("exe-1", Some(&turn_started)));
         assert!(state.should_record_first_token("exe-1", Some(&delta)));
         assert!(state.should_record_first_token("exe-2", Some(&terminal_result)));
+    }
+
+    #[test]
+    fn terminal_output_keeps_the_provider_exhausted_annotation() {
+        let annotation =
+            json!({"resetAt": 1_790_220_376, "signal": "poolMarker", "detail": "pool empty"});
+        // Codex ends the turn with an error line.
+        let codex_error = json!({
+            "method": "error",
+            "params": {
+                "error": {"message": "unexpected status 503: pool empty", "codexErrorInfo": "other"},
+                "willRetry": false,
+                "centaur": {"providerExhausted": annotation},
+            },
+        });
+        assert_eq!(
+            terminal_output(&codex_error, ""),
+            Some(TerminalOutput::Failed {
+                error: "unexpected status 503: pool empty".to_owned(),
+                provider_exhausted: Some(annotation.clone()),
+            })
+        );
+        // Claude Code ends it with a failed turn/completed and no error line.
+        let claude_completed = json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {"id": "t", "status": "failed", "error": {"message": "API Error: 503 pool empty"}},
+                "centaur": {"providerExhausted": annotation},
+            },
+        });
+        let Some(TerminalOutput::Failed {
+            provider_exhausted, ..
+        }) = terminal_output(&claude_completed, "")
+        else {
+            panic!("a failed turn is a failure");
+        };
+        assert_eq!(provider_exhausted, Some(annotation));
+        // A malformed annotation is ignored.
+        let malformed = json!({
+            "method": "error",
+            "params": {"error": {"message": "boom"}, "willRetry": false, "centaur": {"providerExhausted": "yes"}},
+        });
+        assert!(matches!(
+            terminal_output(&malformed, ""),
+            Some(TerminalOutput::Failed {
+                provider_exhausted: None,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -10238,7 +10668,7 @@ mod adoption_tests {
     }
 
     async fn reset_test_store(store: &PgSessionStore) {
-        sqlx::query("truncate table sessions restart identity cascade")
+        sqlx::query("truncate table sessions, provider_health restart identity cascade")
             .execute(store.pool())
             .await
             .expect("reset test db");
@@ -12627,6 +13057,534 @@ mod adoption_tests {
                 .is_some_and(|error| error.contains("OOMKilled")),
             "terminal backend reason should fail immediately and remain visible"
         );
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_exhausted_failure_is_classified_and_remembered() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:provider-exhausted-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-exhausted"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        claim_test_stdout_owner(&runtime, &execution_id).await;
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-exhausted")
+            .await
+            .expect("open initial pipe");
+
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 1800;
+        let line = json!({
+            "method": "error",
+            "params": {
+                "error": {"message": "unexpected status 503: pool empty", "codexErrorInfo": "other"},
+                "willRetry": false,
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "centaur": {"providerExhausted": {"resetAt": reset, "signal": "poolMarker", "detail": "pool empty"}},
+            },
+        });
+        stdout
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write terminal line");
+
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let all = events(&store, &thread_key).await;
+        let failed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_failed")
+            .expect("failed event");
+        assert_eq!(failed.payload["failure_class"], "provider_exhausted");
+        assert_eq!(failed.payload["provider_exhausted"]["resetAt"], reset);
+
+        // The reset time is remembered for the session's harness.
+        let until = store
+            .provider_exhausted_until(&HarnessType::Codex)
+            .await
+            .expect("read provider health")
+            .expect("codex is exhausted");
+        assert_eq!(
+            until
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            reset
+        );
+        assert_eq!(
+            store
+                .provider_exhausted_until(&HarnessType::ClaudeCode)
+                .await
+                .expect("read provider health"),
+            None
+        );
+        reset_test_store(&store).await;
+    }
+
+    fn unix_secs_from_now(secs: u64) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + secs
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sandbox_failover_moves_the_session_and_keeps_the_sandbox() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:provider-failover-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-failover"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        claim_test_stdout_owner(&runtime, &execution_id).await;
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-failover")
+            .await
+            .expect("open initial pipe");
+
+        let reset = unix_secs_from_now(1800);
+        let notice = json!({
+            "method": "centaur/providerFailover",
+            "params": {
+                "from": "codex", "to": "claudecode", "mode": "reactive", "resume": "replay",
+                "history": "converted", "sessionId": "s-1", "turnId": "turn-1",
+                "providerExhausted": {"resetAt": reset, "signal": "poolMarker", "detail": "pool empty"},
+            },
+        });
+        let completed = json!({
+            "method": "turn/completed",
+            "params": {"threadId": "t-2", "turn": {"id": "turn-2", "status": "completed", "error": null}},
+        });
+        stdout
+            .write_all(format!("{notice}\n{completed}\n").as_bytes())
+            .await
+            .expect("write output lines");
+
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let all = events(&store, &thread_key).await;
+        let failover = all
+            .iter()
+            .find(|event| event.event_type == "session.provider_failover")
+            .expect("failover event");
+        assert_eq!(failover.payload["from"], "codex");
+        assert_eq!(failover.payload["to"], "claudecode");
+        assert_eq!(failover.payload["execution_id"], execution_id.as_str());
+        // Clients also get the line itself.
+        assert!(all.iter().any(|event| {
+            event.event_type == SESSION_OUTPUT_LINE_EVENT
+                && event
+                    .payload
+                    .to_string()
+                    .contains("centaur/providerFailover")
+        }));
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.execution_failed")
+        );
+
+        // The row follows the harness; the sandbox and its state volume stay.
+        let session = store.get_session(&thread_key).await.expect("load session");
+        assert_eq!(session.harness_type, HarnessType::ClaudeCode);
+        assert_eq!(session.sandbox_id.as_deref(), Some("sbx-failover"));
+        let record = &session_metadata(&store, &thread_key).await["provider_failover"];
+        assert_eq!(record["from"], "codex");
+        assert_eq!(record["to"], "claudecode");
+        assert_eq!(record["reset_at"], reset);
+        assert_eq!(record["execution_id"], execution_id.as_str());
+        let until = store
+            .provider_exhausted_until(&HarnessType::Codex)
+            .await
+            .expect("read provider health")
+            .expect("codex is exhausted");
+        assert_eq!(
+            until
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            reset
+        );
+        // Clients read the same state; an expired entry is not listed.
+        store
+            .mark_provider_exhausted(
+                &HarnessType::ClaudeCode,
+                std::time::SystemTime::now() - Duration::from_secs(60),
+                "reset already",
+            )
+            .await
+            .expect("mark an expired entry");
+        let listed = runtime
+            .exhausted_providers()
+            .await
+            .expect("list exhausted providers");
+        assert_eq!(listed, vec![("codex".to_owned(), until)]);
+        reset_test_store(&store).await;
+    }
+
+    /// A provider health endpoint: `/codex` answers with the body in `codex`,
+    /// `/claude` always has capacity. Keeps the Authorization headers.
+    async fn spawn_provider_health_stub() -> (
+        String,
+        Arc<std::sync::Mutex<(u16, String)>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let codex = Arc::new(std::sync::Mutex::new((
+            200,
+            r#"{"exhausted":false}"#.to_owned(),
+        )));
+        let auth = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (codex_reply, seen_auth) = (codex.clone(), auth.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                if let Some(line) = request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                {
+                    seen_auth.lock().unwrap().push(line.trim().to_owned());
+                }
+                let (status, body) = if request.starts_with("GET /codex") {
+                    codex_reply.lock().unwrap().clone()
+                } else {
+                    (200, r#"{"exhausted":false,"reset_at":null}"#.to_owned())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (base_url, codex, auth)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_health_checks_mark_and_clear_exhaustion() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, codex, auth) = spawn_provider_health_stub().await;
+        let probe = provider_health::ProviderHealthProbe::new(
+            store.clone(),
+            ProviderHealthProbeConfig {
+                interval: Duration::from_secs(60),
+                endpoints: vec![
+                    (HarnessType::Codex, format!("{base_url}/codex")),
+                    (HarnessType::ClaudeCode, format!("{base_url}/claude")),
+                ],
+                bearer_token: Some("health-key".to_owned()),
+            },
+        );
+        let until = |harness: HarnessType| {
+            let store = store.clone();
+            async move {
+                store
+                    .provider_exhausted_until(&harness)
+                    .await
+                    .expect("read provider health")
+                    .map(|until| {
+                        until
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                    })
+            }
+        };
+
+        // The pool is empty until its reported reset.
+        let reset = unix_secs_from_now(1200);
+        *codex.lock().unwrap() = (200, format!(r#"{{"exhausted":true,"reset_at":{reset}}}"#));
+        probe.check_all().await;
+        assert_eq!(until(HarnessType::Codex).await, Some(reset));
+        assert_eq!(until(HarnessType::ClaudeCode).await, None);
+        assert!(
+            auth.lock()
+                .unwrap()
+                .iter()
+                .all(|line| line == "authorization: Bearer health-key"
+                    || line == "Authorization: Bearer health-key")
+        );
+        assert_eq!(auth.lock().unwrap().len(), 2);
+
+        // A failed check changes nothing.
+        *codex.lock().unwrap() = (500, "{}".to_owned());
+        probe.check_all().await;
+        assert_eq!(until(HarnessType::Codex).await, Some(reset));
+        *codex.lock().unwrap() = (200, r#"{"status":"ok"}"#.to_owned());
+        probe.check_all().await;
+        assert_eq!(until(HarnessType::Codex).await, Some(reset));
+
+        // Capacity again: the mark ends before its reset time.
+        *codex.lock().unwrap() = (200, r#"{"exhausted":false,"reset_at":null}"#.to_owned());
+        probe.check_all().await;
+        assert_eq!(until(HarnessType::Codex).await, None);
+
+        // No reset time: the cooldown applies, and each check renews it.
+        *codex.lock().unwrap() = (200, r#"{"exhausted":true,"reset_at":null}"#.to_owned());
+        probe.check_all().await;
+        let cooldown = until(HarnessType::Codex).await.expect("exhausted");
+        assert!(cooldown >= unix_secs_from_now(0) + 14 * 60);
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_for_the_harness_left_in_a_failover_keeps_the_session() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:failover-guard-{}", uuid::Uuid::new_v4())).unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({})),
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some("sbx-kept"))
+            .await
+            .expect("set sandbox id");
+        let record = failover_record(
+            &HarnessType::Codex,
+            &HarnessType::ClaudeCode,
+            "reactive",
+            None,
+            None,
+        );
+        assert!(
+            store
+                .fail_over_session_harness(
+                    &thread_key,
+                    &HarnessType::Codex,
+                    &HarnessType::ClaudeCode,
+                    &record
+                )
+                .await
+                .expect("fail over")
+        );
+        // Only while the session is still on the old harness.
+        assert!(
+            !store
+                .fail_over_session_harness(
+                    &thread_key,
+                    &HarnessType::Codex,
+                    &HarnessType::ClaudeCode,
+                    &record
+                )
+                .await
+                .expect("fail over again")
+        );
+
+        // Clients that did not see the switch: with or without a restart
+        // policy, the session stays on Claude Code with its sandbox.
+        for policy in [
+            HarnessConflictPolicy::Reject,
+            HarnessConflictPolicy::Restart,
+        ] {
+            let outcome = runtime
+                .create_or_get_session(
+                    &thread_key,
+                    &HarnessType::Codex,
+                    None,
+                    Some(json!({})),
+                    policy,
+                )
+                .await
+                .expect("load session");
+            assert!(!outcome.harness_switched);
+            assert_eq!(outcome.session.harness_type, HarnessType::ClaudeCode);
+            assert_eq!(outcome.session.sandbox_id.as_deref(), Some("sbx-kept"));
+            assert_eq!(outcome.provider_failover.unwrap()["from"], "codex");
+        }
+        // A harness that the session did not leave is still a conflict.
+        let conflict = runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Amp,
+                None,
+                Some(json!({})),
+                HarnessConflictPolicy::Reject,
+            )
+            .await;
+        assert!(conflict.is_err());
+
+        // The user named Codex: restart on it, as before.
+        let outcome = runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({})),
+                HarnessConflictPolicy::RestartExplicit,
+            )
+            .await
+            .expect("restart session");
+        assert!(outcome.harness_switched);
+        assert_eq!(outcome.session.harness_type, HarnessType::Codex);
+        assert_eq!(outcome.provider_failover, None);
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exhausted_provider_moves_the_session_before_the_turn() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let config = ProviderFailoverConfig {
+            enabled: true,
+            models: [(HarnessType::ClaudeCode, "claude-x".to_owned())].into(),
+            thread_prefixes: vec!["test:".to_owned()],
+        };
+        let runtime = runtime_with(&store, backend).with_provider_failover(config);
+        let new_session = |name: &str| {
+            let store = store.clone();
+            let thread_key =
+                ThreadKey::parse(format!("test:{name}-{}", uuid::Uuid::new_v4())).unwrap();
+            async move {
+                let session = store
+                    .create_or_get_session(
+                        &thread_key,
+                        &HarnessType::Codex,
+                        None,
+                        json!({}),
+                        Default::default(),
+                    )
+                    .await
+                    .expect("create session");
+                (thread_key, session)
+            }
+        };
+
+        // Healthy providers: the turn stays on Codex and may fail over.
+        let (_, session) = new_session("healthy").await;
+        let (session, directive) = runtime
+            .plan_provider_failover(session, None, None)
+            .await
+            .expect("plan");
+        let directive = directive.expect("a directive");
+        assert_eq!(session.harness_type, HarnessType::Codex);
+        assert_eq!(directive.harness, HarnessType::Codex);
+        assert!(directive.enabled);
+        assert_eq!(directive.model.as_deref(), Some("claude-x"));
+        assert_eq!(directive.retarget_model, None);
+
+        // The requester turned failover off.
+        let (_, session) = new_session("off").await;
+        let (_, directive) = runtime
+            .plan_provider_failover(session, Some(&json!({"provider_failover": false})), None)
+            .await
+            .expect("plan");
+        assert!(!directive.expect("a directive").enabled);
+
+        store
+            .mark_provider_exhausted(
+                &HarnessType::Codex,
+                std::time::SystemTime::now() + Duration::from_secs(600),
+                "pool empty",
+            )
+            .await
+            .expect("mark codex exhausted");
+
+        // No sandbox yet: the session starts on Claude Code.
+        let (thread_key, session) = new_session("no-sandbox").await;
+        let (session, directive) = runtime
+            .plan_provider_failover(session, None, None)
+            .await
+            .expect("plan");
+        let directive = directive.expect("a directive");
+        assert_eq!(session.harness_type, HarnessType::ClaudeCode);
+        assert_eq!(directive.harness, HarnessType::ClaudeCode);
+        // Never back to the exhausted provider.
+        assert!(!directive.enabled);
+        assert_eq!(directive.retarget_model, Some(Some("claude-x".to_owned())));
+        let event = events(&store, &thread_key)
+            .await
+            .into_iter()
+            .find(|event| event.event_type == "session.provider_failover")
+            .expect("failover event");
+        assert_eq!(event.payload["mode"], "proactive");
+
+        // A sandbox: it moves the session and reports it; the row waits.
+        let (thread_key, _) = new_session("sandbox").await;
+        store
+            .update_sandbox_id(&thread_key, Some("sbx-plan"))
+            .await
+            .expect("set sandbox id");
+        let session = store.get_session(&thread_key).await.expect("load session");
+        let (session, directive) = runtime
+            .plan_provider_failover(session, None, None)
+            .await
+            .expect("plan");
+        assert_eq!(session.harness_type, HarnessType::Codex);
+        assert_eq!(
+            directive.expect("a directive").harness,
+            HarnessType::ClaudeCode
+        );
+
+        // Threads outside the prefixes get a directive that forbids a switch.
+        let other = ThreadKey::parse(format!("cli:other-{}", uuid::Uuid::new_v4())).unwrap();
+        let session = store
+            .create_or_get_session(
+                &other,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        let (session, directive) = runtime
+            .plan_provider_failover(session, None, None)
+            .await
+            .expect("plan");
+        assert_eq!(session.harness_type, HarnessType::Codex);
+        let directive = directive.expect("a directive");
+        assert_eq!(directive.harness, HarnessType::Codex);
+        assert!(!directive.enabled);
         reset_test_store(&store).await;
     }
 

@@ -515,6 +515,33 @@ apiRs:
   # calls thread/resume on the next start (fresh thread when the rollout is
   # gone). Needs sandbox.stateVolume.enabled; api-rs refuses to start otherwise.
   sandboxResumeThreadEnabled: false
+  # Comma-separated texts that mark an exhausted model provider in a harness
+  # error, for example the error code that a subscription proxy returns when
+  # its whole account pool is rate limited. Such a failure is reported as
+  # `provider_exhausted`. Native usage-limit errors are recognized without it.
+  providerExhaustedMarkers: ""
+  # Continue a Codex or Claude Code session on the other harness when the
+  # model provider of its harness has no capacity left. The sandbox converts
+  # the session and resumes it on the other harness, in the same turn, and
+  # the client gets a `session.provider_failover` event. Only sandboxes
+  # created after the change can switch.
+  #   models: comma-separated `harness=model` pairs for the model after a
+  #     switch, for example "codex=gpt-5-codex". Empty: the harness default.
+  #   threadPrefixes: comma-separated thread key prefixes of the sessions
+  #     that can switch. Empty: all sessions.
+  providerFailover:
+    enabled: false
+    models: ""
+    threadPrefixes: ""
+  # Ask each model provider whether it has capacity, instead of learning it
+  # only from failed turns. urls: comma-separated `harness=url` pairs; each URL
+  # answers GET with {"exhausted": bool, "reset_at": <Unix seconds>|null}.
+  # api-rs marks an exhausted provider until reset_at, and clears the mark as
+  # soon as the provider has capacity again. Put a bearer token for the URLs
+  # in the infra secret as SESSION_PROVIDER_HEALTH_TOKEN.
+  providerHealth:
+    urls: ""
+    intervalSecs: 60
   sandboxWarmPoolReplenishIntervalSecs: 5
   # Capacity manager: when nonzero, api-rs keeps observed running-like
   # sandboxes at or below this limit by discarding ready warm sandboxes first,

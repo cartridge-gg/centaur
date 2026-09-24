@@ -110,7 +110,8 @@ Store one secret per enabled harness credential:
 `sandbox.harnessEngine` and the selectors above apply when a session is created.
 A session records its harness and keeps it for the life of the thread, so
 changing the chart value does not move existing threads onto another harness.
-Start a new thread to pick one up.
+Start a new thread to pick one up. The one exception is
+[provider failover](#provider-failover).
 
 In normal sandbox mode, containers receive placeholder values such as
 `OPENAI_API_KEY=OPENAI_API_KEY`. [iron-proxy](https://docs.iron.sh) swaps the
@@ -300,6 +301,71 @@ unset CLAUDE_CODE_REFRESH_TOKEN
 
 The client id is Claude Code's fixed, publicly known OAuth client id. As with
 Codex, api-rs fails fast at startup if the broker credential is missing.
+
+### Provider Failover
+
+A subscription or an account pool can run out of capacity: a usage limit, or
+every account rate limited. Without failover, each turn on that harness fails
+until the provider resets. With `apiRs.providerFailover.enabled: true`, a
+Codex session continues on Claude Code, and a Claude Code session continues
+on Codex:
+
+1. The harness server in the sandbox detects the exhausted provider. Native
+   usage-limit errors always count. Set `apiRs.providerExhaustedMarkers` to
+   the error code of a proxy that pools accounts, so that its pool-exhausted
+   error counts too. Put the code in the error message: Codex keeps only the
+   message. For Claude Code, return a `rate_limit_error` or `api_error` body
+   with `x-should-retry: false`. Claude Code retries an `overloaded_error`
+   and then shows a generic overload text without the proxy's message.
+2. It holds back the failure, converts the native session (the full history,
+   with tool calls as text), and resumes it on the other harness in the same
+   sandbox. The workspace and the state volume stay.
+3. It sends the turn again. If the turn already ran tools, it asks the new
+   harness to check the workspace and continue instead.
+4. The client gets a `session.provider_failover` event, and Slack shows
+   "Switched to Claude Code". The session stays on the new harness.
+
+A turn switches at most once, and never to a provider that is known to be
+exhausted. When a provider is exhausted, api-rs records its reset time, and
+new turns start on the other harness until then. Any authenticated caller,
+including a sandbox, can read that record with `GET /api/provider-health`:
+`{"exhausted": {"codex": {"until": "<RFC 3339>", "reset_at": <Unix seconds>}}}`.
+A harness that is not listed is not known to be exhausted.
+
+api-rs learns about an exhausted provider from failed turns. When the
+provider can report its own capacity, set `apiRs.providerHealth.urls` so that
+api-rs asks it every `intervalSecs` (60 by default). Each URL answers `GET`
+with `{"exhausted": bool, "reset_at": <Unix seconds>|null}`. An exhausted
+provider is marked until `reset_at` (15 minutes when it is unknown, renewed
+on each check), and a provider with capacity again is cleared at once. Put a
+bearer token for the URLs in the infra secret as
+`SESSION_PROVIDER_HEALTH_TOKEN`.
+
+```yaml
+apiRs:
+  providerHealth:
+    urls: "codex=https://pool.example/openai/pool-health,claudecode=https://pool.example/anthropic/pool-health"
+    intervalSecs: 60
+``` A client that still asks for
+the old harness gets the session on the new one; only a request with
+`harness_explicit: true` restarts it on the old harness. Execution metadata
+`{"provider_failover": false}` turns failover off for one execution.
+
+```yaml
+apiRs:
+  providerExhaustedMarkers: "pool_exhausted"
+  sandboxResumeThreadEnabled: true
+  providerFailover:
+    enabled: true
+    # The model after a switch. Empty: the harness default.
+    models: "codex=gpt-5-codex,claudecode=claude-opus-5-5"
+    # Only these threads. Empty: all.
+    threadPrefixes: ""
+```
+
+Both harnesses need credentials. Only sandboxes created after the change can
+switch; a running or paused sandbox keeps its old behavior until it is
+replaced.
 
 ## 4. Configure Advanced Permissioning
 

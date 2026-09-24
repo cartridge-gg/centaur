@@ -306,6 +306,8 @@ COPY --link --chmod=755 services/sandbox/repo_cache_sync.py /usr/local/bin/repo-
 COPY --link --chmod=755 services/sandbox/repo_cache_watch.py /usr/local/bin/repo-cache-watch
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 COPY --link --chown=1001:1001 crates/harness-server/ /opt/centaur/harness-server-src/
+# harness-server depends on ../session-transfer, which resolves to this path.
+COPY --link --chown=1001:1001 crates/session-transfer/ /opt/centaur/session-transfer/
 
 USER agent
 WORKDIR /home/agent

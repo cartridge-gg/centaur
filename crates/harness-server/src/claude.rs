@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
@@ -193,6 +193,24 @@ fn flush_messages(
     }
 }
 
+/// Sandbox env that turns on session persistence: the control plane sets it
+/// when sessions have a persistent state volume (the Claude config lives on it).
+pub(crate) const CLAUDE_SESSION_PERSIST_ENV: &str = "CENTAUR_CLAUDE_SESSION_PERSIST";
+/// Where the current session id is kept, relative to the Claude config dir.
+pub(crate) const PERSISTED_SESSION_FILE: &str = "centaur-session-id";
+
+/// `$CLAUDE_CONFIG_DIR`, or `~/.claude`.
+pub(crate) fn claude_config_dir() -> PathBuf {
+    env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".claude")
+        })
+}
+
 #[derive(Debug, Default)]
 pub struct ClaudeCodeHarness;
 
@@ -219,6 +237,22 @@ impl HarnessServer for ClaudeCodeHarness {
 
     fn default_model_provider(&self) -> &'static str {
         "anthropic"
+    }
+
+    fn persisted_session_file(&self) -> Option<PathBuf> {
+        crate::util::env_flag_enabled(env::var(CLAUDE_SESSION_PERSIST_ENV).ok().as_deref())
+            .then(|| claude_config_dir().join(PERSISTED_SESSION_FILE))
+    }
+
+    /// Claude resumes a session only from its transcript file.
+    fn session_resumable(&self, session_id: &str, cwd: &Path) -> bool {
+        claude_config_dir()
+            .join("projects")
+            .join(session_transfer::claude::encode_project_dir(
+                &cwd.to_string_lossy(),
+            ))
+            .join(format!("{session_id}.jsonl"))
+            .is_file()
     }
 
     fn command_for_turn(&self, state: &ThreadState) -> ProcessCommand {
