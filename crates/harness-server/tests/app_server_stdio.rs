@@ -134,8 +134,14 @@ fn fake_claude_pool_exhaustion_is_annotated_on_the_terminal_lines() {
         .collect();
 
     // The Claude path ends the turn with a failed turn/completed and no
-    // separate error line.
+    // separate error line. The error text is not streamed as an answer.
     assert!(stdout.iter().all(|v| v["method"] != "error"));
+    assert!(
+        stdout
+            .iter()
+            .all(|v| v["params"]["item"]["type"] != "agentMessage"),
+        "{stdout:?}"
+    );
     let completed = stdout
         .iter()
         .find(|v| v["method"] == "turn/completed")
