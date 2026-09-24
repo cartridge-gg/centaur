@@ -8,6 +8,8 @@
 //! capacity again is cleared at once, before its recorded reset. Errors
 //! change nothing.
 
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use centaur_session_core::HarnessType;
@@ -15,7 +17,7 @@ use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::record_provider_health_probe;
 use serde::Deserialize;
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::PROVIDER_EXHAUSTED_DEFAULT_COOLDOWN;
 
@@ -42,6 +44,9 @@ pub(crate) struct ProviderHealthProbe {
     store: PgSessionStore,
     client: reqwest::Client,
     config: ProviderHealthProbeConfig,
+    /// Harnesses whose last check failed: a failure is logged once, when it
+    /// starts, and counted in the metric every time.
+    failing: Mutex<HashSet<HarnessType>>,
 }
 
 impl ProviderHealthProbe {
@@ -50,6 +55,7 @@ impl ProviderHealthProbe {
             store,
             client: reqwest::Client::new(),
             config,
+            failing: Mutex::new(HashSet::new()),
         }
     }
 
@@ -76,14 +82,28 @@ impl ProviderHealthProbe {
                 Err(_) => "error",
             };
             record_provider_health_probe(harness.as_ref(), label);
-            if let Err(error) = result {
-                warn!(
+            let mut failing = self
+                .failing
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match result {
+                Err(error) if failing.insert(harness.clone()) => warn!(
                     component = crate::COMPONENT_SESSION_RUNTIME,
                     event = "provider_health_probe_failed",
                     harness = %harness,
                     %error,
-                    "failed to check model provider health"
-                );
+                    "failed to check model provider health; later failures are only counted"
+                ),
+                Err(error) => {
+                    debug!(harness = %harness, %error, "provider health check failed again")
+                }
+                Ok(_) if failing.remove(harness) => info!(
+                    component = crate::COMPONENT_SESSION_RUNTIME,
+                    event = "provider_health_probe_recovered",
+                    harness = %harness,
+                    "model provider health checks work again"
+                ),
+                Ok(_) => {}
             }
         }
     }
