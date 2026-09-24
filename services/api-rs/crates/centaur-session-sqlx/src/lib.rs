@@ -1970,6 +1970,21 @@ impl PgSessionStore {
         Ok(until.map(std::time::SystemTime::from))
     }
 
+    /// Every provider that is exhausted now, by harness, with its reset time.
+    pub async fn exhausted_providers(
+        &self,
+    ) -> Result<Vec<(String, std::time::SystemTime)>, SessionStoreError> {
+        let rows: Vec<(String, OffsetDateTime)> = sqlx::query_as(
+            "select harness, exhausted_until from provider_health where exhausted_until > now() order by harness",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(harness, until)| (harness, until.into()))
+            .collect())
+    }
+
     pub async fn update_harness_thread_id(
         &self,
         thread_key: &ThreadKey,

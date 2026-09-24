@@ -327,7 +327,10 @@ on Codex:
 
 A turn switches at most once, and never to a provider that is known to be
 exhausted. When a provider is exhausted, api-rs records its reset time, and
-new turns start on the other harness until then. A client that still asks for
+new turns start on the other harness until then. Any authenticated caller,
+including a sandbox, can read that record with `GET /api/provider-health`:
+`{"exhausted": {"codex": {"until": "<RFC 3339>", "reset_at": <Unix seconds>}}}`.
+A harness that is not listed is not known to be exhausted. A client that still asks for
 the old harness gets the session on the new one; only a request with
 `harness_explicit: true` restarts it on the old harness. Execution metadata
 `{"provider_failover": false}` turns failover off for one execution.

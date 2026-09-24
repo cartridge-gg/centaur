@@ -2636,6 +2636,14 @@ impl SessionRuntime {
         ))
     }
 
+    /// Every model provider that is exhausted now, by harness, with its reset
+    /// time. Clients use it to avoid an exhausted provider before a request.
+    pub async fn exhausted_providers(
+        &self,
+    ) -> Result<Vec<(String, std::time::SystemTime)>, SessionRuntimeError> {
+        Ok(self.store.exhausted_providers().await?)
+    }
+
     /// True while the model provider of `harness` is known to be exhausted.
     /// A failed lookup counts as healthy.
     async fn provider_exhausted(&self, harness: &HarnessType) -> bool {
@@ -13204,6 +13212,20 @@ mod adoption_tests {
                 .as_secs(),
             reset
         );
+        // Clients read the same state; an expired entry is not listed.
+        store
+            .mark_provider_exhausted(
+                &HarnessType::ClaudeCode,
+                std::time::SystemTime::now() - Duration::from_secs(60),
+                "reset already",
+            )
+            .await
+            .expect("mark an expired entry");
+        let listed = runtime
+            .exhausted_providers()
+            .await
+            .expect("list exhausted providers");
+        assert_eq!(listed, vec![("codex".to_owned(), until)]);
         reset_test_store(&store).await;
     }
 

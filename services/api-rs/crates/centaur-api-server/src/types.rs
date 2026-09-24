@@ -50,6 +50,22 @@ pub struct CreateSessionResponse {
     pub provider_failover: Option<Value>,
 }
 
+/// `GET /api/provider-health`: the model providers that have no capacity left
+/// now, by harness (`codex`, `claudecode`). A harness that is not listed is
+/// not known to be exhausted.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ProviderHealthResponse {
+    pub exhausted: std::collections::BTreeMap<String, ExhaustedProvider>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ExhaustedProvider {
+    /// When the provider accepts requests again, RFC 3339.
+    pub until: String,
+    /// The same time in Unix seconds.
+    pub reset_at: i64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionContextResponse {
     pub thread_key: ThreadKey,

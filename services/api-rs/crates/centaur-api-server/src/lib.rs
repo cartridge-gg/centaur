@@ -255,6 +255,10 @@ pub(crate) mod tests {
                 .uri("/api/admin/slack/archive-imports")
                 .body(Body::empty())
                 .unwrap(),
+            Request::builder()
+                .uri("/api/provider-health")
+                .body(Body::empty())
+                .unwrap(),
         ] {
             let response = build_router_with_app_state(AppState::unready(test_auth()))
                 .oneshot(request)
@@ -489,6 +493,25 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn any_caller_reads_provider_health() {
+        // A sandbox principal without session access still reads it.
+        for token in [principal_token("prn_sandbox"), console_token()] {
+            let response = build_router_with_app_state(AppState::unready(test_auth()))
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/provider-health")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_ne!(response.status(), StatusCode::FORBIDDEN);
         }
     }
 
