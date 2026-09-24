@@ -5,11 +5,14 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -656,4 +659,184 @@ fn the_marker_and_the_directive_choose_the_harness() {
             .contains(r#""method":"thread/start""#)
     );
     assert_eq!(sandbox.read("state/centaur-active-harness"), "codex\n");
+}
+
+/// What the stub model endpoint answers to request number `n` (from 0).
+enum Reply {
+    Answer(&'static str),
+    PoolExhausted,
+}
+
+/// A Responses API endpoint for the real Codex CLI. It keeps the request
+/// bodies.
+fn stub_responses_server(reply: fn(usize) -> Reply) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&bodies);
+    let count = AtomicUsize::new(0);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).is_err() || header == "\r\n" || header.is_empty() {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; length];
+            let _ = reader.read_exact(&mut body);
+            if !request_line.starts_with("POST") || !request_line.contains("/responses") {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n");
+                continue;
+            }
+            seen.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&body).into_owned());
+            match reply(count.fetch_add(1, Ordering::SeqCst)) {
+                Reply::Answer(text) => {
+                    let events = [
+                        json!({"type": "response.created", "response": {"id": "resp_1"}}),
+                        json!({"type": "response.output_item.done", "item": {"type": "message", "role": "assistant", "id": "msg_1", "content": [{"type": "output_text", "text": text}]}}),
+                        json!({"type": "response.completed", "response": {"id": "resp_1", "usage": {"input_tokens": 1, "input_tokens_details": null, "output_tokens": 1, "output_tokens_details": null, "total_tokens": 2}}}),
+                    ];
+                    let sse: String = events
+                        .iter()
+                        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                        .collect();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{sse}",
+                        sse.len()
+                    );
+                }
+                Reply::PoolExhausted => {
+                    let body = json!({"type": "error", "error": {"type": "overloaded_error", "code": "pool_exhausted",
+                        "message": "pool_exhausted: all accounts are rate limited or unavailable (reset_at=1790220376)"}})
+                    .to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\nx-should-retry: false\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            }
+        }
+    });
+    (base, bodies)
+}
+
+/// Points the real Codex CLI at the stub endpoint.
+fn use_real_codex(sandbox: &mut Sandbox, base_url: &str) {
+    std::fs::write(
+        sandbox.path("codex/config.toml"),
+        format!(
+            "model = \"gpt-5-codex\"\nmodel_provider = \"stub\"\n\n[model_providers.stub]\nname = \"stub\"\nbase_url = \"{base_url}\"\nwire_api = \"responses\"\nrequest_max_retries = 0\nstream_max_retries = 3\n"
+        ),
+    )
+    .unwrap();
+    let bin = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+    sandbox.set("CODEX_BIN", bin);
+    sandbox.set("CODEX_MODEL_PROVIDER", "stub");
+}
+
+#[test]
+#[ignore = "runs the real codex binary (CODEX_BIN or codex on PATH) against a local stub"]
+fn real_codex_continues_a_session_that_claude_left() {
+    let mut sandbox = Sandbox::new("real-claude-to-codex");
+    sandbox.seed_claude_session();
+    let lines = sandbox.lines_file("exhausted.jsonl", &claude_exhaustion(CLAUDE_SESSION_ID));
+    sandbox.set("FAKE_CLAUDE_LINES", lines);
+    let (base_url, bodies) = stub_responses_server(|_| Reply::Answer("RESUMED ON CODEX"));
+    use_real_codex(&mut sandbox, &base_url);
+
+    let mut server = sandbox.spawn("claude-code");
+    server.send(user_line(PROMPT));
+    let output = server.read_turn();
+    server.finish();
+
+    let [notice] = notices(&output)[..] else {
+        panic!("one notice: {output:#?}");
+    };
+    assert_eq!(notice["to"], "codex");
+    let completed = output.last().unwrap();
+    assert_eq!(
+        completed["params"]["turn"]["status"], "completed",
+        "{output:#?}"
+    );
+    assert!(
+        agent_texts(&output).contains(&"RESUMED ON CODEX"),
+        "{output:#?}"
+    );
+
+    // The model request has the imported history, then the prompt once.
+    let bodies = bodies.lock().unwrap();
+    let body = bodies.last().expect("codex called the model");
+    let history = body.find(FIRST_PROMPT).expect("imported history");
+    let prompt = body.rfind(PROMPT).expect("the prompt");
+    assert!(history < prompt);
+    assert_eq!(body.matches(PROMPT).count(), 1, "{body}");
+    assert!(!body.contains("API Error"));
+}
+
+#[test]
+#[ignore = "runs the real codex binary (CODEX_BIN or codex on PATH) against a local stub"]
+fn real_codex_pool_exhaustion_moves_the_turn_to_claude() {
+    let mut sandbox = Sandbox::new("real-codex-to-claude");
+    // The first turn works; then the account pool is empty.
+    let (base_url, bodies) = stub_responses_server(|n| {
+        if n == 0 {
+            Reply::Answer("FIRST ANSWER FROM CODEX")
+        } else {
+            Reply::PoolExhausted
+        }
+    });
+    use_real_codex(&mut sandbox, &base_url);
+
+    let mut server = sandbox.spawn("codex");
+    server.send(user_line("First request."));
+    let first = server.read_turn();
+    assert!(notices(&first).is_empty(), "{first:#?}");
+    assert!(agent_texts(&first).contains(&"FIRST ANSWER FROM CODEX"));
+
+    server.send(user_line(PROMPT));
+    let second = server.read_turn();
+    server.finish();
+
+    let [notice] = notices(&second)[..] else {
+        panic!("one notice: {second:#?}");
+    };
+    assert_eq!(notice["from"], "codex");
+    assert_eq!(notice["to"], "claudecode");
+    assert_eq!(notice["resume"], "replay");
+    assert_eq!(notice["history"], "converted");
+    assert_eq!(notice["providerExhausted"]["signal"], "poolMarker");
+    assert!(second.iter().all(|l| l["method"] != "error"), "{second:#?}");
+    assert_eq!(agent_texts(&second), ["claude answer"]);
+    // Codex stopped after its first retry, not after all of them.
+    assert!(bodies.lock().unwrap().len() < 5);
+
+    let session_id = notice["sessionId"].as_str().unwrap();
+    let converted =
+        std::fs::read_to_string(sandbox.claude_project().join(format!("{session_id}.jsonl")))
+            .unwrap();
+    assert!(converted.contains("First request."));
+    assert!(converted.contains("FIRST ANSWER FROM CODEX"));
+    // The failed prompt is sent again, not kept in the history.
+    assert!(!converted.contains(PROMPT));
+    let claude = sandbox.log("claude.log");
+    assert!(
+        claude.contains(&format!("--resume {session_id}")),
+        "{claude}"
+    );
+    assert!(claude.contains(PROMPT), "{claude}");
 }
