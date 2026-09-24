@@ -327,10 +327,29 @@ on Codex:
 
 A turn switches at most once, and never to a provider that is known to be
 exhausted. When a provider is exhausted, api-rs records its reset time, and
-new turns start on the other harness until then. Any authenticated caller,
-including a sandbox, can read that record with `GET /api/provider-health`:
+new turns start on the other harness until then. A client that still asks
+for the old harness gets the session on the new one. Execution metadata
+`{"provider_failover": false}` turns failover off for one execution.
+
+Any authenticated caller, including a sandbox, can read the record of
+exhausted providers with `GET /api/provider-health`:
 `{"exhausted": {"codex": {"until": "<RFC 3339>", "reset_at": <Unix seconds>}}}`.
 A harness that is not listed is not known to be exhausted.
+
+#### Going back to the original session
+
+A switch never changes or deletes the original native session: the new
+harness gets a new, converted copy. Each switch adds a line to
+`$CENTAUR_STATE_DIR/centaur-failover-journal.jsonl` with the session ids and
+files on both sides. A request with `harness_explicit: true` for the harness
+that the session left (for example `--codex` in Slack) goes back to that
+harness's own session from before the switch, in the same sandbox. The turns
+made on the other harness are not in its history, and the workspace keeps
+their changes. This works while the sandbox of the switch serves the
+session, because its state volume holds the original. After the sandbox is
+replaced, the request restarts the session on that harness, as before.
+
+#### Provider health checks
 
 api-rs learns about an exhausted provider from failed turns. When the
 provider can report its own capacity, set `apiRs.providerHealth.urls` so that
@@ -346,10 +365,9 @@ apiRs:
   providerHealth:
     urls: "codex=https://pool.example/openai/pool-health,claudecode=https://pool.example/anthropic/pool-health"
     intervalSecs: 60
-``` A client that still asks for
-the old harness gets the session on the new one; only a request with
-`harness_explicit: true` restarts it on the old harness. Execution metadata
-`{"provider_failover": false}` turns failover off for one execution.
+```
+
+#### Settings
 
 ```yaml
 apiRs:

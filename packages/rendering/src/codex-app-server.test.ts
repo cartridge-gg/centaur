@@ -944,6 +944,25 @@ describe('CodexAppServerRendererEventMapper provider exhaustion', () => {
     })
   })
 
+  it('shows a restore of the original session', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      method: 'centaur/providerFailover',
+      params: { from: 'claudecode', to: 'codex', mode: 'restore', history: 'restored' }
+    })
+    expect(events.find(event => event.type === 'renderer.task.update')).toMatchObject({
+      task: {
+        title: 'Restored the Codex session',
+        details: [
+          {
+            type: 'text',
+            text: expect.stringContaining('its own history from before the switch to Claude Code')
+          }
+        ]
+      }
+    })
+  })
+
   it('keeps the upstream text for other failures', () => {
     const mapper = new CodexAppServerRendererEventMapper()
     const events = mapper.process({

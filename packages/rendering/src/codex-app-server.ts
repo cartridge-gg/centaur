@@ -837,6 +837,22 @@ function providerFailoverTask(event: any, id: string): HarnessTask | null {
   if (event?.type !== 'centaur.providerFailover') return null
   const from = harnessLabel(event.from)
   const to = harnessLabel(event.to)
+  if (event.mode === 'restore') {
+    return {
+      id,
+      title: `Restored the ${to} session`,
+      status: 'complete',
+      details: [
+        {
+          type: 'text',
+          text:
+            `The session is back on ${to} with its own history from before the switch to ${from}. ` +
+            `The turns on ${from} are not in that history; their changes stay in the workspace.`
+        }
+      ],
+      output: []
+    }
+  }
   const history =
     event.history === 'empty' ? '' : ' with its history'
   return {

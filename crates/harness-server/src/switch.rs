@@ -24,8 +24,14 @@
 //! ```
 //!
 //! If `harness` is not the active harness, the session moves before the turn
-//! starts. `failover.enabled: false` turns off the switch for the turn, and
-//! `failover.model` is the model for the turn after a switch.
+//! starts. With `"restore": true`, it goes back to that harness's own session
+//! from before its last switch instead of a conversion. `failover.enabled:
+//! false` turns off the switch for the turn, and `failover.model` is the model
+//! for the turn after a switch.
+//!
+//! Every switch appends a line to `$CENTAUR_STATE_DIR/centaur-failover-journal.jsonl`
+//! with the session ids and files on both sides. A conversion never changes
+//! or deletes the original session.
 
 use std::collections::VecDeque;
 use std::env;
@@ -57,6 +63,8 @@ pub const SWITCHING_ENV: &str = "CENTAUR_HARNESS_SWITCHING";
 pub const FAILOVER_METHOD: &str = "centaur/providerFailover";
 /// Names the active harness, so that a new process continues on it.
 const ACTIVE_HARNESS_FILE: &str = "centaur-active-harness";
+/// One JSON line per switch, next to the active-harness file.
+const JOURNAL_FILE: &str = "centaur-failover-journal.jsonl";
 const STATE_DIR_ENV: &str = "CENTAUR_STATE_DIR";
 /// How long a turn that stops for a switch can take to end.
 const TURN_STOP_GRACE: Duration = Duration::from_secs(20);
@@ -111,6 +119,59 @@ fn persisted_id_file(tool: Tool, homes: &Homes) -> PathBuf {
     }
 }
 
+/// The file of session `id` of `tool`, found by its name: Codex names a
+/// rollout after its thread id, Claude Code a transcript after its session id.
+fn session_file(tool: Tool, id: &str, homes: &Homes) -> Option<PathBuf> {
+    fn walk(dir: &Path, matches: &dyn Fn(&str) -> bool, depth: usize) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() && depth > 0 {
+                if let Some(found) = walk(&path, matches, depth - 1) {
+                    return Some(found);
+                }
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(matches)
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+    match tool {
+        Tool::Codex => {
+            let suffix = format!("-{id}.jsonl");
+            walk(
+                &homes.codex.join("sessions"),
+                &|name| name.starts_with("rollout-") && name.ends_with(&suffix),
+                3,
+            )
+        }
+        Tool::Claude => {
+            let name = format!("{id}.jsonl");
+            walk(&homes.claude.join("projects"), &|file| file == name, 1)
+        }
+    }
+}
+
+/// The session of `harness` from before its last switch away, from the
+/// journal: `(session id, file)`.
+fn session_before_last_switch(journal: &str, harness: Tool) -> Option<(String, Option<PathBuf>)> {
+    journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|entry| entry.get("from").and_then(Value::as_str) == Some(harness_name(harness)))
+        .and_then(|entry| {
+            let id = entry.get("sourceSessionId")?.as_str()?.to_owned();
+            let path = entry
+                .get("sourcePath")
+                .and_then(Value::as_str)
+                .map(PathBuf::from);
+            Some((id, path))
+        })
+}
+
 fn read_line_file(path: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
     let line = contents.trim();
@@ -144,6 +205,8 @@ impl Default for FailoverDirective {
 #[serde(default)]
 struct Directive {
     harness: Option<String>,
+    /// Go back to `harness`'s session from before its last switch.
+    restore: bool,
     failover: FailoverDirective,
 }
 
@@ -399,11 +462,36 @@ struct Turn {
     may_fail_over: bool,
 }
 
-/// The converted history for the next harness.
+/// The session that the next harness resumes, and where it came from.
 struct History {
+    /// `converted`, `empty` (a new session) or `restored`.
+    kind: &'static str,
     source_id: Option<String>,
-    /// `None` if the source session has nothing to carry over.
-    converted: Option<Converted>,
+    source_path: Option<PathBuf>,
+    session_id: Option<String>,
+    session_path: Option<PathBuf>,
+}
+
+impl History {
+    fn empty(source_id: Option<String>, source_path: Option<PathBuf>) -> Self {
+        Self {
+            kind: "empty",
+            source_id,
+            source_path,
+            session_id: None,
+            session_path: None,
+        }
+    }
+
+    fn converted(source_id: String, source_path: Option<PathBuf>, converted: &Converted) -> Self {
+        Self {
+            kind: "converted",
+            source_id: Some(source_id),
+            source_path,
+            session_id: Some(converted.id.to_string()),
+            session_path: Some(converted.path.clone()),
+        }
+    }
 }
 
 struct Supervisor {
@@ -420,16 +508,18 @@ struct Supervisor {
     cwd: PathBuf,
     homes: Homes,
     marker: PathBuf,
+    journal: PathBuf,
 }
 
 impl Supervisor {
     fn start(requested: Tool) -> Result<Self> {
         let homes = Homes::from_env();
-        let marker = env::var_os(STATE_DIR_ENV)
+        let state_dir = env::var_os(STATE_DIR_ENV)
             .filter(|dir| !dir.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| homes.codex.clone())
-            .join(ACTIVE_HARNESS_FILE);
+            .unwrap_or_else(|| homes.codex.clone());
+        let marker = state_dir.join(ACTIVE_HARNESS_FILE);
+        let journal = state_dir.join(JOURNAL_FILE);
         // The session moved in an earlier process: continue where it is.
         let active = read_line_file(&marker)
             .as_deref()
@@ -458,6 +548,7 @@ impl Supervisor {
             cwd: env::current_dir()?,
             homes,
             marker,
+            journal,
         };
         supervisor.write_marker();
         Ok(supervisor)
@@ -523,8 +614,10 @@ impl Supervisor {
                                 "harness-server: a turn runs; staying on {} for now",
                                 self.child.tool.label()
                             );
+                        } else if directive.restore {
+                            self.restore_before_turn(to)?;
                         } else {
-                            self.switch_before_turn(to)?;
+                            self.switch_before_turn(to, json!({"mode": "proactive"}))?;
                         }
                     }
                     self.queued.push_back(TurnInput {
@@ -666,15 +759,12 @@ impl Supervisor {
     }
 
     /// The control plane asked for another harness: move before the turn.
-    fn switch_before_turn(&mut self, to: Tool) -> Result<()> {
+    fn switch_before_turn(&mut self, to: Tool, details: Value) -> Result<()> {
         let from = self.child.tool;
         let history = match self.prepare_history(from, to, TrailingPrompt::Keep) {
             Ok(history) => history,
             // No session yet: the new harness starts one.
-            Err(session_transfer::Error::NotFound { .. }) => History {
-                source_id: None,
-                converted: None,
-            },
+            Err(session_transfer::Error::NotFound { .. }) => History::empty(None, None),
             Err(error) => {
                 eprintln!(
                     "harness-server: cannot move the session from {} to {}; staying on {}: {error}",
@@ -685,7 +775,50 @@ impl Supervisor {
                 return Ok(());
             }
         };
-        self.switch_child(to, &history, json!({"mode": "proactive"}))
+        self.switch_child(to, &history, details)
+    }
+
+    /// Goes back to `to`'s own session from before its last switch, as the
+    /// journal records it. The turns made since then on the other harness
+    /// are not in that session. Without a journal entry or the file, the
+    /// session is converted instead, and the notice says so.
+    fn restore_before_turn(&mut self, to: Tool) -> Result<()> {
+        let from = self.child.tool;
+        let journal = std::fs::read_to_string(&self.journal).unwrap_or_default();
+        let original = session_before_last_switch(&journal, to).and_then(|(id, path)| {
+            let path = path
+                .filter(|path| path.is_file())
+                .or_else(|| session_file(to, &id, &self.homes))?;
+            Some((id, path))
+        });
+        let Some((original_id, original_path)) = original else {
+            eprintln!(
+                "harness-server: no {} session from before the switch; converting the current one",
+                to.label()
+            );
+            return self
+                .switch_before_turn(to, json!({"mode": "proactive", "restore": "unavailable"}));
+        };
+        if let Err(error) = write_line_file(&persisted_id_file(to, &self.homes), &original_id) {
+            eprintln!(
+                "harness-server: cannot restore the {} session: {error}",
+                to.label()
+            );
+            return self
+                .switch_before_turn(to, json!({"mode": "proactive", "restore": "unavailable"}));
+        }
+        let source_id = read_line_file(&persisted_id_file(from, &self.homes));
+        let source_path = source_id
+            .as_deref()
+            .and_then(|id| session_file(from, id, &self.homes));
+        let history = History {
+            kind: "restored",
+            source_id,
+            source_path,
+            session_id: Some(original_id),
+            session_path: Some(original_path),
+        };
+        self.switch_child(to, &history, json!({"mode": "restore"}))
     }
 
     /// Converts the active session and writes it for `to`. Nothing changes
@@ -708,6 +841,7 @@ impl Supervisor {
             &SessionRef::Query(source_id.clone()),
             self.homes.get(from),
         )?;
+        let source_path = session_file(from, &source_id, &self.homes);
         let target = Target {
             home: self.homes.get(to).to_path_buf(),
             cwd: self.cwd.to_string_lossy().into_owned(),
@@ -727,27 +861,23 @@ impl Supervisor {
             path: target_id_file.clone(),
             source,
         };
-        let converted = match convert(&session, to, &target, &options) {
+        match convert(&session, to, &target, &options) {
             Ok(converted) => {
                 converted.write()?;
                 write_line_file(&target_id_file, &converted.id.to_string()).map_err(write_error)?;
-                Some(converted)
+                Ok(History::converted(source_id, source_path, &converted))
             }
             // Only a prompt that failed: the new harness starts a new session.
             Err(session_transfer::Error::EmptySession { .. }) => {
                 match std::fs::remove_file(&target_id_file) {
                     Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                        return Err(write_error(error));
+                        Err(write_error(error))
                     }
-                    _ => None,
+                    _ => Ok(History::empty(Some(source_id), source_path)),
                 }
             }
-            Err(error) => return Err(error),
-        };
-        Ok(History {
-            source_id: Some(source_id),
-            converted,
-        })
+            Err(error) => Err(error),
+        }
     }
 
     /// Interrupts the running turn and waits for its end. Stdin that arrives
@@ -776,8 +906,9 @@ impl Supervisor {
         }
     }
 
-    /// Replaces the child with one for `to`, which resumes the converted
-    /// session, and prints the notification.
+    /// Replaces the child with one for `to`, which resumes the session of
+    /// `history`, records the switch in the journal, and prints the
+    /// notification.
     fn switch_child(&mut self, to: Tool, history: &History, details: Value) -> Result<()> {
         let from = self.child.tool;
         self.child.stop();
@@ -786,19 +917,43 @@ impl Supervisor {
         let mut params = json!({
             "from": harness_name(from),
             "to": harness_name(to),
-            "history": if history.converted.is_some() { "converted" } else { "empty" },
-            "sessionId": history.converted.as_ref().map(|c| c.id.to_string()),
+            "history": history.kind,
+            "sessionId": history.session_id,
             "sourceSessionId": history.source_id,
         });
         if let (Some(params), Some(details)) = (params.as_object_mut(), details.as_object()) {
             params.extend(details.clone());
         }
+        let mut entry = params.clone();
+        entry["at"] = json!(Local::now().to_rfc3339());
+        entry["sourcePath"] = json!(history.source_path);
+        entry["path"] = json!(history.session_path);
+        self.append_journal(&entry);
         eprintln!(
             "harness-server: the session moved from {} to {}",
             from.label(),
             to.label()
         );
         self.emit_value(&json!({"method": FAILOVER_METHOD, "params": params}))
+    }
+
+    fn append_journal(&self, entry: &Value) {
+        let append = || -> io::Result<()> {
+            if let Some(dir) = self.journal.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.journal)?;
+            writeln!(file, "{entry}")
+        };
+        if let Err(error) = append() {
+            eprintln!(
+                "harness-server: cannot write {}: {error}",
+                self.journal.display()
+            );
+        }
     }
 
     fn write_marker(&self) {
@@ -854,10 +1009,11 @@ mod tests {
 
     #[test]
     fn the_directive_is_taken_out_of_the_line() {
-        let mut line = json!({"type": "user", "text": "hi", "centaur": {"harness": "claudecode", "failover": {"enabled": false, "model": "m"}}});
+        let mut line = json!({"type": "user", "text": "hi", "centaur": {"harness": "claudecode", "restore": true, "failover": {"enabled": false, "model": "m"}}});
         let directive = take_directive(&mut line);
         assert_eq!(line, json!({"type": "user", "text": "hi"}));
         assert_eq!(directive.harness.as_deref(), Some("claudecode"));
+        assert!(directive.restore);
         assert!(!directive.failover.enabled);
         assert_eq!(directive.failover.model.as_deref(), Some("m"));
 
@@ -923,6 +1079,62 @@ mod tests {
         let text = line["message"]["content"].as_str().unwrap();
         assert!(text.starts_with("[Centaur]"), "{text}");
         assert!(text.contains("from Codex CLI") && text.contains("to Claude Code"));
+    }
+
+    #[test]
+    fn the_journal_gives_the_session_before_the_last_switch() {
+        let journal = [
+            json!({"from": "codex", "to": "claudecode", "sourceSessionId": "codex-1", "sourcePath": "/s/codex-1.jsonl"}),
+            json!({"from": "claudecode", "to": "codex", "mode": "restore", "sourceSessionId": "claude-1"}),
+            json!({"from": "codex", "to": "claudecode", "sourceSessionId": "codex-1b"}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_eq!(
+            session_before_last_switch(&journal, Tool::Codex),
+            Some(("codex-1b".to_owned(), None))
+        );
+        assert_eq!(
+            session_before_last_switch(&journal, Tool::Claude),
+            Some(("claude-1".to_owned(), None))
+        );
+        let first = journal.lines().next().unwrap();
+        assert_eq!(
+            session_before_last_switch(first, Tool::Codex),
+            Some((
+                "codex-1".to_owned(),
+                Some(PathBuf::from("/s/codex-1.jsonl"))
+            ))
+        );
+        assert_eq!(session_before_last_switch("", Tool::Codex), None);
+        assert_eq!(session_before_last_switch("not json", Tool::Codex), None);
+    }
+
+    #[test]
+    fn session_files_are_found_by_their_names() {
+        let root = std::env::temp_dir().join(format!("switch-files-{}", Uuid::new_v4().simple()));
+        let homes = Homes {
+            codex: root.join("codex"),
+            claude: root.join("claude"),
+        };
+        let rollout = homes
+            .codex
+            .join("sessions/2026/09/24/rollout-2026-09-24T10-00-00-thread-7.jsonl");
+        let transcript = homes.claude.join("projects/-work-app/session-7.jsonl");
+        for file in [&rollout, &transcript] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "{}\n").unwrap();
+        }
+        assert_eq!(session_file(Tool::Codex, "thread-7", &homes), Some(rollout));
+        assert_eq!(
+            session_file(Tool::Claude, "session-7", &homes),
+            Some(transcript)
+        );
+        assert_eq!(session_file(Tool::Codex, "thread-8", &homes), None);
+        assert_eq!(session_file(Tool::Claude, "session", &homes), None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
