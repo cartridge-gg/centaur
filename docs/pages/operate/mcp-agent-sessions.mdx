@@ -260,6 +260,11 @@ the limit, set `timeout` (in ms) for the server in the MCP configuration.
 You can also set `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (in ms) for all
 servers. The value `0` turns off the limit.
 
+If a call runs longer than 120 s, Claude Code moves the call to the
+background. The call and the turn continue. You can keep working in the
+conversation. When the call ends, Claude Code gives the result to the model
+as a notification.
+
 ### Codex
 
 Codex does not show progress notifications. During the call, Codex shows
@@ -324,7 +329,7 @@ deltas and model reasoning.
 | `message` | `phase`, `text` | `message: Found the flaky test.` |
 | `user_message` | `text` | `prompt: Open a draft PR.` |
 | `command` | `command`, `status`, `exit_code`, `output_tail` | `command: cargo test → exit 0` |
-| `tool_call` | `server`, `tool`, `status`, `error` or `success` | `tool: centaur.slack → completed` |
+| `tool_call` | `server`, `tool`, `status`, `error` or `success`, `command` | `tool: centaur.slack → completed` or `terminal: sleep 8 → completed` |
 | `file_change` | `status`, `paths` | `files: a.rs, b.rs (+2 more)` |
 | `web_search` | `query` | `search: rust sse axum` |
 | `plan` | `text` | `plan updated` |
@@ -340,6 +345,10 @@ deltas and model reasoning.
 | `turn_completed`, `turn_failed`, `turn_cancelled` | none | `turn completed`, `turn failed`, `turn cancelled` |
 
 `output_tail` holds the last 800 characters of the command output.
+
+Hermes runs shell commands through its `terminal` tool, not as `command`
+items. If a tool call has a `command` argument, the `tool_call` item has
+`command`, and the progress line shows the command.
 
 ## Errors
 
