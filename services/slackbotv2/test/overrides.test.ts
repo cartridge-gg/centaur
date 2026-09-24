@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { SlackFormatConverter } from '@chat-adapter/slack'
 import {
+  extractFailoverOverride,
   extractMessageOverrides,
   isHarnessEnabled,
   parseEnabledHarnesses,
@@ -20,6 +21,36 @@ describe('deployment harness allowlist', () => {
     expect(isHarnessEnabled('codex', ['codex', 'claudecode'])).toBe(true)
     expect(() => parseEnabledHarnesses('')).toThrow('SLACKBOTV2_ENABLED_HARNESSES')
     expect(() => parseEnabledHarnesses('codex,typo')).toThrow('SLACKBOTV2_ENABLED_HARNESSES')
+  })
+})
+
+describe('extractFailoverOverride', () => {
+  test('--no-failover and --failover set the choice and are stripped', () => {
+    expect(extractFailoverOverride('--no-failover fix the build')).toEqual({
+      cleanedText: 'fix the build',
+      failover: false
+    })
+    expect(extractFailoverOverride('fix the build --failover')).toEqual({
+      cleanedText: 'fix the build',
+      failover: true
+    })
+  })
+
+  test('leaves other text alone', () => {
+    for (const text of ['fix the failover code', 'use --failovers', 'no--failover here']) {
+      expect(extractFailoverOverride(text)).toEqual({ cleanedText: text })
+    }
+  })
+
+  test('messageOverridesForText returns the choice next to the harness flags', async () => {
+    const result = await messageOverridesForText(
+      {} as SlackbotV2Options,
+      '--claude --no-failover review this',
+      {} as SlackbotV2Trace
+    )
+    expect(result.failover).toBe(false)
+    expect(result.overrides.harnessType).toBe('claudecode')
+    expect(result.cleanedText).toBe('review this')
   })
 })
 

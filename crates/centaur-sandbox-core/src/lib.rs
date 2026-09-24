@@ -17,8 +17,8 @@ pub use backend::SandboxBackend;
 pub use error::{BoxedError, SandboxError, SandboxResult};
 pub use io::{SandboxIo, SandboxIoGuard, SandboxIoParts, SandboxRead, SandboxWrite};
 pub use lifecycle::{
-    KEEP_HARD_DEADLINE_ANNOTATION, KEEP_UNTIL_ANNOTATION, ObservedSandbox,
-    SandboxHandle, SandboxId, SandboxStatus,
+    KEEP_HARD_DEADLINE_ANNOTATION, KEEP_UNTIL_ANNOTATION, ObservedSandbox, SandboxHandle,
+    SandboxId, SandboxStatus,
 };
 pub use spec::{
     EnvVar, Mount, MountKind, RepoCacheAccess, ResourceClaim, ResourceRequirements,

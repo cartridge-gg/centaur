@@ -447,7 +447,7 @@ async fn send_locked(
                 let harness = request
                     .harness
                     .clone()
-                    .unwrap_or_else(|| runtime.default_session_harness());
+                    .unwrap_or_else(|| runtime.default_harness());
                 let outcome = runtime
                     .create_or_get_session_with_principal(
                         thread_key,
@@ -2434,10 +2434,12 @@ mod tests {
             .await
             .expect("connect test db");
         MIGRATED
-            .get_or_init(|| async { store
+            .get_or_init(|| async {
+                store
                     .run_migrations(centaur_session_sqlx::TextSearchBackend::Postgres)
                     .await
-                    .expect("run migrations") })
+                    .expect("run migrations")
+            })
             .await;
         Some(store)
     }

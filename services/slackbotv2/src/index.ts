@@ -93,6 +93,7 @@ import { resolveChannelDefault } from './channel-defaults'
 import { proactiveThreadMessage } from './proactive-classifier'
 import { resolveProactivityRules, type ProactivityRule } from './proactivity-rules'
 import {
+  extractFailoverOverride,
   extractMessageOverrides,
   extractPersonaOverride,
   isHarnessEnabled,
@@ -265,28 +266,31 @@ export async function messageOverridesForText(
   options: SlackbotV2Options,
   text: string,
   trace: SlackbotV2Trace
-): Promise<{ cleanedText?: string; overrides: HarnessOverrides }> {
+): Promise<{ cleanedText?: string; overrides: HarnessOverrides; failover?: boolean }> {
   const strategy = options.messageOverridesStrategy ?? DEFAULT_MESSAGE_OVERRIDES_STRATEGY
   const persona = extractPersonaOverride(text)
+  const failover = extractFailoverOverride(persona.cleanedText)
   let result: { cleanedText?: string; overrides: HarnessOverrides }
   try {
-    result = await strategy({ text: persona.cleanedText })
+    result = await strategy({ text: failover.cleanedText })
   } catch (error) {
     traceWarn(options, 'slackbotv2_message_overrides_strategy_failed', trace, {
       error: errorMessage(error)
     })
-    result = await DEFAULT_MESSAGE_OVERRIDES_STRATEGY({ text: persona.cleanedText })
+    result = await DEFAULT_MESSAGE_OVERRIDES_STRATEGY({ text: failover.cleanedText })
   }
   const { personaId: _strategyPersonaId, ...strategyOverrides } = result.overrides
   return {
     ...result,
-    ...(persona.personaId && result.cleanedText === undefined
-      ? { cleanedText: persona.cleanedText }
+    ...((persona.personaId || failover.failover !== undefined) &&
+    result.cleanedText === undefined
+      ? { cleanedText: failover.cleanedText }
       : {}),
     overrides: {
       ...strategyOverrides,
       ...(persona.personaId ? { personaId: persona.personaId } : {})
-    }
+    },
+    ...(failover.failover !== undefined ? { failover: failover.failover } : {})
   }
 }
 
@@ -1838,6 +1842,10 @@ async function syncThreadMessageToSession(
     stickyOverridesUpdate.provider = null
   }
   const effectiveOverrides = resolveStickyThreadOverrides(state, stickyOverridesUpdate)
+  // --no-failover / --failover are sticky for the thread; failover is on by default.
+  const failoverStateUpdate: Pick<SlackbotV2ThreadState, 'providerFailover'> =
+    messageOverrides.failover === undefined ? {} : { providerFailover: messageOverrides.failover }
+  const providerFailover = messageOverrides.failover ?? state.providerFailover ?? true
   // The default response-metadata mode renders on the first assistant message
   // in a thread (the reply to the first message that starts an execution).
   const isFirstAssistantMessage = shouldStartExecution && executedMessageIds.size === 0
@@ -2040,6 +2048,8 @@ async function syncThreadMessageToSession(
     generativeUiNote,
     provider: shouldStartExecution ? resolvedProvider : undefined,
     reasoning: resolvedReasoning,
+    harnessExplicit: shouldStartExecution ? Boolean(explicitOverrides.harnessType) : undefined,
+    providerFailover: shouldStartExecution ? providerFailover : undefined,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },
@@ -2098,6 +2108,7 @@ async function syncThreadMessageToSession(
       steeringReactionAck !== undefined && latest.activeExecution === true
     await thread.setState({
       ...(stickyOverridesUpdate ?? {}),
+      ...failoverStateUpdate,
       forwardedMessageIds: Array.from(latestMessageIds).slice(-1000),
       historyForwarded: latest.historyForwarded || (shouldIncludeContext && !contextDegraded),
       lastEventId
@@ -2147,6 +2158,7 @@ async function syncThreadMessageToSession(
     }
     await thread.setState({
       ...(stickyOverridesUpdate ?? {}),
+      ...failoverStateUpdate,
       activeExecution: true,
       executedMessageIds: Array.from(latestExecutedMessageIds).slice(-1000),
       lastEventId,
@@ -2255,12 +2267,30 @@ async function syncThreadMessageToSession(
         forwardInput.metadataHarnessType = harnessType
         // A persona-pinned model overrides any model or provider selection.
         const personaModel = outcome.personaModel
+        // The session moved to another harness when its model provider had no
+        // capacity left. Follow it: the model and provider of the old harness
+        // do not apply to the new one.
+        const followsFailover = outcome.providerFailover !== undefined && harnessType !== effectiveHarnessType
+        if (followsFailover) {
+          stickyOverridesUpdate = {
+            ...(stickyOverridesUpdate ?? {}),
+            harnessType,
+            model: null,
+            provider: null
+          }
+          forwardInput.model = undefined
+          forwardInput.provider = undefined
+          traceLog(input.options, 'slackbotv2_session_provider_failover_followed', trace, {
+            from_harness_type: outcome.providerFailover?.from,
+            to_harness_type: harnessType
+          })
+        }
         let model = effectiveModel
         let reasoning = effectiveReasoning
         if (harnessType !== effectiveHarnessType || personaModel) {
           model =
             personaModel ??
-            resolvedModel ??
+            (followsFailover ? undefined : resolvedModel) ??
             defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
           // Validate the raw request: resolvedReasoning was filtered against
           // the model expected before the session resolved.

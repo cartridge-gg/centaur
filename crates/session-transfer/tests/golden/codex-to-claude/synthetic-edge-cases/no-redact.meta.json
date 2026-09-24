@@ -1,0 +1,13 @@
+{
+  "direction": "codex-to-claude",
+  "fixture": "tests/fixtures/codex/synthetic-edge-cases.jsonl",
+  "options": {
+    "keepThinking": false,
+    "redact": false
+  },
+  "expected": {
+    "id": "aaaaaaaa-0000-4000-8000-000000000000",
+    "path": "/claude-home/projects/-Users-dev-it-s-my-app--/aaaaaaaa-0000-4000-8000-000000000000.jsonl",
+    "resumeCommand": "cd '/Users/dev/it'\\''s my app/ü' && claude --resume aaaaaaaa-0000-4000-8000-000000000000"
+  }
+}
