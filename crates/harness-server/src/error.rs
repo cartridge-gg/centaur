@@ -78,4 +78,8 @@ pub enum HarnessServerError {
     },
     #[error("session transfer failed: {0}")]
     Transcript(#[from] session_transfer::Error),
+    #[error("the harness resumed session {session_id} without its history")]
+    ResumedWithoutHistory { session_id: String },
+    #[error("the converted session is not readable by {tool}: {reason}")]
+    UnreadableConversion { tool: &'static str, reason: String },
 }
