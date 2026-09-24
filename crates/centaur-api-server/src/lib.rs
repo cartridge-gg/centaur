@@ -28,7 +28,7 @@ pub fn warm_slack_public_channel_cache() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -105,7 +105,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct TestSessionPrincipalRegistrar;
+    pub(crate) struct TestSessionPrincipalRegistrar;
 
     #[async_trait]
     impl SessionPrincipalRegistrar for TestSessionPrincipalRegistrar {
@@ -985,7 +985,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct TestBackend {
+    pub(crate) struct TestBackend {
         next_id: AtomicU64,
     }
 
