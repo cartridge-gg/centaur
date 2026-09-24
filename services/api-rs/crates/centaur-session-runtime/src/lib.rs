@@ -2558,6 +2558,7 @@ impl SessionRuntime {
         &self,
         mut session: Session,
         execution_metadata: Option<&Value>,
+        execution_id: Option<&str>,
     ) -> Result<(Session, Option<FailoverDirective>), SessionRuntimeError> {
         let config = &self.provider_failover;
         // Without the deployment setting, sandboxes cannot switch.
@@ -2578,7 +2579,7 @@ impl SessionRuntime {
         if allowed && current_exhausted && !other_exhausted {
             retarget_model = Some(config.model_for(&other).map(str::to_owned));
             if session.sandbox_id.is_none() {
-                let record = failover_record(&harness, &other, "proactive", None, None);
+                let record = failover_record(&harness, &other, "proactive", execution_id, None);
                 if self
                     .store
                     .fail_over_session_harness(&session.thread_key, &harness, &other, &record)
@@ -2587,9 +2588,15 @@ impl SessionRuntime {
                     self.store
                         .append_event(
                             &session.thread_key,
-                            None,
+                            execution_id,
                             PROVIDER_FAILOVER_EVENT,
-                            json!({"from": harness.as_ref(), "to": other.as_ref(), "mode": "proactive"}),
+                            json!({
+                                "from": harness.as_ref(),
+                                "to": other.as_ref(),
+                                "mode": "proactive",
+                                "history": "empty",
+                                "execution_id": execution_id,
+                            }),
                         )
                         .await?;
                     record_session_provider_failover(harness.as_ref(), other.as_ref(), "proactive");
@@ -3003,11 +3010,7 @@ impl SessionRuntime {
                 "starting session execution"
             );
             let session = self.store.get_session(thread_key).await?;
-            let (session, failover) = self
-                .plan_provider_failover(session, metadata.as_ref())
-                .await?;
             correlation_sandbox_id = session.sandbox_id.clone();
-            let harness_label = session.harness_type.to_string();
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
             let requester_metadata = metadata.clone();
@@ -3078,6 +3081,24 @@ impl SessionRuntime {
                 return Err(error);
             }
             drop(admission);
+            // After the claim, so that a switch before the turn is an event of
+            // this execution; before the sandbox, which runs the new harness.
+            let (session, failover) = match self
+                .plan_provider_failover(
+                    session,
+                    requester_metadata.as_ref(),
+                    Some(&execution.execution_id),
+                )
+                .await
+            {
+                Ok(planned) => planned,
+                Err(error) => {
+                    self.record_execution_failure(thread_key, &execution.execution_id, &error)
+                        .await;
+                    return Err(error);
+                }
+            };
+            let harness_label = session.harness_type.to_string();
             let execution_trace_span = info_span!(
                 parent: None,
                 "centaur.api_rs.session.execution",
@@ -13326,7 +13347,7 @@ mod adoption_tests {
         // Healthy providers: the turn stays on Codex and may fail over.
         let (_, session) = new_session("healthy").await;
         let (session, directive) = runtime
-            .plan_provider_failover(session, None)
+            .plan_provider_failover(session, None, None)
             .await
             .expect("plan");
         let directive = directive.expect("a directive");
@@ -13339,7 +13360,7 @@ mod adoption_tests {
         // The requester turned failover off.
         let (_, session) = new_session("off").await;
         let (_, directive) = runtime
-            .plan_provider_failover(session, Some(&json!({"provider_failover": false})))
+            .plan_provider_failover(session, Some(&json!({"provider_failover": false})), None)
             .await
             .expect("plan");
         assert!(!directive.expect("a directive").enabled);
@@ -13356,7 +13377,7 @@ mod adoption_tests {
         // No sandbox yet: the session starts on Claude Code.
         let (thread_key, session) = new_session("no-sandbox").await;
         let (session, directive) = runtime
-            .plan_provider_failover(session, None)
+            .plan_provider_failover(session, None, None)
             .await
             .expect("plan");
         let directive = directive.expect("a directive");
@@ -13380,7 +13401,7 @@ mod adoption_tests {
             .expect("set sandbox id");
         let session = store.get_session(&thread_key).await.expect("load session");
         let (session, directive) = runtime
-            .plan_provider_failover(session, None)
+            .plan_provider_failover(session, None, None)
             .await
             .expect("plan");
         assert_eq!(session.harness_type, HarnessType::Codex);
@@ -13402,7 +13423,7 @@ mod adoption_tests {
             .await
             .expect("create session");
         let (session, directive) = runtime
-            .plan_provider_failover(session, None)
+            .plan_provider_failover(session, None, None)
             .await
             .expect("plan");
         assert_eq!(session.harness_type, HarnessType::Codex);

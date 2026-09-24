@@ -64,6 +64,8 @@ type CodexMapperState = {
   emittedActivityRunByTaskId: Map<string, string>
   emittedActivityOutputByTaskId: Map<string, string>
   emittedActivitySignatureByTaskId: Map<string, string>
+  /** `from->to` of each harness switch already shown. */
+  providerFailovers: Set<string>
   done: boolean
 }
 
@@ -176,8 +178,12 @@ export class CodexAppServerRendererEventMapper
     const title = threadTitleUpdate(event)
     if (title) out.push({ type: 'renderer.title.update', title })
 
+    // A switch in the sandbox arrives twice: as its output line and as the
+    // control plane's session event. Show it once.
     const failover = providerFailoverTask(event, `task-${this.state.stepCounter + 1}`)
-    if (failover) {
+    const failoverKey = `${event?.from}->${event?.to}`
+    if (failover && !this.state.providerFailovers.has(failoverKey)) {
+      this.state.providerFailovers.add(failoverKey)
       this.state.stepCounter += 1
       this.state.taskByUseId.set(failover.id, failover)
       this.emitActivitySummary(out)
@@ -668,6 +674,13 @@ export function rustSessionEventToServerNotification(source: unknown): RustSessi
     }
   }
 
+  // The control plane moved the session before the turn, or recorded a move
+  // that the sandbox reported (the same fields as `centaur/providerFailover`).
+  if (eventKind === 'session.provider_failover') {
+    const data = isRecord(source.data) ? source.data : {}
+    return { kind: 'notification', notification: { ...data, type: 'centaur.providerFailover' } }
+  }
+
   if (eventKind === 'session.activity_summary') {
     const data = isRecord(source.data) ? source.data : source
     const status = String(data.summary ?? data.status ?? '').trim()
@@ -737,6 +750,7 @@ function newState(): CodexMapperState {
     emittedActivityRunByTaskId: new Map(),
     emittedActivityOutputByTaskId: new Map(),
     emittedActivitySignatureByTaskId: new Map(),
+    providerFailovers: new Set(),
     done: false
   }
 }

@@ -913,6 +913,37 @@ describe('CodexAppServerRendererEventMapper provider exhaustion', () => {
     )
   })
 
+  it('shows a switch once when both the line and the session event arrive', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const params = { from: 'codex', to: 'claudecode', mode: 'reactive', history: 'converted' }
+    const first = mapper.process({
+      eventKind: 'session.output.line',
+      data: JSON.stringify({ method: 'centaur/providerFailover', params })
+    })
+    const second = mapper.process({
+      eventKind: 'session.provider_failover',
+      data: { ...params, execution_id: 'exec-1' }
+    })
+    const tasks = [...first, ...second].filter(event => event.type === 'renderer.task.update')
+    expect(tasks).toHaveLength(1)
+  })
+
+  it('shows a switch that the control plane made before the turn', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      eventKind: 'session.provider_failover',
+      data: { from: 'codex', to: 'claudecode', mode: 'proactive', history: 'empty' }
+    })
+    expect(events.find(event => event.type === 'renderer.task.update')).toMatchObject({
+      task: {
+        title: 'Switched to Claude Code',
+        details: [
+          { type: 'text', text: 'Codex has no model capacity left, so this session continues on Claude Code.' }
+        ]
+      }
+    })
+  })
+
   it('keeps the upstream text for other failures', () => {
     const mapper = new CodexAppServerRendererEventMapper()
     const events = mapper.process({

@@ -2105,7 +2105,8 @@ async function* parseSessionEventStream(
       if (isTerminalCodexOutputLine(event.data)) return
       continue
     }
-    if (event.event === 'session.activity_summary') {
+    // A harness switch: the renderer shows it as an activity task.
+    if (event.event === 'session.activity_summary' || event.event === 'session.provider_failover') {
       yield {
         data: sessionEventData(event),
         event: event.event,
