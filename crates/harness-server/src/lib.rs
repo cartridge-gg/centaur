@@ -9,6 +9,7 @@ mod nanocodex;
 mod nanocodex_subagents;
 mod otel;
 mod server;
+pub mod switch;
 mod traits;
 pub mod transcript;
 mod turn;

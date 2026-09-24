@@ -344,6 +344,38 @@ pub(crate) struct BlocksState {
     staged: HashMap<String, StagedAttachment>,
 }
 
+impl BlocksState {
+    /// Points the `stagedAttachmentId` blocks of a user line at their staged
+    /// files, so that the line also works for a process without this state.
+    pub(crate) fn inline_staged_attachments(&self, line: &mut Value) {
+        for pointer in ["/message/content", "/content"] {
+            let Some(Value::Array(blocks)) = line.pointer_mut(pointer) else {
+                continue;
+            };
+            for block in blocks {
+                let Some(staged) = block
+                    .get("stagedAttachmentId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.staged.get(id))
+                    .cloned()
+                else {
+                    continue;
+                };
+                if block.get("localPath").is_some() || block.get("path").is_some() {
+                    continue;
+                }
+                block["localPath"] = json!(staged.path);
+                if let Some(mime_type) = staged.mime_type {
+                    block["mimeType"] = json!(mime_type);
+                }
+                if let Some(attachment_type) = staged.attachment_type {
+                    block["attachment_type"] = json!(attachment_type);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StagedAttachment {
     path: PathBuf,
@@ -1803,6 +1835,41 @@ mod tests {
         };
         assert!(text.starts_with("[Attached file saved to "));
         assert!(text.ends_with("clip.mp4]"));
+    }
+
+    #[test]
+    fn a_staged_attachment_works_without_the_staging_state() {
+        let _upload_dir = temp_upload_dir();
+        let mut state = BlocksState::default();
+        let chunk = r#"{"type":"attachment.chunk","attachmentId":"att-1","name":"clip.mp4","mimeType":"video/mp4","attachmentType":"video","chunkIndex":0,"final":true,"dataBase64":"aGVsbG8="}"#;
+        parse_blocks_line_with_state(chunk, &mut state).expect("chunk parses");
+
+        let mut user: Value = serde_json::from_str(r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"analyze this"},{"type":"attachment","stagedAttachmentId":"att-1","name":"clip.mp4"},{"type":"attachment","stagedAttachmentId":"att-2","name":"other.mp4"}]}}"#).unwrap();
+        state.inline_staged_attachments(&mut user);
+        let staged = &state.staged["att-1"];
+        assert_eq!(
+            user["message"]["content"][1]["localPath"],
+            json!(staged.path)
+        );
+        assert_eq!(user["message"]["content"][1]["mimeType"], "video/mp4");
+        assert_eq!(user["message"]["content"][1]["attachment_type"], "video");
+        // An attachment that was not staged stays as it is.
+        assert!(user["message"]["content"][2].get("localPath").is_none());
+
+        // Another process reads the file from its path.
+        let BlocksCommand::User { input, .. } =
+            parse_blocks_line_with_state(&user.to_string(), &mut BlocksState::default())
+                .expect("user parses")
+        else {
+            panic!("expected user command");
+        };
+        let UserInput::Text { text, .. } = &input[1] else {
+            panic!("expected the attachment as text");
+        };
+        assert_eq!(
+            text,
+            &format!("[Attached file saved to {}]", staged.path.display())
+        );
     }
 
     #[test]

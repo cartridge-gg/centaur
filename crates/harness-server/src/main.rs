@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use harness_server::switch::{run_switchable_blocks_server, switching_enabled};
 use harness_server::transcript::{ConvertRequest, convert_session};
 use harness_server::{
     HarnessKind, Result, run_blocks_server, run_harness_server, run_hermes_blocks_server,
@@ -149,8 +150,16 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 }
 
 fn run_mode(kind: HarnessKind, mode: ServerMode) -> Result<()> {
-    match mode {
-        ServerMode::Blocks => run_blocks_server(kind),
-        ServerMode::Jsonrpc => run_harness_server(kind),
+    let switchable = match kind {
+        HarnessKind::Codex => Some(Tool::Codex),
+        HarnessKind::ClaudeCode => Some(Tool::Claude),
+        HarnessKind::Amp => None,
+    };
+    match (mode, switchable) {
+        (ServerMode::Blocks, Some(tool)) if switching_enabled() => {
+            run_switchable_blocks_server(tool)
+        }
+        (ServerMode::Blocks, _) => run_blocks_server(kind),
+        (ServerMode::Jsonrpc, _) => run_harness_server(kind),
     }
 }

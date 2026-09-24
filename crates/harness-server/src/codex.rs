@@ -71,6 +71,12 @@ impl CodexHarnessServer {
     }
 }
 
+/// The model provider of a new Codex thread without a per-turn override.
+pub(crate) fn default_model_provider() -> String {
+    let config = CodexHarnessServer::codex();
+    config.model_provider_for(None, config.default_model().as_deref())
+}
+
 impl AppServerRuntime for CodexHarnessServer {
     fn run_stdio(&self) -> Result<()> {
         let bin = codex_bin();
