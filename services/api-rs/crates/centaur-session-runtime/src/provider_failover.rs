@@ -78,6 +78,9 @@ pub(crate) struct FailoverDirective {
     /// The user lines were written for another harness: their model,
     /// provider and reasoning effort do not apply.
     pub retarget_model: Option<Option<String>>,
+    /// The user asked for `harness`: the sandbox reports the move with the
+    /// mode `requested`.
+    pub requested: bool,
 }
 
 impl FailoverDirective {
@@ -86,7 +89,11 @@ impl FailoverDirective {
         if let Some(model) = &self.model {
             failover["model"] = json!(model);
         }
-        json!({"harness": self.harness.as_ref(), "failover": failover})
+        let mut directive = json!({"harness": self.harness.as_ref(), "failover": failover});
+        if self.requested {
+            directive["mode"] = json!("requested");
+        }
+        directive
     }
 
     /// The user lines with the directive. Other lines are unchanged.
@@ -156,13 +163,16 @@ impl FailoverNotice {
     }
 }
 
-/// `sessions.metadata.provider_failover`: the last switch of the session.
+/// `sessions.metadata.provider_failover`: the last switch of the session,
+/// and the sandbox it happened in. The state volume of that sandbox has the
+/// session, and the sessions that each switch converted it from.
 pub(crate) fn failover_record(
     from: &HarnessType,
     to: &HarnessType,
     mode: &str,
     execution_id: Option<&str>,
     reset_at: Option<i64>,
+    sandbox_id: Option<&str>,
 ) -> Value {
     json!({
         "from": from.as_ref(),
@@ -171,7 +181,25 @@ pub(crate) fn failover_record(
         "at": jiff::Timestamp::now().to_string(),
         "execution_id": execution_id,
         "reset_at": reset_at,
+        "sandbox_id": sandbox_id,
     })
+}
+
+/// True when the sandbox of the last switch still serves the session. That
+/// sandbox can switch harness, and its state volume has the session.
+pub(crate) fn switched_in(record: Option<&Value>, sandbox_id: Option<&str>) -> bool {
+    let recorded = record
+        .and_then(|record| record.get("sandbox_id"))
+        .and_then(Value::as_str);
+    sandbox_id.is_some() && recorded == sandbox_id
+}
+
+/// True while a switch that the user asked for has not reached the sandbox.
+pub(crate) fn switch_pending(record: Option<&Value>) -> bool {
+    record
+        .and_then(|record| record.get("pending"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 /// True when the session left `requested` in a failover and still runs on
@@ -240,6 +268,7 @@ mod tests {
             enabled: true,
             model: Some("gpt-5.5".to_owned()),
             retarget_model: None,
+            requested: false,
         };
         let lines = directive.apply(vec![
             json!({"type": "user", "text": "hi", "model": "claude-opus-5-5"}).to_string(),
@@ -263,6 +292,7 @@ mod tests {
             enabled: false,
             model: None,
             retarget_model: Some(Some("claude-opus-5-5".to_owned())),
+            requested: true,
         };
         let lines = directive.apply(vec![
             json!({"type": "user", "text": "hi", "model": "gpt-5.5", "provider": "p", "reasoning": "high"})
@@ -272,6 +302,7 @@ mod tests {
         assert_eq!(user["model"], "claude-opus-5-5");
         assert!(user.get("provider").is_none() && user.get("reasoning").is_none());
         assert_eq!(user["centaur"]["failover"], json!({"enabled": false}));
+        assert_eq!(user["centaur"]["mode"], "requested");
     }
 
     #[test]
@@ -303,7 +334,14 @@ mod tests {
             "reactive",
             None,
             None,
+            Some("sbx-1"),
         );
+        assert!(switched_in(Some(&record), Some("sbx-1")));
+        assert!(!switched_in(Some(&record), Some("sbx-2")));
+        assert!(!switched_in(Some(&record), None));
+        assert!(!switched_in(None, Some("sbx-1")));
+        assert!(!switch_pending(Some(&record)));
+        assert!(switch_pending(Some(&json!({"pending": true}))));
         assert!(kept_after_failover(
             Some(&record),
             &HarnessType::Codex,

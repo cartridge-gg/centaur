@@ -246,6 +246,14 @@ fn initial_blocks_thread_state<H: HarnessServer>(harness: &H) -> Result<ThreadSt
     {
         if harness.session_resumable(&id, &state.cwd) {
             state.harness_session_id = Some(id);
+        } else if crate::switch::resume_required() {
+            // A session that a harness switch converted: the harness must
+            // fail on it, so that the switch goes back to the session it came
+            // from, instead of a new session without the history.
+            eprintln!(
+                "harness-server: persisted session {id} has no transcript; resuming it anyway"
+            );
+            state.harness_session_id = Some(id);
         } else {
             eprintln!(
                 "harness-server: persisted session {id} has no transcript; starting a new session"
