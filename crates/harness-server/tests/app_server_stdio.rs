@@ -235,7 +235,9 @@ fn fake_claude_session_id_persists_across_processes() {
     std::fs::write(
         &fake_claude,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nprintf '%s\\n' {} {} {}\n",
+            // Read the prompt first, like the real CLI: exiting before
+            // harness-server writes it fails the turn with a broken pipe.
+            "#!/bin/sh\nIFS= read -r _prompt\nprintf '%s\\n' \"$*\" >> {}\nprintf '%s\\n' {} {} {}\n",
             shell_quote(&args_log),
             r#"'{"type":"system","subtype":"init","session_id":"claude-session-1"}'"#,
             r#"'{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"ok"}]}}'"#,
