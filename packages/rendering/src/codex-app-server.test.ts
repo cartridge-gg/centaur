@@ -873,6 +873,46 @@ describe('CodexAppServerRendererEventMapper provider exhaustion', () => {
     })
   })
 
+  it('shows a switch to another harness as a completed task', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      method: 'centaur/providerFailover',
+      params: {
+        from: 'codex',
+        to: 'claudecode',
+        mode: 'reactive',
+        resume: 'replay',
+        history: 'converted',
+        sessionId: '00000000-0000-4000-8000-000000000001',
+        providerExhausted: exhausted
+      }
+    })
+    const update = events.find(event => event.type === 'renderer.task.update')
+    expect(update).toMatchObject({
+      task: {
+        id: 'task-1',
+        title: 'Switched to Claude Code',
+        details: [
+          {
+            type: 'text',
+            text:
+              'Codex has no model capacity left until 2026-09-24 03:26 UTC, so this session ' +
+              'continues on Claude Code with its history.'
+          }
+        ]
+      }
+    })
+    expect(mapper.isDone()).toBe(false)
+    expect(mapper.threadId()).toBe('')
+    // The turn goes on; its end shows the task as complete.
+    expect(mapper.flush()).toContainEqual(
+      expect.objectContaining({
+        type: 'renderer.task.update',
+        task: expect.objectContaining({ id: 'task-1', status: 'complete' })
+      })
+    )
+  })
+
   it('keeps the upstream text for other failures', () => {
     const mapper = new CodexAppServerRendererEventMapper()
     const events = mapper.process({

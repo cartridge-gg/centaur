@@ -176,6 +176,13 @@ export class CodexAppServerRendererEventMapper
     const title = threadTitleUpdate(event)
     if (title) out.push({ type: 'renderer.title.update', title })
 
+    const failover = providerFailoverTask(event, `task-${this.state.stepCounter + 1}`)
+    if (failover) {
+      this.state.stepCounter += 1
+      this.state.taskByUseId.set(failover.id, failover)
+      this.emitActivitySummary(out)
+    }
+
     trackAgentMessageLifecycle(event, this.state)
     ensureCommentarySegmentBreak(event, this.state)
 
@@ -787,16 +794,49 @@ function errorMessage(event: any): string {
 function providerExhaustedMessage(event: any): string | null {
   const exhausted = event?.centaur?.providerExhausted
   if (!isRecord(exhausted)) return null
-  const resetAt =
-    typeof exhausted.resetAt === 'number' ? new Date(exhausted.resetAt * 1000) : null
-  const until =
-    resetAt && !Number.isNaN(resetAt.getTime())
-      ? ` until ${resetAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`
-      : ''
   return (
-    `The model provider has no capacity left${until}: its usage limit is reached ` +
+    `The model provider has no capacity left${untilText(exhausted)}: its usage limit is reached ` +
     'or all its accounts are rate limited. Try again later, or continue with another harness.'
   )
+}
+
+/** ` until YYYY-MM-DD HH:MM UTC` for a known reset time, or ''. */
+function untilText(exhausted: unknown): string {
+  if (!isRecord(exhausted) || typeof exhausted.resetAt !== 'number') return ''
+  const resetAt = new Date(exhausted.resetAt * 1000)
+  if (Number.isNaN(resetAt.getTime())) return ''
+  return ` until ${resetAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`
+}
+
+const HARNESS_LABELS: Record<string, string> = { codex: 'Codex', claudecode: 'Claude Code' }
+
+function harnessLabel(name: unknown): string {
+  return typeof name === 'string' ? (HARNESS_LABELS[name] ?? name) : 'another harness'
+}
+
+/**
+ * A completed task that tells the user that the session moved to another
+ * harness because its model provider had no capacity left (harness-server
+ * switch.rs prints `centaur/providerFailover`).
+ */
+function providerFailoverTask(event: any, id: string): HarnessTask | null {
+  if (event?.type !== 'centaur.providerFailover') return null
+  const from = harnessLabel(event.from)
+  const to = harnessLabel(event.to)
+  const history =
+    event.history === 'empty' ? '' : ' with its history'
+  return {
+    id,
+    title: `Switched to ${to}`,
+    status: 'complete',
+    details: [
+      {
+        type: 'text',
+        text: `${from} has no model capacity left${untilText(event.providerExhausted)}, so this session continues on ${to}${history}.`
+      }
+    ],
+    output: []
+  }
 }
 
 /** Codex reconnects dropped model streams and emits `error` with `willRetry: true`. */
