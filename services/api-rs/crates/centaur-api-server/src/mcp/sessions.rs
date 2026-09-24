@@ -2420,7 +2420,10 @@ mod tests {
         assert_eq!(second["params"]["progress"], 2);
     }
 
-    async fn stream_test_turn() -> Option<(PgSessionStore, StartedTurn)> {
+    /// The DB tests in this binary share one database. Migration runs that
+    /// overlap deadlock in Postgres, so only the first test runs them.
+    async fn test_database() -> Option<PgSessionStore> {
+        static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
         let Ok(url) = std::env::var("SESSION_SQLX_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL"))
         else {
@@ -2430,7 +2433,14 @@ mod tests {
         let store = PgSessionStore::connect(&url)
             .await
             .expect("connect test db");
-        store.run_migrations().await.expect("run migrations");
+        MIGRATED
+            .get_or_init(|| async { store.run_migrations().await.expect("run migrations") })
+            .await;
+        Some(store)
+    }
+
+    async fn stream_test_turn() -> Option<(PgSessionStore, StartedTurn)> {
+        let store = test_database().await?;
         let runtime = SessionRuntime::new(
             store.clone(),
             SandboxRuntime::backend(
@@ -2663,21 +2673,12 @@ mod tests {
     }
 
     async fn mcp_send_harness() -> Option<McpSendHarness> {
-        let Ok(url) = std::env::var("SESSION_SQLX_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL"))
-        else {
-            eprintln!("skipping: set SESSION_SQLX_TEST_DATABASE_URL to a Postgres URL");
-            return None;
-        };
+        let store = test_database().await?;
         let env = EnvGuard::set(&[
             ("CENTAUR_JWT_SIGNING_SECRET", "test-secret"),
             ("CENTAUR_MCP_PUBLIC_URL", "http://localhost:3000/mcp"),
             ("CENTAUR_CONSOLE_PUBLIC_URL", "http://localhost:3001"),
         ]);
-        let store = PgSessionStore::connect(&url)
-            .await
-            .expect("connect test db");
-        store.run_migrations().await.expect("run migrations");
         let runtime = SessionRuntime::new(
             store,
             SandboxRuntime::backend(
