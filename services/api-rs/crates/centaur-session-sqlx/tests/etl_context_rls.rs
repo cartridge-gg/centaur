@@ -1248,7 +1248,13 @@ async fn assert_company_context_reader_public_message_visibility(
                 "C_ALPHA:1000.000004".to_owned(),
                 "C_BETA:1000.000002".to_owned(),
             ],
-            company_context_docs: vec!["doc_slack_alpha".to_owned(), "doc_slack_beta".to_owned(),],
+            // Public Slack access also admits company-scoped memory notes
+            // (migration 0056).
+            company_context_docs: vec![
+                "doc_memory_note".to_owned(),
+                "doc_slack_alpha".to_owned(),
+                "doc_slack_beta".to_owned(),
+            ],
             google_docs_observations: Vec::new(),
             google_docs: Vec::new(),
             granola_docs: Vec::new(),

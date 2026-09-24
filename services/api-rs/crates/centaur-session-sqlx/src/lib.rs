@@ -296,6 +296,29 @@ impl PgSessionStore {
         Ok(message_ids)
     }
 
+    pub async fn client_message_exists(
+        &self,
+        thread_key: &ThreadKey,
+        client_message_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists (
+                select 1
+                from session_messages
+                where thread_key = $1
+                  and client_message_id = $2
+            )
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(client_message_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(exists)
+    }
+
     pub async fn title_generation_candidate(
         &self,
         thread_key: &ThreadKey,
@@ -558,6 +581,82 @@ impl PgSessionStore {
         .await?;
 
         row.map(TryInto::try_into).transpose()
+    }
+
+    /// Load one execution of a thread by id. An execution of another thread
+    /// reads as not found, so callers can authorize by thread alone.
+    pub async fn thread_execution(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+    ) -> Result<SessionExecution, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            from session_executions
+            where thread_key = $1 and execution_id = $2
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(execution_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| SessionStoreError::ExecutionNotFound {
+            execution_id: execution_id.to_owned(),
+        })?;
+
+        row.try_into()
+    }
+
+    /// The newest event of one of `event_types` recorded for an execution.
+    pub async fn latest_execution_event_of_types(
+        &self,
+        execution_id: &str,
+        event_types: &[&str],
+    ) -> Result<Option<SessionEvent>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionEventRow>(
+            r#"
+            select event_id, thread_key, execution_id, event_type, payload, created_at
+            from session_events
+            where execution_id = $1
+              and event_type = any($2)
+            order by event_id desc
+            limit 1
+            "#,
+        )
+        .bind(execution_id)
+        .bind(event_types)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    /// Sessions bound to `iron_control_principal` whose thread key starts with
+    /// `thread_key_prefix`, most recently updated first.
+    pub async fn list_principal_sessions_with_prefix(
+        &self,
+        thread_key_prefix: &str,
+        iron_control_principal: &str,
+        limit: i64,
+    ) -> Result<Vec<Session>, SessionStoreError> {
+        let rows = sqlx::query_as::<_, SessionRow>(
+            r#"
+            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            from sessions
+            where iron_control_principal = $1
+              and starts_with(thread_key, $2)
+            order by updated_at desc, thread_key
+            limit $3
+            "#,
+        )
+        .bind(iron_control_principal)
+        .bind(thread_key_prefix)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     pub async fn mark_execution_running(
@@ -2379,6 +2478,142 @@ mod tests {
                 .proxy_labels,
             labels
         );
+    }
+
+    async fn create_test_session(store: &PgSessionStore, thread_key: &ThreadKey) {
+        store
+            .create_or_get_session(
+                thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create session");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn thread_execution_is_scoped_to_its_thread() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:thread-exec-{}", Uuid::new_v4())).unwrap();
+        let other = ThreadKey::parse(format!("test:thread-exec-{}", Uuid::new_v4())).unwrap();
+        create_test_session(&store, &thread_key).await;
+        create_test_session(&store, &other).await;
+        let execution = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+
+        let loaded = store
+            .thread_execution(&thread_key, &execution.execution_id)
+            .await
+            .expect("load execution");
+        assert_eq!(loaded.execution_id, execution.execution_id);
+        assert!(matches!(
+            store
+                .thread_execution(&other, &execution.execution_id)
+                .await,
+            Err(super::SessionStoreError::ExecutionNotFound { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn latest_execution_event_of_types_returns_the_newest_match() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:terminal-event-{}", Uuid::new_v4())).unwrap();
+        create_test_session(&store, &thread_key).await;
+        let execution_id = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create execution")
+            .execution
+            .execution_id;
+        for (event_type, payload) in [
+            ("session.execution_failed", json!({"error": "first"})),
+            ("session.output.line", json!("working")),
+            (
+                "session.execution_completed",
+                json!({"result_text": "done"}),
+            ),
+            ("session.output.line", json!("late line")),
+        ] {
+            store
+                .append_event(&thread_key, Some(&execution_id), event_type, payload)
+                .await
+                .expect("append event");
+        }
+
+        let terminal = store
+            .latest_execution_event_of_types(
+                &execution_id,
+                &["session.execution_completed", "session.execution_failed"],
+            )
+            .await
+            .expect("load terminal event")
+            .expect("terminal event exists");
+        assert_eq!(terminal.event_type, "session.execution_completed");
+        assert_eq!(terminal.payload, json!({"result_text": "done"}));
+        assert!(
+            store
+                .latest_execution_event_of_types(&execution_id, &["session.execution_cancelled"])
+                .await
+                .expect("load missing event")
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn principal_sessions_filter_by_owner_and_prefix() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let run = Uuid::new_v4().simple().to_string();
+        // `_` would be a LIKE wildcard; the query must match the prefix literally.
+        let principal = format!("prn_{run}");
+        let prefix = format!("mcp-session:{principal}:");
+        let older = ThreadKey::parse(format!("{prefix}older")).unwrap();
+        let newer = ThreadKey::parse(format!("{prefix}newer")).unwrap();
+        let foreign_owner = ThreadKey::parse(format!("{prefix}foreign")).unwrap();
+        let other_namespace = ThreadKey::parse(format!("test:{principal}:other")).unwrap();
+        let wildcard_lookalike =
+            ThreadKey::parse(format!("mcp-session:prnX{run}:lookalike")).unwrap();
+        for (thread_key, owner) in [
+            (&older, principal.clone()),
+            (&newer, principal.clone()),
+            (&foreign_owner, format!("prn_other_{run}")),
+            (&other_namespace, principal.clone()),
+            (&wildcard_lookalike, principal.clone()),
+        ] {
+            create_test_session(&store, thread_key).await;
+            store
+                .bind_iron_control_principal(thread_key, &owner)
+                .await
+                .expect("bind principal");
+        }
+
+        let sessions = store
+            .list_principal_sessions_with_prefix(&prefix, &principal, 10)
+            .await
+            .expect("list sessions");
+        let keys = sessions
+            .iter()
+            .map(|session| session.thread_key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec![newer.as_str(), older.as_str()]);
+
+        let limited = store
+            .list_principal_sessions_with_prefix(&prefix, &principal, 1)
+            .await
+            .expect("list sessions with limit");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].thread_key, newer);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
