@@ -20,8 +20,8 @@ Use Centaur's MCP tools for actions and context exposed by the user's deployment
 
 If `centaur_session_send` is listed, use it to hand a multi-step task to a Centaur agent that works in its own sandbox.
 
-1. Call `centaur_session_send` with the prompt. Omit `session_id` to start a new session.
-2. Call `centaur_session_read` with the returned `session_id` until `done` is true. Pass `after_event_id` from `next_after_event_id` to read only new progress.
+1. Call `centaur_session_send` with the prompt. Omit `session_id` to start a new session. The call waits for the turn and returns `final_answer`.
+2. If `done` is false in the result, call `centaur_session_read` with the returned `session_id` until `done` is true. Pass `after_event_id` from `next_after_event_id` to read only new progress.
 3. Continue the conversation with `centaur_session_send` and the same `session_id`. Use `centaur_session_interrupt` to stop a running turn, and `centaur_session_list` to find earlier sessions.
 
 Centaur authorizes calls using the signed-in principal's live roles and grants. Never request, paste, print, or store Centaur OAuth tokens.

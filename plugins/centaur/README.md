@@ -23,13 +23,21 @@ Deployments with `CENTAUR_MCP_SESSIONS_ENABLED=true` also expose tools that driv
 
 ```json
 {"name": "centaur_session_send", "arguments": {"prompt": "Find the flaky test in the api-rs CI run and propose a fix."}}
-{"name": "centaur_session_read", "arguments": {"session_id": "<session_id>", "wait_seconds": 45}}
 {"name": "centaur_session_send", "arguments": {"session_id": "<session_id>", "prompt": "Open a draft PR with that fix."}}
+{"name": "centaur_session_send", "arguments": {"prompt": "Run the full test suite.", "wait": false}}
+{"name": "centaur_session_read", "arguments": {"session_id": "<session_id>", "wait_seconds": 45}}
 {"name": "centaur_session_interrupt", "arguments": {"session_id": "<session_id>"}}
 {"name": "centaur_session_list", "arguments": {}}
 ```
 
-`centaur_session_send` returns at once with `session_id` and `execution_id`. A prompt sent while a turn runs steers that turn. `centaur_session_read` waits up to `wait_seconds` (at most 50) for the turn to finish. It returns a compact progress list and, when `done` is true, `final_answer`. If `done` is false, call it again with `after_event_id` set to `next_after_event_id`. Sessions are private to the principal that started them.
+By default, `centaur_session_send` waits for the turn to finish and returns `final_answer`. A prompt sent while a turn runs steers that turn.
+
+- Clients that accept `text/event-stream` get the response as a stream. Each agent step is sent as an MCP progress notification with a one-line `message` (for example `command: gh pr list → exit 0`), and a heartbeat follows every 30 s of silence. Claude Code shows the latest line under the tool call; Codex shows no progress. The stream follows the turn for up to 30 minutes.
+- Other clients wait up to 50 s.
+- If the result has `done: false`, call `centaur_session_read` until `done` is true. It waits up to `wait_seconds` (at most 50). Pass `after_event_id` from `next_after_event_id` to read only new progress.
+- Set `wait: false` to return at once with `session_id` and `execution_id`. In Codex, this plus repeated `centaur_session_read` calls is the way to see progress while a turn runs.
+
+Sessions are private to the principal that started them.
 
 ## Codex
 

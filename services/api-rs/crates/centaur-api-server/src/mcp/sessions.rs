@@ -8,9 +8,18 @@
 //! sent while a turn runs steers that turn.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    convert::Infallible,
     sync::{Arc, OnceLock, PoisonError},
     time::{Duration, Instant},
+};
+
+use axum::{
+    http::HeaderValue,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
 
 use centaur_iron_control::IronControlError;
@@ -22,15 +31,18 @@ use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SessionRuntime, SessionRuntimeError,
 };
 use centaur_session_sqlx::SessionStoreError;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tracing::Span;
+use tokio::sync::mpsc;
+use tracing::{Instrument as _, Span};
 use uuid::Uuid;
 
 use super::{
-    McpPrincipal, McpToolCallOutcome, mcp_text_result, record_mcp_tool_correlation,
+    McpPrincipal, McpToolCallOutcome, finish_mcp_tool_span, mcp_json_rpc_response,
+    mcp_json_rpc_result, mcp_text_result, mcp_tool_span, record_mcp_tool_correlation,
     record_mcp_tool_method,
 };
 use crate::{ApiError, routes::AppState};
@@ -58,6 +70,17 @@ const SHORT_TEXT_CHARS: usize = 500;
 const COMMAND_OUTPUT_TAIL_CHARS: usize = 800;
 const FINAL_ANSWER_CHARS: usize = 100_000;
 const DEFAULT_LIST_LIMIT: i64 = 20;
+/// A send that cannot stream waits as long as a read does.
+const JSON_SEND_WAIT: Duration = Duration::from_secs(MAX_READ_WAIT_SECONDS);
+/// A streamed send follows its turn this long, then hands over to reads.
+const STREAM_MAX_WAIT: Duration = Duration::from_secs(30 * 60);
+/// Claude Code aborts a call after 300 seconds without a response or progress.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// The terminal status can lag the terminal event that ends the stream.
+const STREAM_OUTCOME_WAIT: Duration = Duration::from_secs(12);
+const TRACE_BUDGET_BYTES: usize = 16 * 1024;
+const REPORT_PROGRESS_LINES: usize = 40;
+const PROGRESS_LINE_CHARS: usize = 120;
 const MAX_LIST_LIMIT: i64 = 50;
 
 pub(super) fn session_tool_name(name: &str) -> bool {
@@ -77,8 +100,10 @@ pub(super) fn session_tools() -> Vec<Value> {
                 "prompts. Omit session_id to start a new session. Pass a session_id to continue ",
                 "that session; an unused session_id starts a new session with that id. If a turn ",
                 "is already running, the prompt steers that turn instead of starting a new one. ",
-                "Returns at once with session_id and execution_id. Then call ",
-                "centaur_session_read to wait for the answer."
+                "By default the call waits for the turn to finish, streams its progress to ",
+                "clients that show MCP progress, and returns final_answer. If done is false in ",
+                "the result, the turn is still running: call centaur_session_read to wait. Set ",
+                "wait to false to return at once with session_id and execution_id."
             ),
             "inputSchema": {
                 "type": "object",
@@ -107,6 +132,10 @@ pub(super) fn session_tools() -> Vec<Value> {
                     "model": {
                         "type": "string",
                         "description": "Optional model for a new turn. A prompt that steers a running turn keeps that turn's model. Omit to use the harness default.",
+                    },
+                    "wait": {
+                        "type": "boolean",
+                        "description": "Wait for the turn to finish. Defaults to true. Clients that cannot read a streamed response wait at most 50 seconds.",
                     },
                     "idempotency_key": {
                         "type": "string",
@@ -197,7 +226,7 @@ pub(super) async fn session_tool_result(
     arguments: Value,
 ) -> Result<McpToolCallOutcome, ApiError> {
     let result = match name {
-        SESSION_SEND_TOOL => session_send(state, principal, arguments).await,
+        SESSION_SEND_TOOL => unreachable!("sends are dispatched by session_send_call"),
         SESSION_READ_TOOL => session_read(state, principal, arguments).await,
         SESSION_INTERRUPT_TOOL => session_interrupt(state, principal, arguments).await,
         SESSION_LIST_TOOL => session_list(state, principal, arguments).await,
@@ -295,6 +324,8 @@ struct SessionSendArguments {
     model: Option<String>,
     #[serde(default)]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    wait: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,11 +355,20 @@ struct SessionListArguments {
     limit: Option<i64>,
 }
 
+/// A turn that a send started or steered, with the send's own result.
+struct StartedTurn {
+    runtime: SessionRuntime,
+    thread_key: ThreadKey,
+    execution: SessionExecution,
+    accepted: Value,
+    wait: bool,
+}
+
 async fn session_send(
     state: &AppState,
     principal: &McpPrincipal,
     arguments: Value,
-) -> Result<Value, SessionToolError> {
+) -> Result<StartedTurn, SessionToolError> {
     let args = parse_arguments::<SessionSendArguments>(arguments)?;
     record_mcp_tool_method(&Span::current(), SESSION_SEND_TOOL, "send");
     let prompt = args.prompt.trim();
@@ -368,7 +408,14 @@ async fn session_send(
     };
     drop(lock);
     release_send_lock(&thread_key);
-    result
+    let (execution, accepted) = result?;
+    Ok(StartedTurn {
+        runtime,
+        thread_key,
+        execution,
+        accepted,
+        wait: args.wait.unwrap_or(true),
+    })
 }
 
 struct SendRequest<'a> {
@@ -385,7 +432,7 @@ async fn send_locked(
     session_id: &str,
     thread_key: &ThreadKey,
     request: SendRequest<'_>,
-) -> Result<Value, SessionToolError> {
+) -> Result<(SessionExecution, Value), SessionToolError> {
     let (session, created, unavailable_persona_id) =
         match owned_session_if_exists(runtime, principal, thread_key).await? {
             Some(session) => {
@@ -424,7 +471,7 @@ async fn send_locked(
         if let Some(persona_id) = unavailable_persona_id.as_deref() {
             result["unavailable_requested_persona_id"] = json!(persona_id);
         }
-        result
+        (execution.clone(), result)
     };
 
     if let Some(key) = request.idempotency_key
@@ -647,6 +694,401 @@ fn send_result(
     })
 }
 
+/// Answer a `centaur_session_send` call. Without `wait`, the result returns at
+/// once. With `wait`, a client that accepts `text/event-stream` gets a stream
+/// of progress notifications and then the result; any other client waits as
+/// long as a read does.
+pub(super) async fn session_send_call(
+    state: &AppState,
+    principal: &McpPrincipal,
+    id: Value,
+    arguments: Value,
+    progress_token: Option<Value>,
+    accepts_event_stream: bool,
+) -> Result<Response, ApiError> {
+    let span = mcp_tool_span(principal, SESSION_SEND_TOOL)?;
+    let turn = match session_send(state, principal, arguments)
+        .instrument(span.clone())
+        .await
+    {
+        Ok(turn) => turn,
+        Err(error) => {
+            finish_mcp_tool_span(&span, "failed");
+            return match error {
+                SessionToolError::Caller(message) => {
+                    Ok(mcp_json_rpc_response(id, mcp_text_result(message, true)))
+                }
+                SessionToolError::Api(error) => Err(error),
+            };
+        }
+    };
+    if !turn.wait {
+        finish_mcp_tool_span(&span, "completed");
+        let accepted = turn.accepted;
+        return Ok(mcp_json_rpc_response(
+            id,
+            json_outcome(accepted, false)?.result,
+        ));
+    }
+    if accepts_event_stream {
+        return Ok(stream_turn(turn, id, progress_token, span));
+    }
+    let report = async {
+        let (execution, terminal) = wait_for_outcome(
+            &turn.runtime,
+            &turn.thread_key,
+            turn.execution.clone(),
+            JSON_SEND_WAIT,
+        )
+        .await?;
+        let page =
+            progress_page(&turn.runtime, &turn.thread_key, &execution.execution_id, 0).await?;
+        Ok(turn_result(
+            turn.accepted.clone(),
+            &execution,
+            terminal,
+            page,
+        ))
+    }
+    .instrument(span.clone())
+    .await;
+    let (result, status) = match report {
+        Ok(report) => (report_outcome(report), "completed"),
+        Err(error) => (started_turn_error(&turn, error), "failed"),
+    };
+    finish_mcp_tool_span(&span, status);
+    Ok(mcp_json_rpc_response(id, result))
+}
+
+/// Stream the turn as MCP progress notifications, then the tool result.
+/// The response is an SSE stream per the Streamable HTTP transport. When the
+/// client goes away, following stops and the turn itself continues.
+fn stream_turn(
+    turn: StartedTurn,
+    id: Value,
+    progress_token: Option<Value>,
+    span: Span,
+) -> Response {
+    let (sender, receiver) = mpsc::channel::<Value>(64);
+    tokio::spawn(
+        async move {
+            let status = follow_and_answer(turn, id, progress_token, sender).await;
+            finish_mcp_tool_span(&Span::current(), status);
+        }
+        .instrument(span),
+    );
+    let events = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|message| (Ok::<_, Infallible>(sse_message(&message)), receiver))
+    });
+    let mut response = Sse::new(events)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    // Ask buffering proxies to pass each event through at once.
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
+}
+
+async fn follow_and_answer(
+    turn: StartedTurn,
+    id: Value,
+    progress_token: Option<Value>,
+    sender: mpsc::Sender<Value>,
+) -> &'static str {
+    let (result, status) = match follow_turn(&turn, progress_token.as_ref(), &sender).await {
+        Ok(Some(report)) => (report_outcome(report), "completed"),
+        Ok(None) => return "disconnected",
+        Err(error) => (started_turn_error(&turn, error), "failed"),
+    };
+    let _ = sender.send(mcp_json_rpc_result(id, result)).await;
+    status
+}
+
+/// Follow the turn's events until its terminal event, the stream limit, or
+/// the client leaving (`Ok(None)`). Each progress item becomes one progress
+/// notification; quiet stretches get a heartbeat so client idle timers do
+/// not abort the call.
+async fn follow_turn(
+    turn: &StartedTurn,
+    progress_token: Option<&Value>,
+    sender: &mpsc::Sender<Value>,
+) -> Result<Option<Value>, SessionToolError> {
+    let execution_id = turn.execution.execution_id.as_str();
+    let events = turn
+        .runtime
+        .stream_events(&turn.thread_key, 0, Some(execution_id))
+        .await?;
+    futures_util::pin_mut!(events);
+    let mut trace = Trace::default();
+    let mut cursor = 0;
+    let mut notifications = 0;
+    let mut last_notice = Instant::now();
+    let mut outcome_wait = STREAM_OUTCOME_WAIT;
+    let deadline = tokio::time::Instant::now() + STREAM_MAX_WAIT;
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL,
+    );
+    loop {
+        tokio::select! {
+            () = sender.closed() => return Ok(None),
+            next = events.next() => match next {
+                Some(Ok(event)) => {
+                    cursor = event.event_id;
+                    if let Some(item) = progress_item(&event) {
+                        send_progress(sender, progress_token, &mut notifications, progress_line(&item)).await;
+                        last_notice = Instant::now();
+                        trace.push(item);
+                    }
+                    if is_terminal_event(&event.event_type) {
+                        break;
+                    }
+                }
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
+            },
+            _ = heartbeat.tick() => {
+                if last_notice.elapsed() >= HEARTBEAT_INTERVAL {
+                    let quiet = format_elapsed(last_notice.elapsed());
+                    send_progress(sender, progress_token, &mut notifications, format!("working · last step {quiet} ago")).await;
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                outcome_wait = Duration::ZERO;
+                break;
+            }
+        }
+    }
+    let execution = turn
+        .runtime
+        .thread_execution(&turn.thread_key, execution_id)
+        .await?;
+    let (execution, terminal) =
+        wait_for_outcome(&turn.runtime, &turn.thread_key, execution, outcome_wait).await?;
+    Ok(Some(turn_result(
+        turn.accepted.clone(),
+        &execution,
+        terminal,
+        trace.into_page(cursor),
+    )))
+}
+
+/// Progress is only for clients that sent a progress token.
+async fn send_progress(
+    sender: &mpsc::Sender<Value>,
+    progress_token: Option<&Value>,
+    notifications: &mut u64,
+    message: String,
+) {
+    let Some(progress_token) = progress_token else {
+        return;
+    };
+    *notifications += 1;
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {
+            "progressToken": progress_token,
+            "progress": *notifications,
+            "message": message,
+        },
+    });
+    let _ = sender.send(notification).await;
+}
+
+fn sse_message(message: &Value) -> Event {
+    Event::default().event("message").data(message.to_string())
+}
+
+fn is_terminal_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "session.execution_completed" | "session.execution_failed" | "session.execution_cancelled"
+    )
+}
+
+/// The newest progress items of a streamed turn, within a byte budget.
+#[derive(Default)]
+struct Trace {
+    items: VecDeque<(usize, Value)>,
+    bytes: usize,
+    omitted: usize,
+}
+
+impl Trace {
+    fn push(&mut self, item: Value) {
+        let size = item.to_string().len();
+        self.items.push_back((size, item));
+        self.bytes += size;
+        while self.bytes > TRACE_BUDGET_BYTES && self.items.len() > 1 {
+            if let Some((size, _)) = self.items.pop_front() {
+                self.bytes -= size;
+                self.omitted += 1;
+            }
+        }
+    }
+
+    fn into_page(self, next_after_event_id: i64) -> ProgressPage {
+        ProgressPage {
+            items: self.items.into_iter().map(|(_, item)| item).collect(),
+            next_after_event_id,
+            has_more: false,
+            omitted: self.omitted,
+        }
+    }
+}
+
+/// A failure after the turn started must not look like a failed send: the
+/// turn keeps running, so point the client at reads.
+fn started_turn_error(turn: &StartedTurn, error: SessionToolError) -> Value {
+    let detail = match error {
+        SessionToolError::Caller(message) => message,
+        SessionToolError::Api(error) => {
+            tracing::error!(
+                error = %crate::error::error_chain(&error),
+                "following an MCP session turn failed"
+            );
+            "internal error".to_owned()
+        }
+    };
+    mcp_text_result(
+        format!(
+            "The turn continues, but waiting for it failed: {detail}. Call centaur_session_read with session_id {} and execution_id {}.",
+            turn.accepted["session_id"].as_str().unwrap_or_default(),
+            turn.execution.execution_id,
+        ),
+        true,
+    )
+}
+
+/// A waited send's result: a readable report first, because clients show the
+/// start of the text, and the full report as structured content.
+fn report_outcome(report: Value) -> Value {
+    let is_error = report["done"] == json!(true) && report["status"] == json!("failed");
+    json!({
+        "content": [{"type": "text", "text": turn_report_text(&report)}],
+        "structuredContent": report,
+        "isError": is_error,
+    })
+}
+
+fn turn_report_text(report: &Value) -> String {
+    let field = |name: &str| report.get(name).and_then(Value::as_str).unwrap_or_default();
+    let done = report["done"] == json!(true);
+    let mut text = match (done, field("status")) {
+        (true, "completed") => "Turn completed.".to_owned(),
+        (true, "failed") => format!("Turn failed: {}", field("error")),
+        (true, "cancelled") => "Turn cancelled.".to_owned(),
+        (_, status) => format!("Turn is still {status}."),
+    };
+    if report["steered"] == json!(true) {
+        text.push_str(" The prompt was steered into a turn that was already running.");
+    }
+    if let Some(answer) = report
+        .get("final_answer")
+        .and_then(Value::as_str)
+        .filter(|answer| !answer.is_empty())
+    {
+        text.push_str("\n\n");
+        text.push_str(answer);
+    }
+    let lines = report["progress"]
+        .as_array()
+        .map(|items| items.iter().map(progress_line).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !lines.is_empty() {
+        let skipped = lines.len().saturating_sub(REPORT_PROGRESS_LINES);
+        text.push_str("\n\nProgress:\n");
+        if skipped > 0 {
+            text.push_str(&format!("- ({skipped} earlier items)\n"));
+        }
+        for line in &lines[skipped..] {
+            text.push_str(&format!("- {line}\n"));
+        }
+    }
+    text.push_str(&format!(
+        "\nsession_id: {} · execution_id: {} · next_after_event_id: {}\n{}",
+        field("session_id"),
+        field("execution_id"),
+        report["next_after_event_id"],
+        field("next"),
+    ));
+    text
+}
+
+/// One short line per progress item, for progress notifications and reports.
+fn progress_line(item: &Value) -> String {
+    let field = |name: &str| item.get(name).and_then(Value::as_str).unwrap_or_default();
+    let first_line =
+        |text: &str| truncate_chars(text.lines().next().unwrap_or_default(), PROGRESS_LINE_CHARS).0;
+    match field("kind") {
+        "message" => format!("message: {}", first_line(field("text"))),
+        "user_message" => format!("prompt: {}", first_line(field("text"))),
+        "command" => {
+            let result = match item.get("exit_code").and_then(Value::as_i64) {
+                Some(code) => format!(" → exit {code}"),
+                None if !field("status").is_empty() => format!(" → {}", field("status")),
+                None => String::new(),
+            };
+            format!("command: {}{result}", first_line(field("command")))
+        }
+        "tool_call" => {
+            let name = match (field("server"), field("tool")) {
+                ("", tool) => tool.to_owned(),
+                (server, tool) => format!("{server}.{tool}"),
+            };
+            let mut line = format!("tool: {name}");
+            if !field("status").is_empty() {
+                line.push_str(&format!(" → {}", field("status")));
+            }
+            if !field("error").is_empty() {
+                line.push_str(&format!(": {}", first_line(field("error"))));
+            }
+            line
+        }
+        "file_change" => {
+            let paths = item["paths"]
+                .as_array()
+                .map(|paths| paths.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let shown = paths.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+            match paths.len() {
+                0..=3 => format!("files: {shown}"),
+                count => format!("files: {shown} (+{} more)", count - 3),
+            }
+        }
+        "web_search" => format!("search: {}", first_line(field("query"))),
+        "plan" => "plan updated".to_owned(),
+        "image" => "image generated".to_owned(),
+        "subagent_call" => "subagent call".to_owned(),
+        "context_compaction" => "context compacted".to_owned(),
+        "error" => format!("error: {}", first_line(field("message"))),
+        "warning" => format!("warning: {} {}", field("event"), first_line(field("error")))
+            .trim_end()
+            .to_owned(),
+        "turn_started" => "turn started".to_owned(),
+        "sandbox_ready" => "sandbox ready".to_owned(),
+        "prompt_steered" => "prompt steered into the turn".to_owned(),
+        "interrupt_delivered" => "interrupt delivered".to_owned(),
+        "turn_completed" => "turn completed".to_owned(),
+        "turn_failed" => "turn failed".to_owned(),
+        "turn_cancelled" => "turn cancelled".to_owned(),
+        kind => kind.to_owned(),
+    }
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds / 60 {
+        0 => format!("{seconds}s"),
+        minutes => format!("{minutes}m{:02}s", seconds % 60),
+    }
+}
+
 async fn session_read(
     state: &AppState,
     principal: &McpPrincipal,
@@ -692,7 +1134,6 @@ async fn session_read(
         Duration::from_secs(wait_seconds),
     )
     .await?;
-    let done = terminal.is_some();
     let page = progress_page(
         &runtime,
         &thread_key,
@@ -700,21 +1141,38 @@ async fn session_read(
         after_event_id,
     )
     .await?;
+    Ok(turn_result(
+        json!({"session_id": session_id}),
+        &execution,
+        terminal,
+        page,
+    ))
+}
 
-    let mut result = json!({
-        "session_id": session_id,
-        "execution_id": execution.execution_id,
-        "status": execution.status,
-        "done": done,
-        "progress": page.items,
-        "next_after_event_id": page.next_after_event_id,
-        "has_more_progress": page.has_more,
-    });
-    if let Some(terminal) = terminal {
-        apply_terminal_outcome(&mut result, &execution, terminal.as_ref());
+/// The shared report of a turn: status, progress, and, once the turn is
+/// done, its final answer, error, or cancel reason. `base` carries the
+/// fields of the calling tool.
+fn turn_result(
+    mut base: Value,
+    execution: &SessionExecution,
+    terminal: Option<Option<SessionEvent>>,
+    page: ProgressPage,
+) -> Value {
+    let done = terminal.is_some();
+    base["execution_id"] = json!(execution.execution_id);
+    base["status"] = json!(execution.status);
+    base["done"] = json!(done);
+    base["progress"] = Value::Array(page.items);
+    base["next_after_event_id"] = json!(page.next_after_event_id);
+    base["has_more_progress"] = json!(page.has_more);
+    if page.omitted > 0 {
+        base["earlier_progress_omitted"] = json!(page.omitted);
     }
-    result["next"] = Value::String(read_next_hint(done, page.has_more).to_owned());
-    Ok(result)
+    if let Some(terminal) = terminal {
+        apply_terminal_outcome(&mut base, execution, terminal.as_ref());
+    }
+    base["next"] = Value::String(read_next_hint(done, page.has_more).to_owned());
+    base
 }
 
 fn read_next_hint(done: bool, has_more: bool) -> &'static str {
@@ -816,6 +1274,8 @@ struct ProgressPage {
     items: Vec<Value>,
     next_after_event_id: i64,
     has_more: bool,
+    /// Items dropped from the front of a streamed trace to fit its budget.
+    omitted: usize,
 }
 
 async fn progress_page(
@@ -840,6 +1300,7 @@ async fn progress_page(
                         items,
                         next_after_event_id: cursor,
                         has_more: true,
+                        omitted: 0,
                     });
                 }
                 used_bytes += size;
@@ -852,6 +1313,7 @@ async fn progress_page(
                 items,
                 next_after_event_id: cursor,
                 has_more: false,
+                omitted: 0,
             });
         }
     }
@@ -859,6 +1321,7 @@ async fn progress_page(
         items,
         next_after_event_id: cursor,
         has_more: true,
+        omitted: 0,
     })
 }
 
@@ -1365,7 +1828,23 @@ fn tail_chars(text: &str, max_chars: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use async_trait::async_trait;
+    use axum::{Json, extract::State, http::HeaderMap};
+    use centaur_sandbox_core::{
+        ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
+        SandboxResult, SandboxSpec, SandboxStatus,
+    };
+    use centaur_session_runtime::SandboxRuntime;
+    use centaur_session_sqlx::PgSessionStore;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
     use super::*;
+    use crate::mcp::{
+        MCP_ENV_LOCK, McpJsonRpcRequest, mcp_post,
+        mcp_tests::{EnvGuard, mcp_auth_headers, test_jwt},
+    };
 
     fn principal(id: &str) -> McpPrincipal {
         McpPrincipal {
@@ -1811,6 +2290,589 @@ mod tests {
         drop(second);
         release_send_lock(&key);
         assert!(!send_locks().lock().unwrap().contains_key(key.as_str()));
+    }
+
+    #[test]
+    fn progress_lines_are_short_and_self_contained() {
+        let line = |item: Value| progress_line(&item);
+        assert_eq!(
+            line(json!({"kind": "command", "command": "gh pr list\n--state open", "exit_code": 0})),
+            "command: gh pr list → exit 0"
+        );
+        assert_eq!(
+            line(json!({"kind": "command", "command": "sleep 60", "status": "inProgress"})),
+            "command: sleep 60 → inProgress"
+        );
+        assert_eq!(
+            line(
+                json!({"kind": "tool_call", "server": "centaur", "tool": "slack", "status": "failed", "error": "denied"})
+            ),
+            "tool: centaur.slack → failed: denied"
+        );
+        assert_eq!(
+            line(json!({"kind": "file_change", "paths": ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]})),
+            "files: a.rs, b.rs, c.rs (+2 more)"
+        );
+        assert_eq!(
+            line(json!({"kind": "message", "text": "First line.\nSecond line."})),
+            "message: First line."
+        );
+        assert_eq!(
+            line(json!({"kind": "warning", "event": "session.steering_failed"})),
+            "warning: session.steering_failed"
+        );
+        let long = line(json!({"kind": "message", "text": "x".repeat(500)}));
+        assert_eq!(
+            long.chars().count(),
+            "message: ".len() + PROGRESS_LINE_CHARS + 1
+        );
+    }
+
+    #[test]
+    fn elapsed_times_read_as_minutes_and_seconds() {
+        assert_eq!(format_elapsed(Duration::from_secs(42)), "42s");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "2m05s");
+    }
+
+    #[test]
+    fn trace_keeps_the_newest_items_within_its_budget() {
+        let mut trace = Trace::default();
+        let item = |index: usize| json!({"kind": "message", "text": format!("{index}:{}", "x".repeat(1_000))});
+        for index in 0..40 {
+            trace.push(item(index));
+        }
+        let page = trace.into_page(99);
+        assert!(page.omitted > 0);
+        assert_eq!(page.items.len() + page.omitted, 40);
+        assert!(
+            page.items.last().unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("39:")
+        );
+        assert_eq!(page.next_after_event_id, 99);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn reports_start_with_the_outcome_and_end_with_the_ids() {
+        let report = json!({
+            "session_id": "s1",
+            "execution_id": "exe_1",
+            "status": "completed",
+            "done": true,
+            "steered": false,
+            "final_answer": "3 PRs are open.",
+            "progress": [{"kind": "command", "command": "gh pr list", "exit_code": 0}],
+            "next_after_event_id": 7,
+            "next": "The turn is done.",
+        });
+        let text = turn_report_text(&report);
+        assert!(text.starts_with(
+            "Turn completed.\n\n3 PRs are open.\n\nProgress:\n- command: gh pr list → exit 0\n"
+        ));
+        assert!(text.ends_with(
+            "session_id: s1 · execution_id: exe_1 · next_after_event_id: 7\nThe turn is done."
+        ));
+        let outcome = report_outcome(report);
+        assert_eq!(outcome["isError"], false);
+        assert_eq!(
+            outcome["structuredContent"]["final_answer"],
+            "3 PRs are open."
+        );
+
+        let failed = report_outcome(json!({"status": "failed", "done": true, "error": "boom"}));
+        assert_eq!(failed["isError"], true);
+        assert!(
+            failed["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Turn failed: boom")
+        );
+        let running = report_outcome(json!({"status": "running", "done": false}));
+        assert_eq!(running["isError"], false);
+        assert!(
+            running["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Turn is still running.")
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_needs_a_token_and_counts_up() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let mut sent = 0;
+        send_progress(&sender, None, &mut sent, "ignored".to_owned()).await;
+        assert_eq!(sent, 0);
+        assert!(receiver.try_recv().is_err());
+
+        let token = json!("tok-1");
+        send_progress(&sender, Some(&token), &mut sent, "first".to_owned()).await;
+        send_progress(&sender, Some(&token), &mut sent, "second".to_owned()).await;
+        let first = receiver.recv().await.unwrap();
+        let second = receiver.recv().await.unwrap();
+        assert_eq!(first["method"], "notifications/progress");
+        assert_eq!(
+            first["params"],
+            json!({"progressToken": "tok-1", "progress": 1, "message": "first"})
+        );
+        assert_eq!(second["params"]["progress"], 2);
+    }
+
+    async fn stream_test_turn() -> Option<(PgSessionStore, StartedTurn)> {
+        let Ok(url) = std::env::var("SESSION_SQLX_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL"))
+        else {
+            eprintln!("skipping: set SESSION_SQLX_TEST_DATABASE_URL to a Postgres URL");
+            return None;
+        };
+        let store = PgSessionStore::connect(&url)
+            .await
+            .expect("connect test db");
+        store.run_migrations().await.expect("run migrations");
+        let runtime = SessionRuntime::new(
+            store.clone(),
+            SandboxRuntime::backend(
+                Arc::new(crate::tests::TestBackend::default()),
+                SandboxSpec::new("test"),
+            ),
+            crate::tests::TestSessionPrincipalRegistrar,
+        );
+        let owner = principal(&format!("prn_{}", Uuid::new_v4().simple()));
+        let thread_key = session_thread_key(&owner, "stream").unwrap();
+        runtime
+            .create_or_get_session_with_principal(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+                Some(&owner.principal_id),
+            )
+            .await
+            .expect("create session");
+        let execution = store
+            .create_execution(&thread_key, Some("msg-1"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        Some((
+            store,
+            StartedTurn {
+                runtime,
+                thread_key,
+                execution,
+                accepted: json!({"session_id": "stream", "steered": false}),
+                wait: true,
+            },
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streamed_turn_sends_progress_then_the_answer() {
+        let Some((store, turn)) = stream_test_turn().await else {
+            return;
+        };
+        let thread_key = turn.thread_key.clone();
+        let execution_id = turn.execution.execution_id.clone();
+        let (sender, mut receiver) = mpsc::channel(64);
+        let follow = tokio::spawn(async move {
+            let token = json!(7);
+            follow_turn(&turn, Some(&token), &sender).await
+        });
+
+        let line = |value: Value| Value::String(value.to_string());
+        for (event_type, payload) in [
+            (
+                centaur_session_runtime::SESSION_OUTPUT_LINE_EVENT,
+                line(json!({"method": "item/agentMessage/delta", "params": {"delta": "Look"}})),
+            ),
+            (
+                centaur_session_runtime::SESSION_OUTPUT_LINE_EVENT,
+                line(json!({"method": "item/completed", "params": {"item": {
+                    "type": "commandExecution", "id": "c1", "command": "gh pr list",
+                    "status": "completed", "exitCode": 0
+                }}})),
+            ),
+        ] {
+            store
+                .append_event(&thread_key, Some(&execution_id), event_type, payload)
+                .await
+                .expect("append output");
+        }
+        store
+            .complete_execution(&execution_id)
+            .await
+            .expect("complete execution");
+        store
+            .append_event(
+                &thread_key,
+                Some(&execution_id),
+                "session.execution_completed",
+                json!({"result_text": "3 PRs are open."}),
+            )
+            .await
+            .expect("append terminal event");
+
+        let report = tokio::time::timeout(Duration::from_secs(20), follow)
+            .await
+            .expect("stream finishes after the terminal event")
+            .expect("follow task")
+            .expect("follow succeeds")
+            .expect("client still connected");
+        assert_eq!(report["done"], true);
+        assert_eq!(report["status"], "completed");
+        assert_eq!(report["final_answer"], "3 PRs are open.");
+        assert_eq!(report["session_id"], "stream");
+        let kinds = report["progress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["kind"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["command", "turn_completed"]);
+
+        let mut messages = Vec::new();
+        while let Ok(message) = receiver.try_recv() {
+            messages.push(message);
+        }
+        let progress = messages
+            .iter()
+            .map(|message| {
+                assert_eq!(message["method"], "notifications/progress");
+                assert_eq!(message["params"]["progressToken"], 7);
+                message["params"]["message"].as_str().unwrap().to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            progress,
+            vec!["command: gh pr list → exit 0", "turn completed"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn following_stops_when_the_client_leaves() {
+        let Some((_store, turn)) = stream_test_turn().await else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel(64);
+        let follow = tokio::spawn(async move { follow_turn(&turn, None, &sender).await });
+        drop(receiver);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), follow)
+            .await
+            .expect("following stops without a client")
+            .expect("follow task")
+            .expect("follow succeeds");
+        assert!(outcome.is_none());
+    }
+
+    /// A sandbox whose harness answers every user line with one command,
+    /// one final answer, and `turn.completed`.
+    #[derive(Default)]
+    struct ScriptedBackend {
+        next_id: AtomicU64,
+    }
+
+    #[async_trait]
+    impl SandboxBackend for ScriptedBackend {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+
+        async fn create(&self, _spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(SandboxHandle::new(
+                SandboxId::new(format!("scripted-{id}")),
+                self.name(),
+            ))
+        }
+
+        async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+            let (stdin_near, stdin_far) = tokio::io::duplex(64 * 1024);
+            let (stdout_near, mut stdout_far) = tokio::io::duplex(64 * 1024);
+            let (stderr_near, _stderr_far) = tokio::io::duplex(1024);
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdin_far).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if !line.contains("\"type\":\"user\"") {
+                        continue;
+                    }
+                    let output = [
+                        json!({"type": "item.completed", "item": {
+                            "id": "cmd-1", "type": "commandExecution", "command": "gh pr list",
+                            "cwd": "/work", "status": "completed", "exitCode": 0
+                        }}),
+                        json!({"type": "item.completed", "item": {
+                            "id": "msg-1", "type": "agentMessage",
+                            "text": "3 PRs are open.", "phase": "final_answer"
+                        }}),
+                        json!({"type": "turn.completed", "turn": {"id": "turn-1", "status": "completed"}}),
+                    ];
+                    for value in output {
+                        let _ = stdout_far.write_all(format!("{value}\n").as_bytes()).await;
+                    }
+                }
+            });
+            Ok(SandboxIo::new(
+                Box::pin(stdin_near),
+                Box::pin(stdout_near),
+                Box::pin(stderr_near),
+            ))
+        }
+
+        async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
+            Ok(SandboxStatus::Running)
+        }
+
+        async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
+            Ok(ObservedSandbox::new(
+                id.clone(),
+                self.name(),
+                SandboxStatus::Running,
+            ))
+        }
+
+        async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
+            Ok(Vec::new())
+        }
+
+        async fn stop(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn pause(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Err(SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "pause",
+            })
+        }
+
+        async fn resume(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Err(SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "resume",
+            })
+        }
+    }
+
+    struct McpSendHarness {
+        state: AppState,
+        token: String,
+        _env: EnvGuard,
+    }
+
+    async fn mcp_send_harness() -> Option<McpSendHarness> {
+        let Ok(url) = std::env::var("SESSION_SQLX_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL"))
+        else {
+            eprintln!("skipping: set SESSION_SQLX_TEST_DATABASE_URL to a Postgres URL");
+            return None;
+        };
+        let env = EnvGuard::set(&[
+            ("CENTAUR_JWT_SIGNING_SECRET", "test-secret"),
+            ("CENTAUR_MCP_PUBLIC_URL", "http://localhost:3000/mcp"),
+            ("CENTAUR_CONSOLE_PUBLIC_URL", "http://localhost:3001"),
+            ("CENTAUR_MCP_SESSIONS_ENABLED", "true"),
+        ]);
+        let store = PgSessionStore::connect(&url)
+            .await
+            .expect("connect test db");
+        store.run_migrations().await.expect("run migrations");
+        let runtime = SessionRuntime::new(
+            store,
+            SandboxRuntime::backend(
+                Arc::new(ScriptedBackend::default()),
+                SandboxSpec::new("scripted"),
+            ),
+            crate::tests::TestSessionPrincipalRegistrar,
+        );
+        let token = test_jwt(
+            "test-secret",
+            json!({
+                "iss": "http://localhost:3001",
+                "aud": "http://localhost:3000/mcp",
+                "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                "principal_id": format!("prn_{}", Uuid::new_v4().simple()),
+                "scope": "mcp:tools",
+                "email": "ada@example.com",
+            }),
+        );
+        Some(McpSendHarness {
+            state: AppState::ready(
+                runtime,
+                None,
+                crate::auth::ApiAuthConfig::testing("test-secret"),
+            ),
+            token,
+            _env: env,
+        })
+    }
+
+    async fn call_send(
+        harness: &McpSendHarness,
+        arguments: Value,
+        accept: &str,
+    ) -> axum::response::Response {
+        let mut headers: HeaderMap = mcp_auth_headers(&harness.token);
+        headers.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_str(accept).unwrap(),
+        );
+        mcp_post(
+            State(harness.state.clone()),
+            headers,
+            Json(McpJsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                id: Some(json!(41)),
+                method: "tools/call".to_owned(),
+                params: json!({
+                    "name": SESSION_SEND_TOOL,
+                    "arguments": arguments,
+                    "_meta": {"progressToken": "tok-41"},
+                }),
+            }),
+        )
+        .await
+        .expect("mcp response")
+    }
+
+    async fn body_text(response: axum::response::Response) -> String {
+        let body = tokio::time::timeout(
+            Duration::from_secs(30),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("response finishes")
+        .expect("read body");
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    // Handlers read the env on every request, so the env lock must cover the
+    // whole call. Each test owns its runtime, so waiting on it cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waited_send_streams_progress_then_the_answer() {
+        let _lock = MCP_ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(harness) = mcp_send_harness().await else {
+            return;
+        };
+        let response = call_send(
+            &harness,
+            json!({"prompt": "How many PRs are open?"}),
+            "application/json, text/event-stream",
+        )
+        .await;
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let body = body_text(response).await;
+        let messages = body
+            .split("\n\n")
+            .filter_map(|frame| {
+                let data = frame
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!data.is_empty()).then(|| serde_json::from_str::<Value>(&data).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let (result, notifications) = messages.split_last().expect("stream has messages");
+        let progress = notifications
+            .iter()
+            .map(|message| {
+                assert_eq!(message["method"], "notifications/progress");
+                assert_eq!(message["params"]["progressToken"], "tok-41");
+                message["params"]["message"].as_str().unwrap().to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            progress.contains(&"command: gh pr list → exit 0".to_owned()),
+            "{progress:?}"
+        );
+        assert!(
+            progress.contains(&"message: 3 PRs are open.".to_owned()),
+            "{progress:?}"
+        );
+        assert_eq!(result["id"], 41);
+        let tool_result = &result["result"];
+        assert_eq!(tool_result["isError"], false);
+        assert_eq!(tool_result["structuredContent"]["done"], true);
+        assert_eq!(
+            tool_result["structuredContent"]["final_answer"],
+            "3 PRs are open."
+        );
+        assert!(
+            tool_result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Turn completed.\n\n3 PRs are open.")
+        );
+
+        // The session keeps its conversation: a second send continues it.
+        let session_id = tool_result["structuredContent"]["session_id"]
+            .as_str()
+            .unwrap();
+        let second = call_send(
+            &harness,
+            json!({"prompt": "And now?", "session_id": session_id}),
+            "application/json, text/event-stream",
+        )
+        .await;
+        let body = body_text(second).await;
+        assert!(body.contains("\"created\":false"), "{body}");
+        assert!(body.contains("3 PRs are open."), "{body}");
+    }
+
+    // Handlers read the env on every request, so the env lock must cover the
+    // whole call. Each test owns its runtime, so waiting on it cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waited_send_without_streaming_answers_with_json() {
+        let _lock = MCP_ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(harness) = mcp_send_harness().await else {
+            return;
+        };
+        let response = call_send(
+            &harness,
+            json!({"prompt": "How many PRs are open?"}),
+            "application/json",
+        )
+        .await;
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let body = serde_json::from_str::<Value>(&body_text(response).await).unwrap();
+        let report = &body["result"]["structuredContent"];
+        assert_eq!(report["done"], true);
+        assert_eq!(report["final_answer"], "3 PRs are open.");
+        let kinds = report["progress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["kind"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"command"), "{kinds:?}");
+    }
+
+    // Handlers read the env on every request, so the env lock must cover the
+    // whole call. Each test owns its runtime, so waiting on it cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unwaited_send_returns_at_once() {
+        let _lock = MCP_ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(harness) = mcp_send_harness().await else {
+            return;
+        };
+        let response = call_send(
+            &harness,
+            json!({"prompt": "How many PRs are open?", "wait": false}),
+            "application/json, text/event-stream",
+        )
+        .await;
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let body = serde_json::from_str::<Value>(&body_text(response).await).unwrap();
+        let accepted = &body["result"]["structuredContent"];
+        assert_eq!(accepted["created"], true);
+        assert!(accepted.get("done").is_none());
+        assert!(accepted["execution_id"].as_str().is_some());
     }
 
     #[test]
