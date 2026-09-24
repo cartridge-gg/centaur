@@ -1731,6 +1731,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "regex",
  "serde",
  "serde_json",
  "session-transfer",

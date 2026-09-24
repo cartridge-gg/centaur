@@ -107,6 +107,120 @@ fn fake_claude_app_server_streams_codex_v2_notifications() {
 }
 
 #[test]
+fn fake_claude_pool_exhaustion_is_annotated_on_the_terminal_lines() {
+    // Recorded from Claude Code 2.1.281 against a stub proxy that answers 503
+    // with a pool-exhaustion marker.
+    let recorded = include_str!("fixtures/failover/claude-stream.jsonl");
+    let quoted: Vec<String> = recorded
+        .lines()
+        .map(|line| format!("'{}'", line.replace('\'', "'\\''")))
+        .collect();
+    let fake_claude = format!(
+        "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}}' {}",
+        quoted.join(" ")
+    );
+
+    let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
+        Harness::ClaudeCode,
+        Some(fake_claude),
+        None,
+        &[("CENTAUR_PROVIDER_EXHAUSTED_MARKERS", "pool_exhausted")],
+    );
+    bridge.run_blocks_user_turn("say hi", Duration::from_secs(10));
+    let stdout: Vec<Value> = bridge
+        .finish_successfully()
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    // The Claude path ends the turn with a failed turn/completed and no
+    // separate error line.
+    assert!(stdout.iter().all(|v| v["method"] != "error"));
+    let completed = stdout
+        .iter()
+        .find(|v| v["method"] == "turn/completed")
+        .expect("a turn/completed line");
+    assert_eq!(completed["params"]["turn"]["status"], "failed");
+    let exhausted = &completed["params"]["centaur"]["providerExhausted"];
+    assert_eq!(exhausted["signal"], "poolMarker");
+    assert_eq!(exhausted["resetAt"], 1_790_220_353);
+}
+
+#[test]
+fn fake_codex_pool_exhaustion_is_annotated_on_the_error_lines() {
+    // Recorded from codex app-server 0.154 against a stub proxy that answers
+    // 503 with a pool-exhaustion marker: one retry notice, the final error and
+    // the failed turn/completed. The ids are rewritten to the fake's ids.
+    let turn_lines: String = include_str!("fixtures/failover/codex-app-server.jsonl")
+        .lines()
+        .map(|line| {
+            let mut value: Value = serde_json::from_str(line).unwrap();
+            let params = &mut value["params"];
+            params["threadId"] = json!("thread-1");
+            if params.get("turnId").is_some() {
+                params["turnId"] = json!("turn-1");
+            }
+            if params.get("turn").is_some() {
+                params["turn"]["id"] = json!("turn-1");
+            }
+            format!("{value}\n")
+        })
+        .collect();
+    let lines_file = temp_path("fake-codex-exhausted-turn.jsonl");
+    std::fs::write(&lines_file, turn_lines).unwrap();
+    let fake_codex = temp_path("fake-exhausted-codex.sh");
+    let fake_codex_log = temp_path("fake-exhausted-codex-requests.jsonl");
+    std::fs::write(&fake_codex, fake_codex_app_server_script(&fake_codex_log)).unwrap();
+    let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_codex, permissions).unwrap();
+
+    let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
+        Harness::Codex,
+        None,
+        Some(("CODEX_BIN", fake_codex.to_str().unwrap())),
+        &[
+            ("FAKE_CODEX_TURN_LINES", lines_file.to_str().unwrap()),
+            ("CENTAUR_PROVIDER_EXHAUSTED_MARKERS", "pool_exhausted"),
+        ],
+    );
+    // The final error (willRetry: false) ends the turn for harness-server and
+    // api-rs, so read until it, as api-rs does.
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "message": {"role": "user", "content": [{"type": "text", "text": "say hi"}]},
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stdout = Vec::new();
+    loop {
+        let value = bridge.read_json(deadline);
+        let terminal = value["method"] == "error" && value["params"]["willRetry"] == false;
+        stdout.push(value);
+        if terminal {
+            break;
+        }
+    }
+    bridge.finish_successfully();
+
+    let errors: Vec<&Value> = stdout.iter().filter(|v| v["method"] == "error").collect();
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    for error in &errors {
+        assert_eq!(
+            error["params"]["centaur"]["providerExhausted"]["resetAt"],
+            1_790_220_376
+        );
+    }
+    // The retry notice is annotated too: it allows an early switch.
+    assert_eq!(errors[0]["params"]["willRetry"], true);
+    assert_eq!(errors[1]["params"]["willRetry"], false);
+
+    for path in [fake_codex, fake_codex_log, lines_file] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
 fn fake_claude_app_server_completes_on_stop_sequence_without_result() {
     let fake_claude = concat!(
         "printf '%s\\n' ",
@@ -2472,6 +2586,10 @@ while IFS= read -r line; do
       id=$(request_id "$line")
       printf '{"id":%s,"result":{"turn":{"id":"turn-1"}}}\n' "$id"
       printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"itemsView":"full","status":"inProgress","error":null,"startedAt":1,"completedAt":null,"durationMs":null}}}'
+      if [ -n "${FAKE_CODEX_TURN_LINES:-}" ]; then
+        cat "$FAKE_CODEX_TURN_LINES"
+        continue
+      fi
       if [ -n "${FAKE_CODEX_TURN_DELAY:-}" ]; then
         sleep "$FAKE_CODEX_TURN_DELAY"
       fi
