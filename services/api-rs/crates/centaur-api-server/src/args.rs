@@ -32,9 +32,9 @@ use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
-    KeepaliveConfig, PersonaRegistry, ProviderFailoverConfig, SandboxCapacityConfig,
-    SandboxWorkloadMode, SessionEventRetentionConfig, SessionPrincipalAdmission,
-    SessionSandboxCleanupConfig,
+    KeepaliveConfig, PersonaRegistry, ProviderFailoverConfig, ProviderHealthProbeConfig,
+    SandboxCapacityConfig, SandboxWorkloadMode, SessionEventRetentionConfig,
+    SessionPrincipalAdmission, SessionSandboxCleanupConfig,
 };
 use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
@@ -113,6 +113,12 @@ impl Args {
 
     pub(crate) fn provider_failover_config(&self) -> Result<ProviderFailoverConfig, ServerError> {
         self.sandbox.provider_failover_config()
+    }
+
+    pub(crate) fn provider_health_probe_config(
+        &self,
+    ) -> Result<ProviderHealthProbeConfig, ServerError> {
+        self.sandbox.provider_health_probe_config()
     }
 
     pub(crate) fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
@@ -712,6 +718,28 @@ struct SandboxArgs {
         value_delimiter = ','
     )]
     provider_failover_thread_prefixes: Vec<String>,
+    /// The health URL of each harness's model provider, as comma-separated
+    /// `harness=url` pairs. api-rs checks them on an interval: an answer of
+    /// `{"exhausted": true, "reset_at": <Unix seconds>}` marks the provider
+    /// exhausted, and `{"exhausted": false}` clears it early.
+    #[arg(
+        long = "session-provider-health-urls",
+        env = "SESSION_PROVIDER_HEALTH_URLS",
+        default_value = ""
+    )]
+    provider_health_urls: String,
+    /// Bearer token for the health URLs.
+    #[arg(
+        long = "session-provider-health-token",
+        env = "SESSION_PROVIDER_HEALTH_TOKEN"
+    )]
+    provider_health_token: Option<String>,
+    #[arg(
+        long = "session-provider-health-interval-secs",
+        env = "SESSION_PROVIDER_HEALTH_INTERVAL_SECS",
+        default_value_t = 60
+    )]
+    provider_health_interval_secs: u64,
     #[arg(
         long = "session-sandbox-image-pull-secrets",
         env = "SESSION_SANDBOX_IMAGE_PULL_SECRETS",
@@ -1740,6 +1768,39 @@ impl SandboxArgs {
                 .map(|prefix| prefix.trim().to_owned())
                 .filter(|prefix| !prefix.is_empty())
                 .collect(),
+        })
+    }
+
+    fn provider_health_probe_config(&self) -> Result<ProviderHealthProbeConfig, ServerError> {
+        let mut endpoints = Vec::new();
+        for pair in self
+            .provider_health_urls
+            .split(',')
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty())
+        {
+            let parsed = pair.split_once('=').and_then(|(harness, url)| {
+                let harness = harness.trim().parse::<HarnessType>().ok()?;
+                let url = url.trim();
+                (url.starts_with("https://") || url.starts_with("http://"))
+                    .then(|| (harness, url.to_owned()))
+            });
+            let Some(endpoint) = parsed else {
+                return Err(ServerError::UnsupportedConfig(format!(
+                    "SESSION_PROVIDER_HEALTH_URLS: `{pair}` is not `harness=http(s)://...`"
+                )));
+            };
+            endpoints.push(endpoint);
+        }
+        if !endpoints.is_empty() && self.provider_health_interval_secs == 0 {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_PROVIDER_HEALTH_INTERVAL_SECS must be above 0".to_owned(),
+            ));
+        }
+        Ok(ProviderHealthProbeConfig {
+            interval: Duration::from_secs(self.provider_health_interval_secs),
+            endpoints,
+            bearer_token: clean_optional_value(self.provider_health_token.as_deref()),
         })
     }
 
@@ -3018,6 +3079,67 @@ mod tests {
             )
             .unwrap();
             assert!(args.provider_failover_config().is_err(), "{models}");
+        }
+    }
+
+    #[test]
+    fn provider_health_urls_parse_by_harness() {
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ];
+        let config = Args::try_parse_from(base)
+            .unwrap()
+            .provider_health_probe_config()
+            .unwrap();
+        assert!(config.endpoints.is_empty());
+        assert_eq!(config.bearer_token, None);
+
+        let config = Args::try_parse_from(base.iter().copied().chain([
+            "--session-provider-health-urls",
+            "codex=https://pool.example/openai/pool-health, claudecode=https://pool.example/anthropic/pool-health",
+            "--session-provider-health-token",
+            " key-1 ",
+            "--session-provider-health-interval-secs",
+            "30",
+        ]))
+        .unwrap()
+        .provider_health_probe_config()
+        .unwrap();
+        assert_eq!(
+            config.endpoints,
+            [
+                (
+                    HarnessType::Codex,
+                    "https://pool.example/openai/pool-health".to_owned()
+                ),
+                (
+                    HarnessType::ClaudeCode,
+                    "https://pool.example/anthropic/pool-health".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(config.bearer_token.as_deref(), Some("key-1"));
+        assert_eq!(config.interval, Duration::from_secs(30));
+
+        for (urls, interval) in [
+            ("codex", "60"),
+            ("gemini=https://pool.example", "60"),
+            ("codex=pool.example/health", "60"),
+            ("codex=https://pool.example", "0"),
+        ] {
+            let args = Args::try_parse_from(base.iter().copied().chain([
+                "--session-provider-health-urls",
+                urls,
+                "--session-provider-health-interval-secs",
+                interval,
+            ]))
+            .unwrap();
+            assert!(
+                args.provider_health_probe_config().is_err(),
+                "{urls} {interval}"
+            );
         }
     }
 

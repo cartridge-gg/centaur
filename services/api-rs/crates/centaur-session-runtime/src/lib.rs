@@ -1,5 +1,6 @@
 mod cleanup;
 mod provider_failover;
+mod provider_health;
 mod retention;
 mod sandbox_retention;
 mod title_generator;
@@ -60,6 +61,7 @@ use uuid::Uuid;
 
 pub use cleanup::SessionSandboxCleanupConfig;
 pub use provider_failover::ProviderFailoverConfig;
+pub use provider_health::ProviderHealthProbeConfig;
 pub use retention::SessionEventRetentionConfig;
 pub use sandbox_retention::{
     KeepaliveOutcome, Lease, LeaseClose, LeaseState, RETENTION_METADATA_KEY, Retention,
@@ -1121,6 +1123,15 @@ impl SessionRuntime {
 
     pub fn with_provider_failover(mut self, config: ProviderFailoverConfig) -> Self {
         self.provider_failover = config;
+        self
+    }
+
+    /// Checks the configured provider health URLs on an interval and keeps
+    /// `provider_health` in step with them. No endpoints: no checks.
+    pub fn with_provider_health_probe(self, config: ProviderHealthProbeConfig) -> Self {
+        if !config.endpoints.is_empty() {
+            provider_health::ProviderHealthProbe::new(self.store.clone(), config).spawn();
+        }
         self
     }
 
@@ -7105,7 +7116,7 @@ fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
 const PROVIDER_EXHAUSTED_FAILURE_CLASS: &str = "provider_exhausted";
 
 /// How long a provider counts as exhausted when the error names no reset time.
-const PROVIDER_EXHAUSTED_DEFAULT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+pub(crate) const PROVIDER_EXHAUSTED_DEFAULT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 /// The provider-exhaustion annotation of a harness terminal line, if any.
 fn provider_exhausted_annotation(value: &Value) -> Option<Value> {
@@ -13226,6 +13237,128 @@ mod adoption_tests {
             .await
             .expect("list exhausted providers");
         assert_eq!(listed, vec![("codex".to_owned(), until)]);
+        reset_test_store(&store).await;
+    }
+
+    /// A provider health endpoint: `/codex` answers with the body in `codex`,
+    /// `/claude` always has capacity. Keeps the Authorization headers.
+    async fn spawn_provider_health_stub() -> (
+        String,
+        Arc<std::sync::Mutex<(u16, String)>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let codex = Arc::new(std::sync::Mutex::new((
+            200,
+            r#"{"exhausted":false}"#.to_owned(),
+        )));
+        let auth = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (codex_reply, seen_auth) = (codex.clone(), auth.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                if let Some(line) = request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                {
+                    seen_auth.lock().unwrap().push(line.trim().to_owned());
+                }
+                let (status, body) = if request.starts_with("GET /codex") {
+                    codex_reply.lock().unwrap().clone()
+                } else {
+                    (200, r#"{"exhausted":false,"reset_at":null}"#.to_owned())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (base_url, codex, auth)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_health_checks_mark_and_clear_exhaustion() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, codex, auth) = spawn_provider_health_stub().await;
+        let probe = provider_health::ProviderHealthProbe::new(
+            store.clone(),
+            ProviderHealthProbeConfig {
+                interval: Duration::from_secs(60),
+                endpoints: vec![
+                    (HarnessType::Codex, format!("{base_url}/codex")),
+                    (HarnessType::ClaudeCode, format!("{base_url}/claude")),
+                ],
+                bearer_token: Some("health-key".to_owned()),
+            },
+        );
+        let until = |harness: HarnessType| {
+            let store = store.clone();
+            async move {
+                store
+                    .provider_exhausted_until(&harness)
+                    .await
+                    .expect("read provider health")
+                    .map(|until| {
+                        until
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                    })
+            }
+        };
+
+        // The pool is empty until its reported reset.
+        let reset = unix_secs_from_now(1200);
+        *codex.lock().unwrap() = (200, format!(r#"{{"exhausted":true,"reset_at":{reset}}}"#));
+        probe.check_all().await;
+        assert_eq!(until(HarnessType::Codex).await, Some(reset));
+        assert_eq!(until(HarnessType::ClaudeCode).await, None);
+        assert!(
+            auth.lock()
+                .unwrap()
+                .iter()
+                .all(|line| line == "authorization: Bearer health-key"
+                    || line == "Authorization: Bearer health-key")
+        );
+        assert_eq!(auth.lock().unwrap().len(), 2);
+
+        // A failed check changes nothing.
+        *codex.lock().unwrap() = (500, "{}".to_owned());
+        probe.check_all().await;
+        assert_eq!(until(HarnessType::Codex).await, Some(reset));
+        *codex.lock().unwrap() = (200, r#"{"status":"ok"}"#.to_owned());
+        probe.check_all().await;
+        assert_eq!(until(HarnessType::Codex).await, Some(reset));
+
+        // Capacity again: the mark ends before its reset time.
+        *codex.lock().unwrap() = (200, r#"{"exhausted":false,"reset_at":null}"#.to_owned());
+        probe.check_all().await;
+        assert_eq!(until(HarnessType::Codex).await, None);
+
+        // No reset time: the cooldown applies, and each check renews it.
+        *codex.lock().unwrap() = (200, r#"{"exhausted":true,"reset_at":null}"#.to_owned());
+        probe.check_all().await;
+        let cooldown = until(HarnessType::Codex).await.expect("exhausted");
+        assert!(cooldown >= unix_secs_from_now(0) + 14 * 60);
         reset_test_store(&store).await;
     }
 

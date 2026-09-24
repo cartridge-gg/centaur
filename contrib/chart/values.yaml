@@ -533,6 +533,15 @@ apiRs:
     enabled: false
     models: ""
     threadPrefixes: ""
+  # Ask each model provider whether it has capacity, instead of learning it
+  # only from failed turns. urls: comma-separated `harness=url` pairs; each URL
+  # answers GET with {"exhausted": bool, "reset_at": <Unix seconds>|null}.
+  # api-rs marks an exhausted provider until reset_at, and clears the mark as
+  # soon as the provider has capacity again. Put a bearer token for the URLs
+  # in the infra secret as SESSION_PROVIDER_HEALTH_TOKEN.
+  providerHealth:
+    urls: ""
+    intervalSecs: 60
   sandboxWarmPoolReplenishIntervalSecs: 5
   # Capacity manager: when nonzero, api-rs keeps observed running-like
   # sandboxes at or below this limit by discarding ready warm sandboxes first,

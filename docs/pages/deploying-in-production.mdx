@@ -330,7 +330,23 @@ exhausted. When a provider is exhausted, api-rs records its reset time, and
 new turns start on the other harness until then. Any authenticated caller,
 including a sandbox, can read that record with `GET /api/provider-health`:
 `{"exhausted": {"codex": {"until": "<RFC 3339>", "reset_at": <Unix seconds>}}}`.
-A harness that is not listed is not known to be exhausted. A client that still asks for
+A harness that is not listed is not known to be exhausted.
+
+api-rs learns about an exhausted provider from failed turns. When the
+provider can report its own capacity, set `apiRs.providerHealth.urls` so that
+api-rs asks it every `intervalSecs` (60 by default). Each URL answers `GET`
+with `{"exhausted": bool, "reset_at": <Unix seconds>|null}`. An exhausted
+provider is marked until `reset_at` (15 minutes when it is unknown, renewed
+on each check), and a provider with capacity again is cleared at once. Put a
+bearer token for the URLs in the infra secret as
+`SESSION_PROVIDER_HEALTH_TOKEN`.
+
+```yaml
+apiRs:
+  providerHealth:
+    urls: "codex=https://pool.example/openai/pool-health,claudecode=https://pool.example/anthropic/pool-health"
+    intervalSecs: 60
+``` A client that still asks for
 the old harness gets the session on the new one; only a request with
 `harness_explicit: true` restarts it on the old harness. Execution metadata
 `{"provider_failover": false}` turns failover off for one execution.

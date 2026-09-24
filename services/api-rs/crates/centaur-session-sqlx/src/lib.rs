@@ -1970,6 +1970,27 @@ impl PgSessionStore {
         Ok(until.map(std::time::SystemTime::from))
     }
 
+    /// Ends an exhaustion of `harness` early, when the provider reports
+    /// capacity again. Returns false when it was not exhausted.
+    pub async fn clear_provider_exhausted(
+        &self,
+        harness: &HarnessType,
+        detail: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update provider_health
+            set exhausted_until = now(), last_signal_at = now(), detail = $2
+            where harness = $1 and exhausted_until > now()
+            "#,
+        )
+        .bind(harness.to_string())
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Every provider that is exhausted now, by harness, with its reset time.
     pub async fn exhausted_providers(
         &self,
