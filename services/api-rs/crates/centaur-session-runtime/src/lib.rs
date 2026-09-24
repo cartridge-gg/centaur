@@ -4647,7 +4647,10 @@ impl SessionRuntime {
             thread_key,
             sandbox_id,
             execution_id,
-            TerminalOutput::Failed { error },
+            TerminalOutput::Failed {
+                error,
+                provider_exhausted: None,
+            },
         )
         .await
         {
@@ -5642,7 +5645,10 @@ async fn fail_detached_execution(
         thread_key,
         sandbox_id,
         execution_id,
-        TerminalOutput::Failed { error },
+        TerminalOutput::Failed {
+            error,
+            provider_exhausted: None,
+        },
     )
     .await
     {
@@ -5855,7 +5861,10 @@ async fn record_stdout_pump_failure(
             thread_key,
             sandbox_id,
             &execution.execution_id,
-            TerminalOutput::Failed { error },
+            TerminalOutput::Failed {
+                error,
+                provider_exhausted: None,
+            },
         )
         .await?;
     }
@@ -6144,6 +6153,9 @@ enum TerminalOutput {
     },
     Failed {
         error: String,
+        /// `params.centaur.providerExhausted` of the terminal line: the model
+        /// provider had no capacity left (see harness-server failover.rs).
+        provider_exhausted: Option<Value>,
     },
 }
 
@@ -6213,8 +6225,15 @@ async fn record_terminal_output(
                 .await?;
             (execution, "cancelled")
         }
-        TerminalOutput::Failed { error } => {
-            failure_class = Some(terminal_failure_class(&error));
+        TerminalOutput::Failed {
+            error,
+            provider_exhausted,
+        } => {
+            failure_class = Some(if provider_exhausted.is_some() {
+                PROVIDER_EXHAUSTED_FAILURE_CLASS
+            } else {
+                terminal_failure_class(&error)
+            });
             let Some(execution) = ctx
                 .store
                 .fail_execution_if_active_and_stdout_owner(
@@ -6235,9 +6254,14 @@ async fn record_terminal_output(
                         "execution_id": execution_id,
                         "thread_key": thread_key.as_str(),
                         "error": error.as_str(),
+                        "failure_class": failure_class,
+                        "provider_exhausted": provider_exhausted,
                     }),
                 )
                 .await?;
+            if let Some(exhausted) = &provider_exhausted {
+                record_provider_exhausted(&ctx.store, thread_key, exhausted).await;
+            }
             (execution, "failed")
         }
     };
@@ -6862,6 +6886,57 @@ fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
     }
 }
 
+/// Failure class of a turn whose model provider had no capacity left.
+const PROVIDER_EXHAUSTED_FAILURE_CLASS: &str = "provider_exhausted";
+
+/// How long a provider counts as exhausted when the error names no reset time.
+const PROVIDER_EXHAUSTED_DEFAULT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+/// The provider-exhaustion annotation of a harness terminal line, if any.
+fn provider_exhausted_annotation(value: &Value) -> Option<Value> {
+    value
+        .pointer("/params/centaur/providerExhausted")
+        .filter(|annotation| annotation.is_object())
+        .cloned()
+}
+
+/// Remembers until when the provider of the session's harness is exhausted,
+/// so that later turns can avoid it. A failure here only loses that hint.
+async fn record_provider_exhausted(
+    store: &PgSessionStore,
+    thread_key: &ThreadKey,
+    exhausted: &Value,
+) {
+    let now = std::time::SystemTime::now();
+    let until = exhausted
+        .get("resetAt")
+        .and_then(Value::as_u64)
+        .and_then(|reset| std::time::UNIX_EPOCH.checked_add(Duration::from_secs(reset)))
+        .filter(|reset| *reset > now)
+        .unwrap_or(now + PROVIDER_EXHAUSTED_DEFAULT_COOLDOWN);
+    let detail = exhausted
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let result = match store.get_session(thread_key).await {
+        Ok(session) => {
+            store
+                .mark_provider_exhausted(&session.harness_type, until, detail)
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "provider_exhausted_record_failed",
+            thread_key = %thread_key,
+            %error,
+            "failed to record an exhausted model provider"
+        );
+    }
+}
+
 fn terminal_failure_class(error: &str) -> &'static str {
     let error = error.to_ascii_lowercase();
     // Capacity deaths are checked first because they arrive wrapped in the
@@ -6954,6 +7029,7 @@ fn terminal_output(value: &Value, prior_final_answer_text: &str) -> Option<Termi
         }
         return Some(TerminalOutput::Failed {
             error: terminal_error_text(value),
+            provider_exhausted: provider_exhausted_annotation(value),
         });
     }
 
@@ -6979,6 +7055,7 @@ fn terminal_output(value: &Value, prior_final_answer_text: &str) -> Option<Termi
             if result_is_failure(value) {
                 Some(TerminalOutput::Failed {
                     error: terminal_error_text(value),
+                    provider_exhausted: provider_exhausted_annotation(value),
                 })
             } else {
                 Some(completed_terminal_output(value, "result"))
@@ -7011,6 +7088,7 @@ fn completed_turn_terminal_output(value: &Value, prior_final_answer_text: &str) 
         }
         Some(status) => TerminalOutput::Failed {
             error: format!("turn completed with status {status} before final answer"),
+            provider_exhausted: provider_exhausted_annotation(value),
         },
     }
 }
@@ -8644,7 +8722,8 @@ mod tests {
         assert_eq!(
             terminal_output(&terminal, ""),
             Some(TerminalOutput::Failed {
-                error: "terminal harness output reported failure".to_owned()
+                error: "terminal harness output reported failure".to_owned(),
+                provider_exhausted: None,
             })
         );
     }
@@ -8769,7 +8848,8 @@ mod tests {
         assert_eq!(
             terminal_output(&event, ""),
             Some(TerminalOutput::Failed {
-                error: "sandbox exited".to_owned()
+                error: "sandbox exited".to_owned(),
+                provider_exhausted: None,
             })
         );
     }
@@ -8812,7 +8892,8 @@ mod tests {
             terminal_output(&event, ""),
             Some(TerminalOutput::Failed {
                 error: "Reconnecting... 5/5: stream disconnected before completion: provider error"
-                    .to_owned()
+                    .to_owned(),
+                provider_exhausted: None,
             })
         );
     }
@@ -8850,6 +8931,55 @@ mod tests {
         assert!(!state.should_record_first_token("exe-1", Some(&turn_started)));
         assert!(state.should_record_first_token("exe-1", Some(&delta)));
         assert!(state.should_record_first_token("exe-2", Some(&terminal_result)));
+    }
+
+    #[test]
+    fn terminal_output_keeps_the_provider_exhausted_annotation() {
+        let annotation =
+            json!({"resetAt": 1_790_220_376, "signal": "poolMarker", "detail": "pool empty"});
+        // Codex ends the turn with an error line.
+        let codex_error = json!({
+            "method": "error",
+            "params": {
+                "error": {"message": "unexpected status 503: pool empty", "codexErrorInfo": "other"},
+                "willRetry": false,
+                "centaur": {"providerExhausted": annotation},
+            },
+        });
+        assert_eq!(
+            terminal_output(&codex_error, ""),
+            Some(TerminalOutput::Failed {
+                error: "unexpected status 503: pool empty".to_owned(),
+                provider_exhausted: Some(annotation.clone()),
+            })
+        );
+        // Claude Code ends it with a failed turn/completed and no error line.
+        let claude_completed = json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {"id": "t", "status": "failed", "error": {"message": "API Error: 503 pool empty"}},
+                "centaur": {"providerExhausted": annotation},
+            },
+        });
+        let Some(TerminalOutput::Failed {
+            provider_exhausted, ..
+        }) = terminal_output(&claude_completed, "")
+        else {
+            panic!("a failed turn is a failure");
+        };
+        assert_eq!(provider_exhausted, Some(annotation));
+        // A malformed annotation is ignored.
+        let malformed = json!({
+            "method": "error",
+            "params": {"error": {"message": "boom"}, "willRetry": false, "centaur": {"providerExhausted": "yes"}},
+        });
+        assert!(matches!(
+            terminal_output(&malformed, ""),
+            Some(TerminalOutput::Failed {
+                provider_exhausted: None,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -10238,7 +10368,7 @@ mod adoption_tests {
     }
 
     async fn reset_test_store(store: &PgSessionStore) {
-        sqlx::query("truncate table sessions restart identity cascade")
+        sqlx::query("truncate table sessions, provider_health restart identity cascade")
             .execute(store.pool())
             .await
             .expect("reset test db");
@@ -12626,6 +12756,79 @@ mod adoption_tests {
                 .as_str()
                 .is_some_and(|error| error.contains("OOMKilled")),
             "terminal backend reason should fail immediately and remain visible"
+        );
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_exhausted_failure_is_classified_and_remembered() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:provider-exhausted-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-exhausted"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        claim_test_stdout_owner(&runtime, &execution_id).await;
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-exhausted")
+            .await
+            .expect("open initial pipe");
+
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 1800;
+        let line = json!({
+            "method": "error",
+            "params": {
+                "error": {"message": "unexpected status 503: pool empty", "codexErrorInfo": "other"},
+                "willRetry": false,
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "centaur": {"providerExhausted": {"resetAt": reset, "signal": "poolMarker", "detail": "pool empty"}},
+            },
+        });
+        stdout
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write terminal line");
+
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let all = events(&store, &thread_key).await;
+        let failed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_failed")
+            .expect("failed event");
+        assert_eq!(failed.payload["failure_class"], "provider_exhausted");
+        assert_eq!(failed.payload["provider_exhausted"]["resetAt"], reset);
+
+        // The reset time is remembered for the session's harness.
+        let until = store
+            .provider_exhausted_until(&HarnessType::Codex)
+            .await
+            .expect("read provider health")
+            .expect("codex is exhausted");
+        assert_eq!(
+            until
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            reset
+        );
+        assert_eq!(
+            store
+                .provider_exhausted_until(&HarnessType::ClaudeCode)
+                .await
+                .expect("read provider health"),
+            None
         );
         reset_test_store(&store).await;
     }

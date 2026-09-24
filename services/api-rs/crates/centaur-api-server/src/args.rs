@@ -667,6 +667,17 @@ struct SandboxArgs {
         action = clap::ArgAction::Set
     )]
     resume_thread_enabled: bool,
+    /// Comma-separated texts that mark an exhausted model provider in a
+    /// harness error, for example the error code of a subscription proxy whose
+    /// account pool is empty. The harness reports such a failure as
+    /// `provider_exhausted`, next to the native usage-limit errors it always
+    /// recognizes.
+    #[arg(
+        long = "session-provider-exhausted-markers",
+        env = "SESSION_PROVIDER_EXHAUSTED_MARKERS",
+        default_value = ""
+    )]
+    provider_exhausted_markers: String,
     #[arg(
         long = "session-sandbox-image-pull-secrets",
         env = "SESSION_SANDBOX_IMAGE_PULL_SECRETS",
@@ -1190,6 +1201,16 @@ impl SandboxArgs {
             // persist the Codex thread id under CODEX_HOME (on the state
             // volume) and resume it on the next start.
             envs.push((CODEX_THREAD_PERSIST_ENV.to_owned(), "1".to_owned()));
+            // The same for the Claude Code session id (claude.rs).
+            envs.push((CLAUDE_SESSION_PERSIST_ENV.to_owned(), "1".to_owned()));
+        }
+        let markers = self.provider_exhausted_markers.trim();
+        if !markers.is_empty() {
+            // Read by the harness server (crates/harness-server/src/failover.rs).
+            envs.push((
+                PROVIDER_EXHAUSTED_MARKERS_ENV.to_owned(),
+                markers.to_owned(),
+            ));
         }
 
         // Single source of truth: propagate this control plane's harness auth
@@ -1806,6 +1827,8 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
 /// Sandbox env the harness server reads to persist and resume its Codex
 /// thread across a pause (see `crates/harness-server/src/codex.rs`).
 const CODEX_THREAD_PERSIST_ENV: &str = "CENTAUR_CODEX_THREAD_PERSIST";
+const CLAUDE_SESSION_PERSIST_ENV: &str = "CENTAUR_CLAUDE_SESSION_PERSIST";
+const PROVIDER_EXHAUSTED_MARKERS_ENV: &str = "CENTAUR_PROVIDER_EXHAUSTED_MARKERS";
 
 #[derive(Debug, ClapArgs)]
 struct ToolsArgs {
@@ -2814,6 +2837,7 @@ mod tests {
         args.sandbox.validate_resume_thread().unwrap();
         let envs = args.sandbox.codex_app_server_env_template().unwrap();
         assert!(envs.contains(&(CODEX_THREAD_PERSIST_ENV.to_owned(), "1".to_owned())));
+        assert!(envs.contains(&(CLAUDE_SESSION_PERSIST_ENV.to_owned(), "1".to_owned())));
 
         // Off by default, and the state volume alone does not turn it on.
         let args = Args::try_parse_from(
@@ -2829,6 +2853,39 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|(name, _)| name == CODEX_THREAD_PERSIST_ENV)
+        );
+    }
+
+    #[test]
+    fn provider_exhausted_markers_reach_the_sandbox_only_when_set() {
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ];
+        let args = Args::try_parse_from(base).unwrap();
+        assert!(
+            !args
+                .sandbox
+                .codex_app_server_env_template()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == PROVIDER_EXHAUSTED_MARKERS_ENV)
+        );
+
+        let args = Args::try_parse_from(base.iter().copied().chain([
+            "--session-provider-exhausted-markers",
+            " pool_exhausted,usage_cap ",
+        ]))
+        .unwrap();
+        assert!(
+            args.sandbox
+                .codex_app_server_env_template()
+                .unwrap()
+                .contains(&(
+                    PROVIDER_EXHAUSTED_MARKERS_ENV.to_owned(),
+                    "pool_exhausted,usage_cap".to_owned()
+                ))
         );
     }
 

@@ -515,6 +515,11 @@ apiRs:
   # calls thread/resume on the next start (fresh thread when the rollout is
   # gone). Needs sandbox.stateVolume.enabled; api-rs refuses to start otherwise.
   sandboxResumeThreadEnabled: false
+  # Comma-separated texts that mark an exhausted model provider in a harness
+  # error, for example the error code that a subscription proxy returns when
+  # its whole account pool is rate limited. Such a failure is reported as
+  # `provider_exhausted`. Native usage-limit errors are recognized without it.
+  providerExhaustedMarkers: ""
   sandboxWarmPoolReplenishIntervalSecs: 5
   # Capacity manager: when nonzero, api-rs keeps observed running-like
   # sandboxes at or below this limit by discarding ready warm sandboxes first,

@@ -1899,6 +1899,47 @@ impl PgSessionStore {
         Ok(())
     }
 
+    /// Records that the model provider of `harness` has no capacity until
+    /// `until`. A later reset time already on record wins.
+    pub async fn mark_provider_exhausted(
+        &self,
+        harness: &HarnessType,
+        until: std::time::SystemTime,
+        detail: &str,
+    ) -> Result<(), SessionStoreError> {
+        sqlx::query(
+            r#"
+            insert into provider_health (harness, exhausted_until, last_signal_at, detail)
+            values ($1, $2, now(), $3)
+            on conflict (harness) do update
+            set exhausted_until = greatest(provider_health.exhausted_until, excluded.exhausted_until),
+                last_signal_at = now(),
+                detail = excluded.detail
+            "#,
+        )
+        .bind(harness.to_string())
+        .bind(OffsetDateTime::from(until))
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// When the model provider of `harness` accepts sessions again, if it is
+    /// exhausted now.
+    pub async fn provider_exhausted_until(
+        &self,
+        harness: &HarnessType,
+    ) -> Result<Option<std::time::SystemTime>, SessionStoreError> {
+        let until: Option<OffsetDateTime> = sqlx::query_scalar(
+            "select exhausted_until from provider_health where harness = $1 and exhausted_until > now()",
+        )
+        .bind(harness.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(until.map(std::time::SystemTime::from))
+    }
+
     pub async fn update_harness_thread_id(
         &self,
         thread_key: &ThreadKey,
