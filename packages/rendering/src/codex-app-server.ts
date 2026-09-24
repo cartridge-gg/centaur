@@ -762,14 +762,40 @@ function parseServerNotificationLine(line: string): ServerNotification | null {
 function errorMessage(event: any): string {
   const eventType = String(event?.type ?? '')
   if (eventType === 'turn.completed' && isFailedTurn(event)) {
-    return messageFromError(event?.turn?.error ?? event?.error, event?.message, 'turn failed')
+    return (
+      providerExhaustedMessage(event) ??
+      messageFromError(event?.turn?.error ?? event?.error, event?.message, 'turn failed')
+    )
   }
   if (eventType !== 'error' && eventType !== 'turn.failed') return ''
   if (isRetryableCodexErrorNotification(event)) return ''
-  return messageFromError(
-    event?.error,
-    event?.message,
-    eventType === 'turn.failed' ? 'turn failed' : 'Execution failed'
+  return (
+    providerExhaustedMessage(event) ??
+    messageFromError(
+      event?.error,
+      event?.message,
+      eventType === 'turn.failed' ? 'turn failed' : 'Execution failed'
+    )
+  )
+}
+
+/**
+ * A clear message when the model provider has no capacity left: a usage
+ * limit, or an account pool where every account is rate limited. The harness
+ * adds `centaur.providerExhausted` to such errors (harness-server failover.rs).
+ */
+function providerExhaustedMessage(event: any): string | null {
+  const exhausted = event?.centaur?.providerExhausted
+  if (!isRecord(exhausted)) return null
+  const resetAt =
+    typeof exhausted.resetAt === 'number' ? new Date(exhausted.resetAt * 1000) : null
+  const until =
+    resetAt && !Number.isNaN(resetAt.getTime())
+      ? ` until ${resetAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`
+      : ''
+  return (
+    `The model provider has no capacity left${until}: its usage limit is reached ` +
+    'or all its accounts are rate limited. Try again later, or continue with another harness.'
   )
 }
 

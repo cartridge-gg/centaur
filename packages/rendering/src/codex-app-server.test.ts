@@ -833,6 +833,58 @@ describe('isRetryableCodexErrorNotification', () => {
   })
 })
 
+describe('CodexAppServerRendererEventMapper provider exhaustion', () => {
+  const exhausted = {
+    resetAt: 1790220376,
+    signal: 'poolMarker',
+    detail: 'unexpected status 503: pool_exhausted'
+  }
+
+  it('explains a Codex error from an exhausted provider', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      method: 'error',
+      params: {
+        error: { message: 'unexpected status 503: pool_exhausted', codexErrorInfo: 'other' },
+        willRetry: false,
+        centaur: { providerExhausted: exhausted }
+      }
+    })
+    const done = events.find(event => event.type === 'renderer.done')
+    expect(done).toMatchObject({
+      type: 'renderer.done',
+      error: expect.stringContaining('no capacity left until 2026-09-24 03:26 UTC')
+    })
+  })
+
+  it('explains a failed Claude turn from an exhausted provider, without a reset time', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      method: 'turn/completed',
+      params: {
+        turn: { id: 't', status: 'failed', error: { message: 'API Error: 503 pool_exhausted' } },
+        centaur: { providerExhausted: { signal: 'usageLimit', detail: 'usage limit reached' } }
+      }
+    })
+    const done = events.find(event => event.type === 'renderer.done')
+    expect(done).toMatchObject({
+      type: 'renderer.done',
+      error: expect.stringMatching(/^The model provider has no capacity left: /)
+    })
+  })
+
+  it('keeps the upstream text for other failures', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      method: 'error',
+      params: { error: { message: 'model error' }, willRetry: false }
+    })
+    expect(events.find(event => event.type === 'renderer.done')).toMatchObject({
+      error: 'model error'
+    })
+  })
+})
+
 describe('CodexAppServerRendererEventMapper retryable errors', () => {
   it('does not fail the mapper on retryable Codex error notifications', () => {
     const mapper = new CodexAppServerRendererEventMapper()
