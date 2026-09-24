@@ -33,6 +33,7 @@ use crate::{
 };
 
 mod search;
+mod sessions;
 
 #[cfg(test)]
 pub(crate) static MCP_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -75,6 +76,8 @@ struct McpToolCallParams {
     name: String,
     #[serde(default)]
     arguments: Value,
+    #[serde(default, rename = "_meta")]
+    meta: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +167,25 @@ pub(crate) async fn mcp_post(
             if mcp_v2_tool_name(&params.name) && !mcp_v2_enabled() {
                 return Ok(mcp_json_error(id, -32602, "unknown tool"));
             }
+            // A send can wait for its turn and stream progress, so it answers
+            // with its own response instead of one tool result.
+            if params.name == sessions::SESSION_SEND_TOOL {
+                let progress_token = params
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("progressToken"))
+                    .filter(|token| token.is_string() || token.is_number())
+                    .cloned();
+                return sessions::session_send_call(
+                    &state,
+                    &principal,
+                    id,
+                    params.arguments,
+                    progress_token,
+                    accepts_event_stream(&headers),
+                )
+                .await;
+            }
             let tool = if mcp_builtin_tool_name(&params.name) {
                 None
             } else {
@@ -179,12 +201,34 @@ pub(crate) async fn mcp_post(
         _ => return Ok(mcp_json_error(id, -32601, "method not found")),
     };
 
-    Ok(Json(json!({
+    Ok(mcp_json_rpc_response(id, result))
+}
+
+fn mcp_json_rpc_response(id: Value, result: Value) -> Response {
+    Json(mcp_json_rpc_result(id, result)).into_response()
+}
+
+fn mcp_json_rpc_result(id: Value, result: Value) -> Value {
+    json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": result,
-    }))
-    .into_response())
+    })
+}
+
+/// Streamable HTTP clients list `text/event-stream` in `Accept` when they can
+/// read a streamed response to a POST.
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|media_type| {
+            media_type.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("text/event-stream")
+            })
+        })
 }
 
 async fn mcp_tool_call_result(
@@ -193,29 +237,7 @@ async fn mcp_tool_call_result(
     params: McpToolCallParams,
     tool: Option<(DiscoveredTool, ToolHostCallPolicy)>,
 ) -> Result<Value, ApiError> {
-    let thread_key = tool_host_thread_key(&principal.principal_id)?;
-    let span = info_span!(
-        parent: None,
-        "centaur.api_rs.mcp.tool",
-        component = "mcp",
-        event = "mcp_tool_call",
-        "lmnr.span.type" = "TOOL",
-        "lmnr.span.input" = tracing::field::Empty,
-        "lmnr.span.output" = tracing::field::Empty,
-        "lmnr.association.properties.session_id" = thread_key.as_str(),
-        "lmnr.association.properties.metadata.thread_key" = thread_key.as_str(),
-        "lmnr.association.properties.metadata.execution_id" = tracing::field::Empty,
-        "lmnr.association.properties.metadata.request_id" = tracing::field::Empty,
-        "otel.status_code" = tracing::field::Empty,
-        "centaur.thread_key" = thread_key.as_str(),
-        "centaur.execution_id" = tracing::field::Empty,
-        "centaur.sandbox_id" = tracing::field::Empty,
-        "tool.kind" = "centaur",
-        "centaur.tool.entry_point" = "mcp",
-        "tool.name" = params.name.as_str(),
-        "tool.method" = tracing::field::Empty,
-        "tool.status" = tracing::field::Empty,
-    );
+    let span = mcp_tool_span(principal, &params.name)?;
 
     async move {
         let outcome = if let Some((tool, policy)) = tool {
@@ -240,6 +262,9 @@ async fn mcp_tool_call_result(
                         timed_out: false,
                     }
                 }),
+                name if sessions::session_tool_name(name) => {
+                    sessions::session_tool_result(state, principal, name, params.arguments).await
+                }
                 _ => unreachable!("non-builtin MCP tools are resolved before dispatch"),
             }
         };
@@ -263,6 +288,32 @@ async fn mcp_tool_call_result(
     }
     .instrument(span)
     .await
+}
+
+fn mcp_tool_span(principal: &McpPrincipal, tool_name: &str) -> Result<Span, ApiError> {
+    let thread_key = tool_host_thread_key(&principal.principal_id)?;
+    Ok(info_span!(
+        parent: None,
+        "centaur.api_rs.mcp.tool",
+        component = "mcp",
+        event = "mcp_tool_call",
+        "lmnr.span.type" = "TOOL",
+        "lmnr.span.input" = tracing::field::Empty,
+        "lmnr.span.output" = tracing::field::Empty,
+        "lmnr.association.properties.session_id" = thread_key.as_str(),
+        "lmnr.association.properties.metadata.thread_key" = thread_key.as_str(),
+        "lmnr.association.properties.metadata.execution_id" = tracing::field::Empty,
+        "lmnr.association.properties.metadata.request_id" = tracing::field::Empty,
+        "otel.status_code" = tracing::field::Empty,
+        "centaur.thread_key" = thread_key.as_str(),
+        "centaur.execution_id" = tracing::field::Empty,
+        "centaur.sandbox_id" = tracing::field::Empty,
+        "tool.kind" = "centaur",
+        "centaur.tool.entry_point" = "mcp",
+        "tool.name" = tool_name,
+        "tool.method" = tracing::field::Empty,
+        "tool.status" = tracing::field::Empty,
+    ))
 }
 
 fn mcp_tool_trace_input(name: &str, method: &str) -> String {
@@ -382,6 +433,17 @@ fn mcp_initialize_result(params: &Value) -> Value {
             .to_owned(),
         );
     }
+    let sessions = concat!(
+        "To hand a multi-step task to a Centaur agent that works in its own sandbox, call ",
+        "`centaur_session_send`. It waits for the turn and returns `final_answer`; if `done` ",
+        "is false, call `centaur_session_read` until it is true. Continue the conversation ",
+        "by sending again with the same `session_id`."
+    );
+    let instructions = match result["instructions"].as_str() {
+        Some(existing) => format!("{existing} {sessions}"),
+        None => sessions.to_owned(),
+    };
+    result["instructions"] = Value::String(instructions);
     result
 }
 
@@ -391,6 +453,7 @@ fn mcp_builtin_tools() -> Vec<Value> {
         tools.extend(mcp_v2_tools());
         tools.push(mcp_artifact_get_tool());
     }
+    tools.extend(sessions::session_tools());
     tools.push(mcp_whoami_tool());
     tools
 }
@@ -414,7 +477,9 @@ fn mcp_v2_tool_name(name: &str) -> bool {
 }
 
 fn mcp_builtin_tool_name(name: &str) -> bool {
-    mcp_v2_tool_name(name) || matches!(name, "centaur_artifact_get" | "centaur_whoami")
+    mcp_v2_tool_name(name)
+        || sessions::session_tool_name(name)
+        || matches!(name, "centaur_artifact_get" | "centaur_whoami")
 }
 
 fn mcp_v2_tools() -> Vec<Value> {
@@ -1664,12 +1729,12 @@ mod mcp_tests {
 
     use super::MCP_ENV_LOCK as ENV_LOCK;
 
-    struct EnvGuard {
+    pub(crate) struct EnvGuard {
         saved: Vec<(&'static str, Option<String>)>,
     }
 
     impl EnvGuard {
-        fn set(vars: &[(&'static str, &'static str)]) -> Self {
+        pub(crate) fn set(vars: &[(&'static str, &'static str)]) -> Self {
             let saved = vars
                 .iter()
                 .map(|(name, _)| (*name, env::var(name).ok()))
@@ -1726,7 +1791,7 @@ mod mcp_tests {
         }
     }
 
-    fn test_jwt(secret: &str, claims: Value) -> String {
+    pub(crate) fn test_jwt(secret: &str, claims: Value) -> String {
         let header = general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&json!({"alg": "HS256", "typ": "JWT"})).unwrap());
         let payload = general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
@@ -1737,7 +1802,7 @@ mod mcp_tests {
         format!("{signing_input}.{signature}")
     }
 
-    fn mcp_auth_headers(token: &str) -> HeaderMap {
+    pub(crate) fn mcp_auth_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             "Authorization",
@@ -2217,28 +2282,41 @@ def search(query, limit=20):
                 .into_iter()
                 .map(|tool| tool["name"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>();
-            assert_eq!(
-                names,
-                if enabled {
-                    vec![
-                        "centaur_catalog_search",
-                        "centaur_catalog_load",
-                        "centaur_tool_call",
-                        "centaur_artifact_get",
-                        "centaur_whoami",
-                    ]
-                } else {
-                    vec!["centaur_whoami"]
-                }
-            );
+            let session_tools = [
+                "centaur_session_send",
+                "centaur_session_read",
+                "centaur_session_interrupt",
+                "centaur_session_list",
+            ];
+            let expected = if enabled {
+                [
+                    "centaur_catalog_search",
+                    "centaur_catalog_load",
+                    "centaur_tool_call",
+                    "centaur_artifact_get",
+                ]
+                .iter()
+                .chain(&session_tools)
+                .chain(&["centaur_whoami"])
+                .copied()
+                .collect::<Vec<_>>()
+            } else {
+                session_tools
+                    .iter()
+                    .chain(&["centaur_whoami"])
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(names, expected);
             let initialize = mcp_initialize_result(&json!({}));
+            let instructions = initialize["instructions"].as_str().unwrap();
+            assert!(instructions.contains("`centaur_session_send`"));
             if enabled {
-                let instructions = initialize["instructions"].as_str().unwrap();
                 assert!(instructions.contains("write it beneath `/tmp/downloads`"));
                 assert!(instructions.contains("`centaur_artifact_get`"));
                 assert!(instructions.contains("transient"));
             } else {
-                assert!(initialize.get("instructions").is_none());
+                assert!(!instructions.contains("/tmp/downloads"));
             }
 
             // Invalid arguments prove enabled requests reach the dispatcher
@@ -2280,6 +2358,104 @@ def search(query, limit=20):
     }
 
     #[test]
+    fn event_stream_support_comes_from_the_accept_header() {
+        let headers = |values: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(
+                    axum::http::header::ACCEPT,
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            headers
+        };
+        // Claude Code and Codex send these values.
+        assert!(accepts_event_stream(&headers(&[
+            "application/json, text/event-stream"
+        ])));
+        assert!(accepts_event_stream(&headers(&[
+            "text/event-stream, application/json"
+        ])));
+        assert!(accepts_event_stream(&headers(&[
+            "application/json",
+            "Text/Event-Stream;q=0.5"
+        ])));
+        assert!(!accepts_event_stream(&headers(&["application/json"])));
+        assert!(!accepts_event_stream(&headers(&[])));
+    }
+
+    #[test]
+    fn mcp_session_tools_are_always_listed_and_callable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("CENTAUR_JWT_SIGNING_SECRET", "test-secret"),
+            ("CENTAUR_MCP_PUBLIC_URL", "http://localhost:3000/mcp"),
+            ("CENTAUR_CONSOLE_PUBLIC_URL", "http://localhost:3001"),
+            ("CENTAUR_MCP_V2_ENABLED", "false"),
+        ]);
+        let names = mcp_builtin_tools()
+            .into_iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "centaur_session_send",
+                "centaur_session_read",
+                "centaur_session_interrupt",
+                "centaur_session_list",
+                "centaur_whoami",
+            ]
+        );
+        assert!(
+            mcp_initialize_result(&json!({}))["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("`centaur_session_send`")
+        );
+
+        // Invalid arguments prove the call reaches the session tools without
+        // requiring a runtime.
+        let state = AppState::unready(crate::auth::ApiAuthConfig::testing("test-secret"));
+        let token = test_jwt(
+            "test-secret",
+            json!({
+                "iss": "http://localhost:3001",
+                "aud": "http://localhost:3000/mcp",
+                "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                "principal_id": "prn_test",
+                "scope": "mcp:tools",
+            }),
+        );
+        let response = mcp_post(
+            State(state),
+            mcp_auth_headers(&token),
+            Json(McpJsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                id: Some(json!(1)),
+                method: "tools/call".to_owned(),
+                params: json!({"name": "centaur_session_send", "arguments": {}}),
+            }),
+        )
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(mcp_result_is_error(&body["result"]));
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("invalid arguments")
+        );
+    }
+
+    #[test]
     fn mcp_v2_hides_legacy_tools_from_discovery_but_keeps_them_callable() {
         let _lock = ENV_LOCK.lock().unwrap();
         let temp = temp_dir("centaur-api-rs-mcp-v2-legacy-tools");
@@ -2317,7 +2493,17 @@ def search(query, limit=20):
                 .into_iter()
                 .map(|tool| tool["name"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>();
-            assert_eq!(names, vec!["centaur_whoami", "demo"]);
+            assert_eq!(
+                names,
+                vec![
+                    "centaur_session_send",
+                    "centaur_session_read",
+                    "centaur_session_interrupt",
+                    "centaur_session_list",
+                    "centaur_whoami",
+                    "demo",
+                ]
+            );
         }
 
         let names = mcp_tool_entries(&filter)
@@ -2332,6 +2518,10 @@ def search(query, limit=20):
                 "centaur_catalog_load",
                 "centaur_tool_call",
                 "centaur_artifact_get",
+                "centaur_session_send",
+                "centaur_session_read",
+                "centaur_session_interrupt",
+                "centaur_session_list",
                 "centaur_whoami",
             ]
         );
