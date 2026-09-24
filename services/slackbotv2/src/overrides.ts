@@ -11,6 +11,9 @@ import { escapeRegExp } from './utils'
  *   --model <name> (or --model=<name>)           pick the model within that harness
  *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort (codex/nanocodex)
  *   --fable | --opus | --sonnet | --haiku        model shortcuts (imply claude-code)
+ *   --no-failover | --failover                   keep the thread on its harness when
+ *                                                the model provider has no capacity
+ *                                                left, or allow the switch (default)
  *
  * Flags are stripped from the text before it reaches the agent. The harness
  * applies at session creation — an explicit harness flag on a thread pinned to
@@ -47,6 +50,12 @@ export type MessageOverrides = HarnessOverrides & {
 export type PersonaOverride = {
   cleanedText: string
   personaId?: string
+}
+
+export type FailoverOverride = {
+  cleanedText: string
+  /** False: the thread stays on its harness when its model provider is exhausted. */
+  failover?: boolean
 }
 
 // Flag name -> HarnessType wire value (serde lowercase of the Rust enum).
@@ -233,6 +242,19 @@ export function extractPersonaOverride(text: string): PersonaOverride {
     cleanedText: stripMatch(text, match).trim(),
     personaId: match[1]!
   }
+}
+
+/**
+ * `--no-failover` keeps the thread on its harness when the model provider has
+ * no capacity left; `--failover` allows the switch again. The choice is sticky
+ * for the thread.
+ */
+export function extractFailoverOverride(text: string): FailoverOverride {
+  const off = flagPattern('no-failover').exec(text)
+  if (off) return { cleanedText: stripMatch(text, off).trim(), failover: false }
+  const on = flagPattern('failover').exec(text)
+  if (on) return { cleanedText: stripMatch(text, on).trim(), failover: true }
+  return { cleanedText: text }
 }
 
 export function validateStrategyOverrides(

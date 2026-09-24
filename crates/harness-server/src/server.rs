@@ -239,7 +239,46 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
 fn initial_blocks_thread_state<H: HarnessServer>(harness: &H) -> Result<ThreadState> {
     let cwd = env::current_dir()?;
     let params = ThreadStartParams::default();
-    Ok(harness.thread_state(&params, cwd))
+    let mut state = harness.thread_state(&params, cwd);
+    // Resume the session of an earlier process on the same state volume.
+    if let Some(file) = harness.persisted_session_file()
+        && let Some(id) = read_persisted_session_id(&file)
+    {
+        if harness.session_resumable(&id, &state.cwd) {
+            state.harness_session_id = Some(id);
+        } else {
+            eprintln!(
+                "harness-server: persisted session {id} has no transcript; starting a new session"
+            );
+            let _ = std::fs::remove_file(&file);
+        }
+    }
+    Ok(state)
+}
+
+fn read_persisted_session_id(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let id = contents.trim();
+    (!id.is_empty() && id.lines().count() == 1).then(|| id.to_owned())
+}
+
+/// Keeps the session id for the next process, when the harness persists it.
+fn persist_session_id<H: HarnessServer>(harness: &H, session_id: &str) {
+    let Some(file) = harness.persisted_session_file() else {
+        return;
+    };
+    let write = || -> std::io::Result<()> {
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&file, format!("{session_id}\n"))
+    };
+    if let Err(error) = write() {
+        eprintln!(
+            "harness-server: failed to persist session id to {}: {error}",
+            file.display()
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -303,6 +342,38 @@ pub(crate) enum BlocksCommand {
 pub(crate) struct BlocksState {
     uploads: HashMap<String, StagedAttachment>,
     staged: HashMap<String, StagedAttachment>,
+}
+
+impl BlocksState {
+    /// Points the `stagedAttachmentId` blocks of a user line at their staged
+    /// files, so that the line also works for a process without this state.
+    pub(crate) fn inline_staged_attachments(&self, line: &mut Value) {
+        for pointer in ["/message/content", "/content"] {
+            let Some(Value::Array(blocks)) = line.pointer_mut(pointer) else {
+                continue;
+            };
+            for block in blocks {
+                let Some(staged) = block
+                    .get("stagedAttachmentId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.staged.get(id))
+                    .cloned()
+                else {
+                    continue;
+                };
+                if block.get("localPath").is_some() || block.get("path").is_some() {
+                    continue;
+                }
+                block["localPath"] = json!(staged.path);
+                if let Some(mime_type) = staged.mime_type {
+                    block["mimeType"] = json!(mime_type);
+                }
+                if let Some(attachment_type) = staged.attachment_type {
+                    block["attachment_type"] = json!(attachment_type);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1352,6 +1423,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 for normalized in normalized_events {
                     telemetry.observe_normalized(&normalized);
                     if let Some(session_id) = normalized.session_id() {
+                        if state.harness_session_id.as_deref() != Some(session_id) {
+                            persist_session_id(harness, session_id);
+                        }
                         last_session_id = Some(session_id.to_string());
                         state.harness_session_id = Some(session_id.to_string());
                     }
@@ -1761,6 +1835,41 @@ mod tests {
         };
         assert!(text.starts_with("[Attached file saved to "));
         assert!(text.ends_with("clip.mp4]"));
+    }
+
+    #[test]
+    fn a_staged_attachment_works_without_the_staging_state() {
+        let _upload_dir = temp_upload_dir();
+        let mut state = BlocksState::default();
+        let chunk = r#"{"type":"attachment.chunk","attachmentId":"att-1","name":"clip.mp4","mimeType":"video/mp4","attachmentType":"video","chunkIndex":0,"final":true,"dataBase64":"aGVsbG8="}"#;
+        parse_blocks_line_with_state(chunk, &mut state).expect("chunk parses");
+
+        let mut user: Value = serde_json::from_str(r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"analyze this"},{"type":"attachment","stagedAttachmentId":"att-1","name":"clip.mp4"},{"type":"attachment","stagedAttachmentId":"att-2","name":"other.mp4"}]}}"#).unwrap();
+        state.inline_staged_attachments(&mut user);
+        let staged = &state.staged["att-1"];
+        assert_eq!(
+            user["message"]["content"][1]["localPath"],
+            json!(staged.path)
+        );
+        assert_eq!(user["message"]["content"][1]["mimeType"], "video/mp4");
+        assert_eq!(user["message"]["content"][1]["attachment_type"], "video");
+        // An attachment that was not staged stays as it is.
+        assert!(user["message"]["content"][2].get("localPath").is_none());
+
+        // Another process reads the file from its path.
+        let BlocksCommand::User { input, .. } =
+            parse_blocks_line_with_state(&user.to_string(), &mut BlocksState::default())
+                .expect("user parses")
+        else {
+            panic!("expected user command");
+        };
+        let UserInput::Text { text, .. } = &input[1] else {
+            panic!("expected the attachment as text");
+        };
+        assert_eq!(
+            text,
+            &format!("[Attached file saved to {}]", staged.path.display())
+        );
     }
 
     #[test]

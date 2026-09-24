@@ -11,6 +11,7 @@ on:
       - contrib/chart/**
       - services/**
       - crates/harness-server/**
+      - crates/session-transfer/**
       - harness/**
       - centaur_sdk/**
       - packages/**

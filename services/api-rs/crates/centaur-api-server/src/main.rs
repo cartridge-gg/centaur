@@ -104,6 +104,8 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     if let Some(config) = args.sandbox_keepalive_config()? {
         runtime = runtime.with_sandbox_keepalive(config);
     }
+    runtime = runtime.with_provider_failover(args.provider_failover_config()?);
+    runtime = runtime.with_provider_health_probe(args.provider_health_probe_config()?);
     runtime = runtime.with_sandbox_reaper(args.sandbox_reaper_config());
     runtime = runtime.with_sandbox_cleanup(args.sandbox_cleanup_config());
     if let Some(config) = args.session_event_retention_config() {

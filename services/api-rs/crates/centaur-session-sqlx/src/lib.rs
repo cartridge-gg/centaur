@@ -1899,6 +1899,113 @@ impl PgSessionStore {
         Ok(())
     }
 
+    /// Moves a session to the harness it failed over to. `harness_type`
+    /// changes only while it is still `from`, and `metadata.provider_failover`
+    /// gets `record`. The sandbox stays: the harness changed inside it.
+    /// Returns false when the session is not on `from`.
+    pub async fn fail_over_session_harness(
+        &self,
+        thread_key: &ThreadKey,
+        from: &HarnessType,
+        to: &HarnessType,
+        record: &Value,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update sessions
+            set harness_type = $3,
+                harness_thread_id = null,
+                metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{provider_failover}', $4::jsonb, true),
+                updated_at = now()
+            where thread_key = $1 and harness_type = $2
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(from.as_ref())
+        .bind(to.as_ref())
+        .bind(record)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Records that the model provider of `harness` has no capacity until
+    /// `until`. A later reset time already on record wins.
+    pub async fn mark_provider_exhausted(
+        &self,
+        harness: &HarnessType,
+        until: std::time::SystemTime,
+        detail: &str,
+    ) -> Result<(), SessionStoreError> {
+        sqlx::query(
+            r#"
+            insert into provider_health (harness, exhausted_until, last_signal_at, detail)
+            values ($1, $2, now(), $3)
+            on conflict (harness) do update
+            set exhausted_until = greatest(provider_health.exhausted_until, excluded.exhausted_until),
+                last_signal_at = now(),
+                detail = excluded.detail
+            "#,
+        )
+        .bind(harness.to_string())
+        .bind(OffsetDateTime::from(until))
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// When the model provider of `harness` accepts sessions again, if it is
+    /// exhausted now.
+    pub async fn provider_exhausted_until(
+        &self,
+        harness: &HarnessType,
+    ) -> Result<Option<std::time::SystemTime>, SessionStoreError> {
+        let until: Option<OffsetDateTime> = sqlx::query_scalar(
+            "select exhausted_until from provider_health where harness = $1 and exhausted_until > now()",
+        )
+        .bind(harness.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(until.map(std::time::SystemTime::from))
+    }
+
+    /// Ends an exhaustion of `harness` early, when the provider reports
+    /// capacity again. Returns false when it was not exhausted.
+    pub async fn clear_provider_exhausted(
+        &self,
+        harness: &HarnessType,
+        detail: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update provider_health
+            set exhausted_until = now(), last_signal_at = now(), detail = $2
+            where harness = $1 and exhausted_until > now()
+            "#,
+        )
+        .bind(harness.to_string())
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Every provider that is exhausted now, by harness, with its reset time.
+    pub async fn exhausted_providers(
+        &self,
+    ) -> Result<Vec<(String, std::time::SystemTime)>, SessionStoreError> {
+        let rows: Vec<(String, OffsetDateTime)> = sqlx::query_as(
+            "select harness, exhausted_until from provider_health where exhausted_until > now() order by harness",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(harness, until)| (harness, until.into()))
+            .collect())
+    }
+
     pub async fn update_harness_thread_id(
         &self,
         thread_key: &ThreadKey,

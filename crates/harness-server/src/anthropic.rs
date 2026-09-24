@@ -21,6 +21,11 @@ pub enum AnthropicStreamEvent {
         message: AnthropicMessage,
         #[serde(default)]
         parent_tool_use_id: Option<String>,
+        /// Claude Code reports a failed API request as an assistant message
+        /// with the error text. The `result` that follows carries the same
+        /// error.
+        #[serde(default)]
+        is_api_error_message: bool,
     },
     User {
         message: AnthropicMessage,
@@ -244,6 +249,11 @@ impl AnthropicEventNormalizer {
                     NormalizedEvent::Ignored
                 }
             }
+            // Not an answer: the failed `result` ends the turn with this error.
+            AnthropicStreamEvent::Assistant {
+                is_api_error_message: true,
+                ..
+            } => NormalizedEvent::Ignored,
             AnthropicStreamEvent::Assistant {
                 is_partial,
                 message,
@@ -608,5 +618,21 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, Some(13));
         assert_eq!(usage.output_tokens, Some(17));
         assert_eq!(usage.total_tokens, Some(41));
+    }
+
+    #[test]
+    fn a_failed_api_request_is_not_an_answer() {
+        // Recorded from Claude Code 2.1.281: a 503 from the model API.
+        let recorded = include_str!("../tests/fixtures/failover/claude-stream.jsonl");
+        let mut normalizer = AnthropicEventNormalizer::default();
+        let events: Vec<NormalizedEvent> = recorded
+            .lines()
+            .map(|line| normalizer.normalize(AnthropicStreamEvent::parse_json_line(line).unwrap()))
+            .collect();
+        assert!(matches!(events[0], NormalizedEvent::Ignored));
+        let NormalizedEvent::Result { error: Some(error) } = &events[1] else {
+            panic!("the result fails the turn: {:?}", events[1]);
+        };
+        assert!(error.starts_with("API Error: 503"), "{error}");
     }
 }

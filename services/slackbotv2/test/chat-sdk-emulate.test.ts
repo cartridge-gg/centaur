@@ -974,6 +974,77 @@ describe('slackbotv2', () => {
     expect(state).toEqual(expect.objectContaining({ personaId: 'old' }))
   })
 
+  it('follows a session that moved to another harness in a provider failover', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    const parent = await postUserMessage('Thread default context.')
+    const runMention = async (eventId: string, text: string) => {
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> ${text}`, parent.ts)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: eventId,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parent.ts,
+            text: `<@${BOT_USER_ID}> ${text}`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+    }
+
+    await runMention('Ev-slackbotv2-failover-first', '--codex --model gpt-5.5 --no-failover first pass')
+    // The Codex provider ran out of capacity, and the session moved to Claude
+    // Code. api-rs keeps it there for the sticky --codex request.
+    codexApi.queueCreateResponse({
+      harness_switched: false,
+      harness_type: 'claudecode',
+      provider_failover: { from: 'codex', to: 'claudecode', mode: 'reactive' }
+    })
+    await runMention('Ev-slackbotv2-failover-second', '--failover continue')
+    await runMention('Ev-slackbotv2-failover-third', 'and again')
+
+    expect(codexApi.creates.map(create => create.body.harness_type)).toEqual([
+      'codex',
+      'codex',
+      'claudecode'
+    ])
+    expect(codexApi.creates[0]!.body.harness_explicit).toBe(true)
+    expect(codexApi.creates[1]!.body.harness_explicit).toBeUndefined()
+    // The Codex model never reaches Claude Code.
+    const models = codexApi.executes.map(
+      execute => (JSON.parse(execute.body.input_lines.at(-1)!) as Record<string, unknown>).model
+    )
+    expect(models).toEqual(['gpt-5.5', undefined, undefined])
+    expect(
+      codexApi.executes.map(
+        execute => (execute.body.metadata as Record<string, unknown>).provider_failover
+      )
+    ).toEqual([false, undefined, undefined])
+    expect(JSON.stringify(codexApi.executes[0]!.body)).not.toContain('--no-failover')
+    const state = await sharedState.get<Record<string, unknown>>(
+      `thread-state:${threadKey(parent.ts)}`
+    )
+    expect(state).toEqual(
+      expect.objectContaining({
+        harnessType: 'claudecode',
+        model: null,
+        provider: null,
+        providerFailover: true
+      })
+    )
+  })
+
   it('reports a fallback for a stale sticky persona on a plain message', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()

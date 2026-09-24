@@ -1721,6 +1721,7 @@ version = "0.1.0"
 dependencies = [
  "allocative",
  "base64 0.23.1",
+ "chrono",
  "clap",
  "codex-app-server-protocol",
  "codex-protocol",
@@ -1730,8 +1731,10 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "regex",
  "serde",
  "serde_json",
+ "session-transfer",
  "shell-words",
  "thiserror 2.0.20",
  "tokio",
@@ -4613,6 +4616,19 @@ dependencies = [
  "cfg-if",
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "session-transfer"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "regex",
+ "ryu",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]

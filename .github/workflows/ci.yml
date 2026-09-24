@@ -19,6 +19,7 @@ jobs:
     outputs:
       migration_order: ${{ steps.filter.outputs.migration_order }}
       harness_server_checks: ${{ steps.filter.outputs.harness_server_checks }}
+      session_transfer_checks: ${{ steps.filter.outputs.session_transfer_checks }}
       rust_api: ${{ steps.filter.outputs.rust_api }}
       sandbox_e2e: ${{ steps.filter.outputs.sandbox_e2e }}
       sandbox_tests: ${{ steps.filter.outputs.sandbox_tests }}
@@ -74,6 +75,10 @@ jobs:
             '^\.github/workflows/ci\.yml$'
           set_output harness_server_checks \
             '^crates/harness-server/' \
+            '^crates/session-transfer/' \
+            '^\.github/workflows/ci\.yml$'
+          set_output session_transfer_checks \
+            '^crates/session-transfer/' \
             '^\.github/workflows/ci\.yml$'
           set_output rust_api \
             '^services/api-rs/' \
@@ -166,6 +171,37 @@ jobs:
 
       - name: Test
         working-directory: crates/harness-server
+        run: cargo test --locked
+
+  session-transfer-checks:
+    name: Session transfer fmt, clippy, and tests
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    needs: ci_changes
+    if: needs.ci_changes.outputs.session_transfer_checks == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: crates/session-transfer
+
+      - name: Format
+        working-directory: crates/session-transfer
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        working-directory: crates/session-transfer
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: crates/session-transfer
         run: cargo test --locked
 
   rust-api:
@@ -582,6 +618,7 @@ jobs:
       - ci_changes
       - migration-order
       - harness-server-checks
+      - session-transfer-checks
       - rust-api
       - sandbox-e2e
       - sandbox-tests
@@ -596,5 +633,5 @@ jobs:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
         with:
-          allowed-skips: migration-order, harness-server-checks, rust-api, sandbox-e2e, sandbox-tests, workflow-python-tests, tool-tests, slackbotv2-tests, discordbot-checks, githubbot-checks, teamsbot-checks
+          allowed-skips: migration-order, harness-server-checks, session-transfer-checks, rust-api, sandbox-e2e, sandbox-tests, workflow-python-tests, tool-tests, slackbotv2-tests, discordbot-checks, githubbot-checks, teamsbot-checks
           jobs: ${{ toJSON(needs) }}
