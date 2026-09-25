@@ -349,32 +349,60 @@ pub fn record_session_first_token_latency(harness: &str, duration: Duration) {
     .record(duration.as_secs_f64());
 }
 
-pub fn record_session_failure(harness: &str, failure_class: &str) {
+fn session_failures(harness: &str, failure_class: &str) -> metrics::Counter {
     metrics::counter!(
         SESSION_FAILURES_TOTAL,
         "failure_class" => normalize_label(failure_class),
         "harness" => normalize_label(harness),
     )
-    .increment(1);
 }
 
-pub fn record_session_provider_failover(from: &str, to: &str, mode: &str) {
+pub fn record_session_failure(harness: &str, failure_class: &str) {
+    session_failures(harness, failure_class).increment(1);
+}
+
+/// Creates the series at 0. Use it for a rare failure class: `increase()`
+/// cannot see the first increment of a series that starts at 1, and each
+/// process start begins new series.
+pub fn init_session_failure(harness: &str, failure_class: &str) {
+    session_failures(harness, failure_class).increment(0);
+}
+
+fn session_provider_failovers(from: &str, to: &str, mode: &str) -> metrics::Counter {
     metrics::counter!(
         SESSION_PROVIDER_FAILOVERS_TOTAL,
         "from" => normalize_label(from),
         "to" => normalize_label(to),
         "mode" => normalize_label(mode),
     )
-    .increment(1);
 }
 
-pub fn record_provider_health_probe(harness: &str, result: &'static str) {
+pub fn record_session_provider_failover(from: &str, to: &str, mode: &str) {
+    session_provider_failovers(from, to, mode).increment(1);
+}
+
+/// Creates the series at 0, so that `increase()` sees the first switch after
+/// a process start (see [`init_session_failure`]).
+pub fn init_session_provider_failover(from: &str, to: &str, mode: &str) {
+    session_provider_failovers(from, to, mode).increment(0);
+}
+
+fn provider_health_probes(harness: &str, result: &'static str) -> metrics::Counter {
     metrics::counter!(
         PROVIDER_HEALTH_PROBES_TOTAL,
         "harness" => normalize_label(harness),
         "result" => result,
     )
-    .increment(1);
+}
+
+pub fn record_provider_health_probe(harness: &str, result: &'static str) {
+    provider_health_probes(harness, result).increment(1);
+}
+
+/// Creates the series at 0, so that `increase()` sees the first check with
+/// this result (see [`init_session_failure`]).
+pub fn init_provider_health_probe(harness: &str, result: &'static str) {
+    provider_health_probes(harness, result).increment(0);
 }
 
 pub fn record_sandbox_operation(backend: &str, operation: &'static str, status: &'static str) {
@@ -1084,6 +1112,32 @@ mod tests {
         assert!(metrics.contains(r#"centaur_sandbox_warm_pool_claims_total{result="hit"}"#));
         assert!(metrics.contains(
             r#"workflow_runs_total{queue="centaur_workflows",workflow_name="example",status="failed"} 1"#
+        ));
+    }
+
+    #[test]
+    fn prometheus_metrics_render_initialized_failover_series_at_zero() {
+        prometheus_handle().unwrap();
+        init_session_provider_failover("claudecode", "codex", "revert");
+        init_session_failure("claudecode", "provider_exhausted");
+        init_provider_health_probe("claudecode", "exhausted");
+
+        let metrics = render_metrics().unwrap();
+
+        assert!(metrics.contains(
+            r#"centaur_session_provider_failovers_total{from="claudecode",to="codex",mode="revert"} 0"#
+        ));
+        assert!(metrics.contains(
+            r#"centaur_session_failures_total{failure_class="provider_exhausted",harness="claudecode"} 0"#
+        ));
+        assert!(metrics.contains(
+            r#"centaur_provider_health_probes_total{harness="claudecode",result="exhausted"} 0"#
+        ));
+
+        // A later increment counts from 0.
+        record_session_provider_failover("claudecode", "codex", "revert");
+        assert!(render_metrics().unwrap().contains(
+            r#"centaur_session_provider_failovers_total{from="claudecode",to="codex",mode="revert"} 1"#
         ));
     }
 

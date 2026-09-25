@@ -1123,6 +1123,7 @@ impl SessionRuntime {
     }
 
     pub fn with_provider_failover(mut self, config: ProviderFailoverConfig) -> Self {
+        provider_failover::init_metrics(config.enabled);
         self.provider_failover = config;
         self
     }
