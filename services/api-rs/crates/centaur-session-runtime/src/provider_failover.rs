@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use centaur_session_core::{HarnessType, ThreadKey};
+use centaur_telemetry::{init_session_failure, init_session_provider_failover};
 use serde_json::{Map, Value, json};
 
 /// The line that a sandbox prints after it moved the session.
@@ -45,6 +46,27 @@ impl ProviderFailoverConfig {
 
     pub(crate) fn model_for(&self, harness: &HarnessType) -> Option<&str> {
         self.models.get(harness).map(String::as_str)
+    }
+}
+
+/// Every `mode` of a switch: a turn hit an exhausted provider (`reactive`),
+/// the provider was known to be exhausted before the turn (`proactive`), the
+/// user asked for the harness (`requested`), or the sandbox could not use the
+/// converted session and went back (`revert`).
+pub(crate) const FAILOVER_MODES: [&str; 4] = ["reactive", "proactive", "requested", "revert"];
+
+/// Creates the metrics of switches and of turns that failed on an exhausted
+/// provider at 0. These events are rare, and `increase()` cannot see the first
+/// increment of a series that starts at 1; each process start begins new
+/// series.
+pub(crate) fn init_metrics(failover_enabled: bool) {
+    for harness in [HarnessType::Codex, HarnessType::ClaudeCode] {
+        init_session_failure(harness.as_ref(), crate::PROVIDER_EXHAUSTED_FAILURE_CLASS);
+        if let Some(other) = failover_target(&harness).filter(|_| failover_enabled) {
+            for mode in FAILOVER_MODES {
+                init_session_provider_failover(harness.as_ref(), other.as_ref(), mode);
+            }
+        }
     }
 }
 
@@ -362,5 +384,26 @@ mod tests {
             &HarnessType::Codex,
             "claudecode"
         ));
+    }
+
+    #[test]
+    fn switch_and_exhausted_failure_metrics_start_at_zero() {
+        centaur_telemetry::prometheus_handle().unwrap();
+        init_metrics(true);
+        let metrics = centaur_telemetry::render_metrics().unwrap();
+        for (from, to) in [("codex", "claudecode"), ("claudecode", "codex")] {
+            for mode in FAILOVER_MODES {
+                let series = format!(
+                    r#"centaur_session_provider_failovers_total{{from="{from}",to="{to}",mode="{mode}"}} "#
+                );
+                assert!(metrics.contains(&series), "{series}");
+            }
+        }
+        for harness in ["codex", "claudecode"] {
+            let series = format!(
+                r#"centaur_session_failures_total{{failure_class="provider_exhausted",harness="{harness}"}} "#
+            );
+            assert!(metrics.contains(&series), "{series}");
+        }
     }
 }

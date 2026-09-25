@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use centaur_session_core::HarnessType;
 use centaur_session_sqlx::PgSessionStore;
-use centaur_telemetry::record_provider_health_probe;
+use centaur_telemetry::{init_provider_health_probe, record_provider_health_probe};
 use serde::Deserialize;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
@@ -22,6 +22,10 @@ use tracing::{debug, info, warn};
 use crate::PROVIDER_EXHAUSTED_DEFAULT_COOLDOWN;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// The `result` label of each check.
+const HEALTHY: &str = "healthy";
+const EXHAUSTED: &str = "exhausted";
+const ERROR: &str = "error";
 
 #[derive(Clone, Debug)]
 pub struct ProviderHealthProbeConfig {
@@ -40,6 +44,16 @@ pub(crate) struct HealthReport {
     pub reset_at: Option<i64>,
 }
 
+/// Creates the check metric of each checked harness at 0 for every result, so
+/// that `increase()` sees the first exhausted or failed check after a start.
+fn init_metrics(endpoints: &[(HarnessType, String)]) {
+    for (harness, _) in endpoints {
+        for result in [HEALTHY, EXHAUSTED, ERROR] {
+            init_provider_health_probe(harness.as_ref(), result);
+        }
+    }
+}
+
 pub(crate) struct ProviderHealthProbe {
     store: PgSessionStore,
     client: reqwest::Client,
@@ -51,6 +65,7 @@ pub(crate) struct ProviderHealthProbe {
 
 impl ProviderHealthProbe {
     pub(crate) fn new(store: PgSessionStore, config: ProviderHealthProbeConfig) -> Self {
+        init_metrics(&config.endpoints);
         Self {
             store,
             client: reqwest::Client::new(),
@@ -77,9 +92,9 @@ impl ProviderHealthProbe {
                 Err(error) => Err(error),
             };
             let label = match &result {
-                Ok(true) => "exhausted",
-                Ok(false) => "healthy",
-                Err(_) => "error",
+                Ok(true) => EXHAUSTED,
+                Ok(false) => HEALTHY,
+                Err(_) => ERROR,
             };
             record_provider_health_probe(harness.as_ref(), label);
             let mut failing = self
@@ -195,6 +210,22 @@ mod tests {
                 report_until(reset, now),
                 now + PROVIDER_EXHAUSTED_DEFAULT_COOLDOWN
             );
+        }
+    }
+
+    #[test]
+    fn check_metrics_start_at_zero_for_each_checked_harness() {
+        centaur_telemetry::prometheus_handle().unwrap();
+        init_metrics(&[(
+            HarnessType::ClaudeCode,
+            "http://pool.test/claude".to_owned(),
+        )]);
+        let metrics = centaur_telemetry::render_metrics().unwrap();
+        for result in [HEALTHY, EXHAUSTED, ERROR] {
+            let series = format!(
+                r#"centaur_provider_health_probes_total{{harness="claudecode",result="{result}"}} "#
+            );
+            assert!(metrics.contains(&series), "{series}");
         }
     }
 }
