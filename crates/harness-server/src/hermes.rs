@@ -1079,6 +1079,41 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_trimmed_final_text_is_not_sent_again() {
+        // Hermes streams the reply with leading newlines and completes it
+        // with the trimmed text.
+        let mut normalizer = crate::turn::CodexTurnNormalizer::new(crate::turn::BridgeConfig::new(
+            "T-local", "turn-1",
+        ));
+        let mut deltas = Vec::new();
+        let mut completed = Vec::new();
+        for frame in [
+            frame("message.delta", json!({"text": "\n\nwhich pr"})),
+            frame("message.delta", json!({"text": " did you mean?"})),
+            frame(
+                "message.complete",
+                json!({"text": "which pr did you mean?"}),
+            ),
+        ] {
+            for event in normalize_hermes_frame("1", &frame) {
+                for notification in normalizer.process_event(&event).unwrap() {
+                    let rpc = crate::wire::notification_to_jsonrpc(&notification).unwrap();
+                    let params = rpc.params.unwrap_or_default();
+                    match rpc.method.as_str() {
+                        "item/agentMessage/delta" => deltas.push(params["delta"].clone()),
+                        "item/completed" if params["item"]["type"] == "agentMessage" => {
+                            completed.push(params["item"]["text"].clone())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert_eq!(deltas, [json!("\n\nwhich pr"), json!(" did you mean?")]);
+        assert_eq!(completed, [json!("which pr did you mean?")]);
+    }
+
+    #[test]
     fn a_clarify_question_is_answered_at_once() {
         let mut child = fake_gateway(BLOCKING_GATEWAY);
         let (_tx, rx) = std::sync::mpsc::channel();

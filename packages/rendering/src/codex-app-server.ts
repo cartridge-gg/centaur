@@ -516,7 +516,12 @@ export class CodexAppServerRendererEventMapper
       const delta = extractDeltaText(event)
       if (!delta) return { bufferChanged: false }
       const byId = buffer === 'answer' ? this.state.answerByItemId : this.state.commentaryByItemId
-      byId.set(itemId, (byId.get(itemId) ?? '') + delta)
+      const current = byId.get(itemId) ?? ''
+      // A harness can resend the whole text as one delta: harness-server did
+      // when its final text differed from the streamed text only by leading
+      // whitespace. Appending it would show the text twice.
+      if (current.trim() && delta.trim() === current.trim()) return { bufferChanged: false }
+      byId.set(itemId, current + delta)
       recomposeBuffers(this.state)
       return { bufferChanged: true }
     }

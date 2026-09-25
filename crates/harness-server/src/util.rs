@@ -81,10 +81,16 @@ pub(crate) fn default_codex_home() -> PathBuf {
         .join(".codex")
 }
 
+/// The part of `current` that a client that already has `previous` still
+/// needs. A final text can drop the leading whitespace of the streamed text
+/// (Hermes trims its final message). When `current` does not continue
+/// `previous`, the delta is empty: resending all of `current` would show the
+/// text twice, and the completed item carries the full text anyway.
 pub(crate) fn suffix_delta(previous: &str, current: &str) -> String {
     current
         .strip_prefix(previous)
-        .unwrap_or(current)
+        .or_else(|| current.strip_prefix(previous.trim_start()))
+        .unwrap_or_default()
         .to_string()
 }
 
@@ -109,4 +115,27 @@ pub(crate) fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::suffix_delta;
+
+    #[test]
+    fn a_delta_is_only_the_new_part_of_the_text() {
+        assert_eq!(suffix_delta("", "hello"), "hello");
+        assert_eq!(suffix_delta("hel", "hello"), "lo");
+        assert_eq!(suffix_delta("hello", "hello"), "");
+        // Only whitespace was streamed: all of the text is new.
+        assert_eq!(suffix_delta("\n\n", "hello"), "hello");
+    }
+
+    #[test]
+    fn a_trimmed_or_changed_text_is_not_sent_again() {
+        // Hermes streams "\n\nhello" and completes with "hello".
+        assert_eq!(suffix_delta("\n\nhello", "hello"), "");
+        assert_eq!(suffix_delta("\n\nhel", "hello"), "lo");
+        assert_eq!(suffix_delta("hello\n", "hello"), "");
+        assert_eq!(suffix_delta("hello", "goodbye"), "");
+    }
 }
