@@ -32,6 +32,12 @@ inside a Centaur sandbox:
 - **Interrupts** — Centaur's interrupt maps to Hermes's
   `session.interrupt`, ending the turn as Interrupted without killing the
   gateway, so the session survives for the next message.
+- **Questions to the user** — a Centaur thread cannot show Hermes's
+  interactive prompts, so the harness answers them at once. The `clarify`
+  tool gets an answer that tells the agent to put the question and its
+  choices in its reply; the user answers in the thread. `sudo`, `secret`,
+  and the desktop read tools get an empty answer, as on their own timeout.
+  Without these answers, a `clarify` question held the turn for an hour.
 
 ## Configuration
 

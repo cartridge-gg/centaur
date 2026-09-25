@@ -16,6 +16,11 @@
 //! - `turn.usage`                          → TokenUsage
 //! - `message.complete`                    → AssistantMessage(final) + Result
 //!
+//! Tools that wait for a person (`clarify`, `sudo`, `secret` and the desktop
+//! read tools) get an answer at once: nobody can answer them in a Centaur
+//! session, and each would hold the turn until its own timeout (an hour for
+//! `clarify`). See [`blocking_request_reply`].
+//!
 //! Because the gateway (not this process) owns the agent loop, Hermes's
 //! session history, prompt cache, learning loop, and cron jobs all survive
 //! across turns. `HERMES_CONTINUE_SESSION_ID` resumes the durable session
@@ -51,6 +56,13 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(180);
 /// `message.complete` before we stop draining and move on.
 const INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CRON_TICK_SECONDS: u64 = 60;
+/// The answer to Hermes's `clarify` tool. A Centaur session runs in a chat
+/// thread, which cannot show an interactive question, so the model asks in
+/// its reply instead.
+const CLARIFY_ANSWER: &str = "Nobody can answer this prompt: this session runs in a chat thread, \
+which cannot show interactive questions. Do not wait for an answer, and do not call clarify \
+again in this turn. End the turn with the question and its choices in your reply. The user \
+answers in the thread.";
 
 /// Entry point for `harness-server hermes`.
 pub fn run_hermes_blocks_server() -> Result<()> {
@@ -593,6 +605,35 @@ fn normalize_hermes_frame(turn: &str, frame: &Value) -> Vec<NormalizedEvent> {
     }
 }
 
+/// The reply to a Hermes tool that blocks until a person answers it:
+/// `(method, params)` for the gateway, or `None` for other frames.
+///
+/// The gateway emits `<kind>.request` with a `request_id` and waits for
+/// `<kind>.respond`. Nobody can answer in a Centaur session, so `clarify` gets
+/// [`CLARIFY_ANSWER`], and the others get the empty answer that their own
+/// timeout would give (`sudo` and `secret` fail, the read tools return
+/// nothing). Approvals are off (`HERMES_APPROVAL_MODE`).
+fn blocking_request_reply(frame: &Value) -> Option<(&'static str, Value)> {
+    let kind = event_type(frame)?;
+    let (method, key, answer) = match kind.as_str() {
+        "clarify.request" => ("clarify.respond", "answer", CLARIFY_ANSWER),
+        "sudo.request" => ("sudo.respond", "password", ""),
+        "secret.request" => ("secret.respond", "value", ""),
+        "terminal.read.request" => ("terminal.read.respond", "text", ""),
+        "preview.read.request" => ("preview.read.respond", "text", ""),
+        "window.read.request" => ("window.read.respond", "text", ""),
+        _ => return None,
+    };
+    let request_id = frame.pointer("/params/payload/request_id")?.as_str()?;
+    let mut params = serde_json::Map::new();
+    params.insert("request_id".to_owned(), json!(request_id));
+    if let Some(session_id) = frame.pointer("/params/session_id") {
+        params.insert("session_id".to_owned(), session_id.clone());
+    }
+    params.insert(key.to_owned(), json!(answer));
+    Some((method, Value::Object(params)))
+}
+
 fn nonempty_or(value: &str, fallback: &str) -> String {
     if value.is_empty() { fallback } else { value }.to_string()
 }
@@ -715,6 +756,16 @@ fn run_hermes_turn<W: Write>(
                 {
                     continue;
                 }
+                if let Some((method, params)) = blocking_request_reply(&frame) {
+                    eprintln!(
+                        "harness-server: Hermes waits for a person ({}); answering at once",
+                        event_type(&frame).unwrap_or_default()
+                    );
+                    // The gateway's reply to this request has an id and no
+                    // session, so the loop skips it.
+                    child.send_request(method, params)?;
+                    continue;
+                }
                 let mut terminal = false;
                 for event in normalize_hermes_frame(&turn_id, &frame) {
                     terminal |= event.is_terminal();
@@ -759,6 +810,7 @@ fn user_input_text(input: &[UserInput]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use codex_app_server_protocol::UserInput;
     use serde_json::json;
 
     use crate::traits::{NormalizedContent, NormalizedEvent};
@@ -987,6 +1039,104 @@ for line in sys.stdin:
     elif method=='image.attach':
         send({'id':req['id'],'error':{'message':'missing image'}})
 "#;
+
+    /// A gateway whose model calls a tool that waits for a person. The turn
+    /// ends when the answer arrives, and its text is the answer. Without an
+    /// answer, it ends after 5 seconds with the text `NO ANSWER`.
+    const BLOCKING_GATEWAY: &str = r#"
+import json,sys,threading
+
+lock=threading.Lock()
+def send(value):
+    with lock: print(json.dumps(value), flush=True)
+def event(kind, payload, session='live'):
+    send({'method':'event','params':{'type':kind,'session_id':session,'payload':payload}})
+kind=None
+timer=None
+for line in sys.stdin:
+    req=json.loads(line)
+    method=req['method']
+    if method=='prompt.submit':
+        kind=req['params']['text']
+        send({'id':req['id'],'result':{'accepted':True}})
+        event(kind+'.request', {'question':'Which one?','choices':['a','b'],'request_id':'r1'})
+        timer=threading.Timer(5, lambda: event('message.complete', {'text':'NO ANSWER'}))
+        timer.start()
+    elif method==kind+'.respond':
+        timer.cancel()
+        send({'id':req['id'],'result':{'status':'ok'}})
+        event('message.complete', {'text':json.dumps(req['params'], sort_keys=True)})
+"#;
+
+    fn final_text(output: &[u8]) -> String {
+        String::from_utf8_lossy(output)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["method"] == "item/completed")
+            .filter_map(|value| value["params"]["item"]["text"].as_str().map(str::to_owned))
+            .next_back()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_clarify_question_is_answered_at_once() {
+        let mut child = fake_gateway(BLOCKING_GATEWAY);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        let input = vec![UserInput::Text {
+            text: "clarify".into(),
+            text_elements: Vec::new(),
+        }];
+        super::run_hermes_turn(&mut child, &mut output, input, None, None, 1, &rx).unwrap();
+
+        let reply: serde_json::Value = serde_json::from_str(&final_text(&output)).unwrap();
+        assert_eq!(reply["request_id"], "r1");
+        assert_eq!(reply["session_id"], "live");
+        let answer = reply["answer"].as_str().unwrap();
+        assert!(
+            answer.starts_with("Nobody can answer this prompt"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains("question and its choices in your reply"),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn prompts_for_a_password_or_secret_get_an_empty_answer() {
+        for (kind, key) in [
+            ("sudo", "password"),
+            ("secret", "value"),
+            ("terminal.read", "text"),
+        ] {
+            let mut child = fake_gateway(BLOCKING_GATEWAY);
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let mut output = Vec::new();
+            let input = vec![UserInput::Text {
+                text: kind.into(),
+                text_elements: Vec::new(),
+            }];
+            super::run_hermes_turn(&mut child, &mut output, input, None, None, 1, &rx).unwrap();
+
+            let reply: serde_json::Value = serde_json::from_str(&final_text(&output)).unwrap();
+            assert_eq!(reply["request_id"], "r1", "{kind}");
+            assert_eq!(reply[key], "", "{kind}");
+        }
+    }
+
+    #[test]
+    fn other_frames_need_no_reply() {
+        assert!(
+            super::blocking_request_reply(&frame("message.delta", json!({"text": "hi"}))).is_none()
+        );
+        assert!(
+            super::blocking_request_reply(&frame("approval.request", json!({"request_id": "r1"})))
+                .is_none()
+        );
+        // A request without an id cannot be answered.
+        assert!(super::blocking_request_reply(&frame("clarify.request", json!({}))).is_none());
+    }
 
     #[test]
     fn durable_key_is_persisted_and_compaction_updates_it() {
