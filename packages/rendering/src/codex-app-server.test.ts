@@ -1053,3 +1053,153 @@ describe('CodexAppServerRendererEventMapper retryable errors', () => {
     })
   })
 })
+
+describe('CodexAppServerRendererEventMapper dynamic tool calls', () => {
+  // harness-server sends every tool call of Hermes, and every Claude Code
+  // tool other than Bash, as a dynamicToolCall item.
+  const toolItem = (id: string, tool: string, args: Record<string, unknown>, extra = {}) => ({
+    id,
+    type: 'dynamicToolCall',
+    tool,
+    arguments: args,
+    status: 'inProgress',
+    ...extra
+  })
+  const started = (item: unknown) => ({
+    method: 'item/started',
+    params: { threadId: 'thread-1', turnId: 'turn-1', item }
+  })
+  const completed = (item: unknown) => ({
+    method: 'item/completed',
+    params: { threadId: 'thread-1', turnId: 'turn-1', item }
+  })
+  const taskUpdates = (chunks: any[], id: string) =>
+    chunks.filter(chunk => chunk.type === 'task_update' && chunk.id === id)
+
+  it('shows a Hermes terminal call as a numbered command, with its output', async () => {
+    const terminal = toolItem('call-1', 'terminal', { command: 'git status --short' })
+    const result = JSON.stringify({ output: ' M README.md\n', exit_code: 0, error: null })
+    const chunks = await collect(
+      codexAppServerToChatSdkStream(
+        toAsyncIterable([
+          started({ id: 'cmd-1', type: 'commandExecution', command: 'pnpm test' }),
+          started(terminal),
+          completed({
+            ...terminal,
+            status: 'completed',
+            success: true,
+            contentItems: [{ type: 'inputText', text: result }]
+          })
+        ]),
+        { taskOutput: 'full' }
+      )
+    )
+
+    const updates = taskUpdates(chunks, 'call-1')
+    // Commands of both kinds share one count.
+    expect(updates[0]).toMatchObject({
+      title: '2. Command execution',
+      status: 'in_progress',
+      details: '```sh\ngit status --short\n```'
+    })
+    expect(updates.map(update => update.output).filter(Boolean).join('')).toContain('M README.md')
+    expect(updates.at(-1)).toMatchObject({ status: 'complete' })
+  })
+
+  it('shows the exit code of a failed Hermes terminal call', async () => {
+    const terminal = toolItem('call-1', 'terminal', { command: 'false' })
+    const result = JSON.stringify({ output: '', exit_code: 1, error: 'command failed' })
+    const chunks = await collect(
+      codexAppServerToChatSdkStream(
+        toAsyncIterable([
+          completed({
+            ...terminal,
+            status: 'failed',
+            success: false,
+            contentItems: [{ type: 'inputText', text: result }]
+          })
+        ]),
+        { taskOutput: 'full' }
+      )
+    )
+
+    const output = taskUpdates(chunks, 'call-1')
+      .map(update => update.output)
+      .filter(Boolean)
+      .join('')
+    expect(output).toContain('exit code 1')
+    expect(output).toContain('command failed')
+  })
+
+  it('shows a clarify question with its choices', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process(
+      started(
+        toolItem('call-2', 'clarify', {
+          question: 'How should I reconcile #476 and #480?',
+          choices: ['Close #480', 'Rebase #480 on #476']
+        })
+      )
+    )
+    expect(events).toContainEqual({
+      type: 'renderer.task.update',
+      task: {
+        id: 'call-2',
+        title: 'Ask a question',
+        status: 'in_progress',
+        details: [
+          { type: 'text', text: 'How should I reconcile #476 and #480?' },
+          { type: 'text', text: '1. Close #480' },
+          { type: 'text', text: '2. Rebase #480 on #476' }
+        ],
+        output: undefined
+      },
+      flush: true
+    })
+  })
+
+  it('names file, search, and web tools of Claude Code and Hermes', () => {
+    const titles = [
+      toolItem('a', 'Read', { file_path: 'src/app.ts' }),
+      toolItem('b', 'write_file', { path: 'notes.md', content: 'x' }),
+      toolItem('c', 'Edit', { file_path: 'src/app.ts', old_string: 'a', new_string: 'b' }),
+      toolItem('d', 'search_files', { pattern: 'TODO' }),
+      toolItem('e', 'WebSearch', { query: 'hermes agent' }),
+      toolItem('f', 'web_extract', { urls: ['https://example.com'] }),
+      toolItem('g', 'delegate_task', { goal: 'Review the diff' }),
+      // Arguments can arrive as JSON text.
+      toolItem('h', 'Read', JSON.stringify({ file_path: 'README.md' }) as any)
+    ].flatMap(item =>
+      new CodexAppServerRendererEventMapper()
+        .process(started(item))
+        .filter((event: any) => event.type === 'renderer.task.update')
+        .map((event: any) => event.task.title)
+    )
+    expect(titles).toEqual([
+      'Read src/app.ts',
+      'Write notes.md',
+      'Edit src/app.ts',
+      'Search files',
+      'Search the web',
+      'Fetch web pages',
+      'Start a subagent',
+      'Read README.md'
+    ])
+  })
+
+  it('shows an unknown tool with its arguments', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process(started(toolItem('call-3', 'memory', { action: 'add' })))
+    expect(events).toContainEqual({
+      type: 'renderer.task.update',
+      task: {
+        id: 'call-3',
+        title: 'Use memory',
+        status: 'in_progress',
+        details: [{ type: 'code', language: 'json', text: '{\n  "action": "add"\n}' }],
+        output: undefined
+      },
+      flush: true
+    })
+  })
+})

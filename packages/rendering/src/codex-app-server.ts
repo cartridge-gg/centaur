@@ -247,6 +247,24 @@ export class CodexAppServerRendererEventMapper
       this.emitActivitySummary(out)
     }
 
+    const dynamicTool = dynamicToolCall(event)
+    if (dynamicTool) {
+      const existing = this.state.taskByUseId.get(dynamicToolId(dynamicTool))
+      const commandIndex =
+        dynamicToolCommand(dynamicTool) === undefined
+          ? undefined
+          : commandNumber(this.state, existing)
+      const task = dynamicToolTask(
+        dynamicTool,
+        String(event?.type ?? ''),
+        commandIndex,
+        this.includeTaskOutput
+      )
+      const merged = mergeTask(existing, task)
+      this.state.taskByUseId.set(merged.id, merged)
+      this.emitActivitySummary(out)
+    }
+
     const outputDelta = commandOutputDelta(event)
     if (outputDelta && this.includeTaskOutput) {
       const current = this.state.commandOutputById.get(outputDelta.id) ?? ''
@@ -1041,6 +1059,23 @@ function commandExecution(event: any): Record<string, any> | null {
   return item
 }
 
+/**
+ * A tool call that harness-server does not map to a command or a file change:
+ * the tools of Hermes (`terminal`, `read_file`, `clarify`, ...) and Claude Code
+ * tools other than `Bash` (`Read`, `Edit`, `Grep`, ...).
+ */
+function dynamicToolCall(event: any): Record<string, any> | null {
+  if (
+    event?.type !== 'item.started' &&
+    event?.type !== 'item.updated' &&
+    event?.type !== 'item.completed'
+  )
+    return null
+  const item = event.item
+  if (!item || (item.type !== 'dynamicToolCall' && item.type !== 'dynamic_tool_call')) return null
+  return item
+}
+
 function fileChangeEvent(event: any): Record<string, any> | null {
   if (event?.type === 'file_change') return event
   if (
@@ -1392,6 +1427,142 @@ function fileChangeTask(item: any, eventType: string, existing?: HarnessTask): H
       ? [section([text('Files: '), text(uniquePaths.join(', '), { code: true })])]
       : (existing?.details ?? []),
     output: diff ? [pre(diff, 'diff')] : (existing?.output ?? [])
+  }
+}
+
+function dynamicToolId(item: any): string {
+  return String(item.id ?? item.callId ?? item.call_id ?? `${item.tool ?? 'tool'}-call`)
+}
+
+/** The arguments of a dynamic tool call: an object, or JSON text of one. */
+function dynamicToolArguments(item: any): Record<string, any> {
+  const args = item.arguments
+  if (typeof args === 'string') {
+    try {
+      const parsed = JSON.parse(args)
+      return parsed && typeof parsed === 'object' ? parsed : {}
+    } catch {
+      return {}
+    }
+  }
+  return args && typeof args === 'object' ? args : {}
+}
+
+/** Shell tools that run one command: shown like a Codex command. */
+const COMMAND_TOOLS = new Set(['terminal', 'Bash', 'shell', 'shell_command'])
+
+function dynamicToolCommand(item: any): string | undefined {
+  if (!COMMAND_TOOLS.has(String(item.tool ?? ''))) return undefined
+  const command = dynamicToolArguments(item).command
+  return typeof command === 'string' && command.trim() ? command : undefined
+}
+
+function dynamicToolResultText(item: any): string {
+  const content = Array.isArray(item.contentItems) ? item.contentItems : []
+  return content
+    .map((part: any) => (typeof part === 'string' ? part : String(part?.text ?? '')))
+    .filter(Boolean)
+    .join('\n')
+}
+
+function dynamicToolTask(
+  item: any,
+  eventType: string,
+  commandIndex: number | undefined,
+  includeOutput: boolean
+): HarnessTask {
+  const id = dynamicToolId(item)
+  const status = itemStatus(item, eventType)
+  const failed = item.success === false || String(item.status ?? '').toLowerCase() === 'failed'
+  const result = includeOutput ? dynamicToolResultText(item) : ''
+  const command = dynamicToolCommand(item)
+  if (command !== undefined) {
+    const display = oneLine(unwrapShellCommand(command), 220)
+    // Hermes's terminal tool answers {"output", "exit_code", "error"}.
+    let output = result
+    let exitCode: number | null | undefined
+    try {
+      const parsed = JSON.parse(result)
+      if (typeof parsed?.output === 'string') output = parsed.output
+      if (typeof parsed?.exit_code === 'number') exitCode = parsed.exit_code
+      if (typeof parsed?.error === 'string' && parsed.error) output = `${output}\n${parsed.error}`.trim()
+    } catch {}
+    return {
+      id,
+      title: commandExecutionTitle(commandIndex),
+      status,
+      ...(commandIndex !== undefined ? { commandIndex } : {}),
+      details: [pre(display, shellLanguageForCommand(display))],
+      output: result ? commandOutputElements(output, exitCode) : []
+    }
+  }
+  const { title, details } = describeDynamicTool(
+    String(item.tool ?? 'tool'),
+    dynamicToolArguments(item)
+  )
+  return {
+    id,
+    title,
+    status,
+    details,
+    output: result ? outputElementsForResult({ content: result, is_error: failed }) : []
+  }
+}
+
+/** The title and details of a tool call, from the tool name and arguments. */
+function describeDynamicTool(
+  name: string,
+  args: Record<string, any>
+): { title: string; details: RendererTaskBlock[] } {
+  const path = stringInput(args, 'file_path', stringInput(args, 'path', stringInput(args, 'notebook_path')))
+  const onFile = (verb: string) => ({ title: oneLine(`${verb} ${path || 'file'}`), details: [] })
+  const code = (label: string, value: string) =>
+    value ? [section([text(label), text(oneLine(value, 220), { code: true })])] : []
+  switch (name) {
+    case 'Read':
+    case 'read_file':
+      return onFile('Read')
+    case 'Write':
+    case 'write_file':
+      return onFile('Write')
+    case 'Edit':
+    case 'MultiEdit':
+    case 'NotebookEdit':
+    case 'edit_file':
+    case 'patch':
+      return onFile('Edit')
+    case 'Grep':
+    case 'Glob':
+    case 'search_files':
+      return { title: 'Search files', details: code('Pattern: ', stringInput(args, 'pattern')) }
+    case 'WebSearch':
+    case 'web_search':
+      return { title: 'Search the web', details: code('Query: ', stringInput(args, 'query')) }
+    case 'WebFetch':
+    case 'web_extract': {
+      const urls = Array.isArray(args.urls) ? args.urls.map(String) : []
+      const url = stringInput(args, 'url', urls.join(', '))
+      return { title: 'Fetch web pages', details: code('URL: ', url) }
+    }
+    case 'clarify': {
+      const choices = Array.isArray(args.choices) ? args.choices.map(String) : []
+      const question = stringInput(args, 'question')
+      return {
+        title: 'Ask a question',
+        details: [
+          ...(question ? [section([text(question)])] : []),
+          ...choices.map((choice: string, index: number) => section([text(`${index + 1}. ${choice}`)]))
+        ]
+      }
+    }
+    case 'Task':
+    case 'Agent':
+    case 'delegate_task': {
+      const goal = stringInput(args, 'description', stringInput(args, 'goal', stringInput(args, 'prompt')))
+      return { title: 'Start a subagent', details: goal ? [section([text(oneLine(goal, 220))])] : [] }
+    }
+    default:
+      return { title: `Use ${name}`, details: [pre(JSON.stringify(args, null, 2), 'json')] }
   }
 }
 
