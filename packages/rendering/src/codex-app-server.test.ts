@@ -1131,7 +1131,7 @@ describe('CodexAppServerRendererEventMapper dynamic tool calls', () => {
     expect(output).toContain('command failed')
   })
 
-  it('shows a clarify question with its choices', () => {
+  it('points a clarify question to the reply instead of repeating it', () => {
     const mapper = new CodexAppServerRendererEventMapper()
     const events = mapper.process(
       started(
@@ -1148,9 +1148,10 @@ describe('CodexAppServerRendererEventMapper dynamic tool calls', () => {
         title: 'Ask a question',
         status: 'in_progress',
         details: [
-          { type: 'text', text: 'How should I reconcile #476 and #480?' },
-          { type: 'text', text: '1. Close #480' },
-          { type: 'text', text: '2. Rebase #480 on #476' }
+          {
+            type: 'text',
+            text: 'The question and its 2 options are in the reply. Answer in this thread.'
+          }
         ],
         output: undefined
       },
@@ -1185,6 +1186,40 @@ describe('CodexAppServerRendererEventMapper dynamic tool calls', () => {
       'Start a subagent',
       'Read README.md'
     ])
+  })
+
+  it('does not show a reply twice when the harness resends its whole text', async () => {
+    const clarify = toolItem('call-1', 'clarify', { question: 'Which PR?', choices: ['#480', '#476'] })
+    const delta = (text: string) => ({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-1', delta: text }
+    })
+    const reply = 'which pr did you mean? reply *#480* or *#476*.'
+    const chunks = await collect(
+      codexAppServerToChatSdkStream(
+        toAsyncIterable([
+          started(clarify),
+          completed({ ...clarify, status: 'completed', success: true }),
+          started({ id: 'msg-1', type: 'agentMessage', text: '' }),
+          // As recorded from a Hermes turn: the streamed text starts with
+          // newlines, and the trimmed text follows as one more delta.
+          delta('\n\nwhich pr did you mean?'),
+          delta(' reply *#480* or *#476*.'),
+          delta(reply),
+          completed({ id: 'msg-1', type: 'agentMessage', text: reply, phase: 'final_answer' }),
+          {
+            method: 'turn/completed',
+            params: { threadId: 'thread-1', turn: { id: 'turn-1', items: [], status: 'completed', error: null } }
+          }
+        ])
+      )
+    )
+
+    const text = chunks
+      .filter(chunk => chunk.type === 'markdown_text')
+      .map(chunk => (chunk as any).text)
+      .join('')
+    expect(text.trim()).toBe(reply)
   })
 
   it('shows an unknown tool with its arguments', () => {

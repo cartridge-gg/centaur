@@ -516,7 +516,12 @@ export class CodexAppServerRendererEventMapper
       const delta = extractDeltaText(event)
       if (!delta) return { bufferChanged: false }
       const byId = buffer === 'answer' ? this.state.answerByItemId : this.state.commentaryByItemId
-      byId.set(itemId, (byId.get(itemId) ?? '') + delta)
+      const current = byId.get(itemId) ?? ''
+      // A harness can resend the whole text as one delta: harness-server did
+      // when its final text differed from the streamed text only by leading
+      // whitespace. Appending it would show the text twice.
+      if (current.trim() && delta.trim() === current.trim()) return { bufferChanged: false }
+      byId.set(itemId, current + delta)
       recomposeBuffers(this.state)
       return { bufferChanged: true }
     }
@@ -1545,14 +1550,13 @@ function describeDynamicTool(
       return { title: 'Fetch web pages', details: code('URL: ', url) }
     }
     case 'clarify': {
-      const choices = Array.isArray(args.choices) ? args.choices.map(String) : []
-      const question = stringInput(args, 'question')
+      // The reply asks the question (harness-server tells the agent to), so
+      // the task points to it instead of repeating it.
+      const count = Array.isArray(args.choices) ? args.choices.length : 0
+      const options = count === 1 ? ' and its option' : count > 1 ? ` and its ${count} options` : ''
       return {
         title: 'Ask a question',
-        details: [
-          ...(question ? [section([text(question)])] : []),
-          ...choices.map((choice: string, index: number) => section([text(`${index + 1}. ${choice}`)]))
-        ]
+        details: [section([text(`The question${options} ${count ? 'are' : 'is'} in the reply. Answer in this thread.`)])]
       }
     }
     case 'Task':
