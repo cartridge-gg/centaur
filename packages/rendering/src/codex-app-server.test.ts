@@ -1238,3 +1238,135 @@ describe('CodexAppServerRendererEventMapper dynamic tool calls', () => {
     })
   })
 })
+
+describe('CodexAppServerRendererEventMapper Codex tool items', () => {
+  const started = (item: unknown) => ({
+    method: 'item/started',
+    params: { threadId: 'thread-1', turnId: 'turn-1', item }
+  })
+  const completed = (item: unknown) => ({
+    method: 'item/completed',
+    params: { threadId: 'thread-1', turnId: 'turn-1', item }
+  })
+  // The first task update of an item, from a new mapper.
+  const firstTask = (item: unknown): any =>
+    (new CodexAppServerRendererEventMapper()
+      .process(started(item))
+      .find((event: any) => event.type === 'renderer.task.update') as any)?.task
+  const detailText = (task: any) =>
+    (task.details ?? []).map((block: any) => block.text ?? '').join('')
+  // The task updates of one item, to the end of the stream.
+  const streamUpdates = async (events: unknown[], id: string): Promise<any[]> =>
+    (await collect(codexAppServerToChatSdkStream(toAsyncIterable(events), { taskOutput: 'full' }))).filter(
+      (chunk: any) => chunk.type === 'task_update' && chunk.id === id
+    )
+
+  it('shows an image view as a task', async () => {
+    // As Codex sends it: the same item on start and on completion, with no status.
+    const item = { type: 'imageView', id: 'exec-1', path: '/home/agent/workspace/feedback.jpg' }
+    const updates = await streamUpdates([started(item), completed(item)], 'exec-1')
+    expect(updates[0]).toMatchObject({
+      title: 'View /home/agent/workspace/feedback.jpg',
+      status: 'in_progress'
+    })
+    expect(updates.at(-1)).toMatchObject({ status: 'complete' })
+  })
+
+  it('tells that the conversation was summarized', async () => {
+    const item = { type: 'contextCompaction', id: 'compact-1' }
+    const updates = await streamUpdates([started(item), completed(item)], 'compact-1')
+    expect(updates[0]).toMatchObject({ title: 'Summarize the conversation' })
+    expect(updates[0].details).toContain('context limit')
+    expect(updates.at(-1)).toMatchObject({ status: 'complete' })
+  })
+
+  it('names web searches by their action', () => {
+    const tasks = [
+      { type: 'webSearch', id: 'a', query: 'codex app server', action: { type: 'search', query: 'codex app server' } },
+      { type: 'webSearch', id: 'b', query: '', action: { type: 'openPage', url: 'https://example.com' } },
+      {
+        type: 'webSearch',
+        id: 'c',
+        query: '',
+        action: { type: 'findInPage', url: 'https://example.com', pattern: 'pricing' }
+      },
+      // The first event of a search has no action yet.
+      { type: 'webSearch', id: 'd', query: '' }
+    ].map(firstTask)
+    expect(tasks.map(task => [task.title, detailText(task)])).toEqual([
+      ['Search the web', 'Query: codex app server'],
+      ['Open a web page', 'URL: https://example.com'],
+      ['Find text in a web page', 'Pattern: pricingURL: https://example.com'],
+      ['Search the web', '']
+    ])
+  })
+
+  it('shows an MCP tool call with its arguments and result', async () => {
+    const item = {
+      type: 'mcpToolCall',
+      id: 'mcp-1',
+      server: 'docs',
+      tool: 'search',
+      status: 'inProgress',
+      arguments: { query: 'retry' }
+    }
+    const updates = await streamUpdates(
+      [
+        started(item),
+        completed({
+          ...item,
+          status: 'completed',
+          result: { content: [{ type: 'text', text: 'Found 3 pages' }], structuredContent: null }
+        })
+      ],
+      'mcp-1'
+    )
+    expect(updates[0]).toMatchObject({ title: 'Use docs.search', status: 'in_progress' })
+    expect(updates[0].details).toContain('"query": "retry"')
+    expect(updates.map(update => update.output).join('')).toContain('Found 3 pages')
+    expect(updates.at(-1)).toMatchObject({ status: 'complete' })
+  })
+
+  it('shows the error of a failed MCP tool call', async () => {
+    const updates = await streamUpdates(
+      [
+        completed({
+          type: 'mcpToolCall',
+          id: 'mcp-2',
+          server: 'docs',
+          tool: 'search',
+          status: 'failed',
+          arguments: {},
+          error: { message: 'server not reachable' }
+        })
+      ],
+      'mcp-2'
+    )
+    expect(updates[0]).toMatchObject({ title: 'Use docs.search' })
+    expect(updates.map(update => update.output).join('')).toContain('server not reachable')
+    expect(updates.at(-1)).toMatchObject({ status: 'complete' })
+  })
+
+  it('names subagent calls by their tool', () => {
+    const tasks = ['spawnAgent', 'sendInput', 'resumeAgent', 'wait', 'closeAgent', 'other'].map(tool =>
+      firstTask({
+        type: 'collabAgentToolCall',
+        id: tool,
+        tool,
+        status: 'inProgress',
+        senderThreadId: 'thread-1',
+        receiverThreadIds: [],
+        prompt: tool === 'spawnAgent' ? 'Review the diff' : null,
+        agentsStates: {}
+      })
+    )
+    expect(tasks.map(task => [task.title, detailText(task)])).toEqual([
+      ['Start a subagent', 'Review the diff'],
+      ['Message a subagent', ''],
+      ['Resume a subagent', ''],
+      ['Wait for subagents', ''],
+      ['Stop a subagent', ''],
+      ['Use a subagent', '']
+    ])
+  })
+})
