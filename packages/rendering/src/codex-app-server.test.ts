@@ -1131,7 +1131,7 @@ describe('CodexAppServerRendererEventMapper dynamic tool calls', () => {
     expect(output).toContain('command failed')
   })
 
-  it('shows a clarify question with its choices', () => {
+  it('points a clarify question to the reply instead of repeating it', () => {
     const mapper = new CodexAppServerRendererEventMapper()
     const events = mapper.process(
       started(
@@ -1148,9 +1148,10 @@ describe('CodexAppServerRendererEventMapper dynamic tool calls', () => {
         title: 'Ask a question',
         status: 'in_progress',
         details: [
-          { type: 'text', text: 'How should I reconcile #476 and #480?' },
-          { type: 'text', text: '1. Close #480' },
-          { type: 'text', text: '2. Rebase #480 on #476' }
+          {
+            type: 'text',
+            text: 'The question and its 2 options are in the reply. Answer in this thread.'
+          }
         ],
         output: undefined
       },
