@@ -247,6 +247,15 @@ export class CodexAppServerRendererEventMapper
       this.emitActivitySummary(out)
     }
 
+    const codexTool = codexToolItem(event)
+    if (codexTool) {
+      const existing = this.state.taskByUseId.get(codexToolId(codexTool))
+      const task = codexToolTask(codexTool, String(event?.type ?? ''), this.includeTaskOutput)
+      const merged = mergeTask(existing, task)
+      this.state.taskByUseId.set(merged.id, merged)
+      this.emitActivitySummary(out)
+    }
+
     const dynamicTool = dynamicToolCall(event)
     if (dynamicTool) {
       const existing = this.state.taskByUseId.get(dynamicToolId(dynamicTool))
@@ -1081,6 +1090,26 @@ function dynamicToolCall(event: any): Record<string, any> | null {
   return item
 }
 
+/** Codex items for tools that have no command, file change, or dynamic item. */
+const CODEX_TOOL_ITEM_TYPES = new Set([
+  'mcpToolCall',
+  'webSearch',
+  'collabAgentToolCall',
+  'imageView',
+  'contextCompaction'
+])
+
+function codexToolItem(event: any): Record<string, any> | null {
+  if (
+    event?.type !== 'item.started' &&
+    event?.type !== 'item.updated' &&
+    event?.type !== 'item.completed'
+  )
+    return null
+  const item = event.item
+  return item && CODEX_TOOL_ITEM_TYPES.has(item.type) ? item : null
+}
+
 function fileChangeEvent(event: any): Record<string, any> | null {
   if (event?.type === 'file_change') return event
   if (
@@ -1514,6 +1543,83 @@ function dynamicToolTask(
   }
 }
 
+function codexToolId(item: any): string {
+  return String(item.id ?? `${item.type}-item`)
+}
+
+function codexToolTask(item: any, eventType: string, includeOutput: boolean): HarnessTask {
+  const { title, details } = describeCodexTool(item)
+  const failed = String(item.status ?? '').toLowerCase() === 'failed' || Boolean(item.error)
+  let output: RendererTaskBlock[] = []
+  if (includeOutput && item.type === 'mcpToolCall') {
+    const content = typeof item.error?.message === 'string' ? item.error.message : item.result?.content
+    if (content?.length) output = outputElementsForResult({ content, is_error: failed })
+  }
+  return { id: codexToolId(item), title, status: itemStatus(item, eventType), details, output }
+}
+
+const SUBAGENT_TITLES: Record<string, string> = {
+  spawnAgent: 'Start a subagent',
+  sendInput: 'Message a subagent',
+  resumeAgent: 'Resume a subagent',
+  wait: 'Wait for subagents',
+  closeAgent: 'Stop a subagent'
+}
+
+/** The title and details of a Codex tool item that is not a command or a file change. */
+function describeCodexTool(item: any): { title: string; details: RendererTaskBlock[] } {
+  switch (item.type) {
+    case 'imageView': {
+      const path = typeof item.path === 'string' ? item.path : ''
+      return { title: oneLine(`View ${path || 'an image'}`), details: [] }
+    }
+    case 'contextCompaction':
+      return {
+        title: 'Summarize the conversation',
+        details: [
+          section([
+            text('The earlier turns were replaced with a summary, to stay within the context limit.')
+          ])
+        ]
+      }
+    case 'webSearch': {
+      const action = item.action ?? {}
+      if (action.type === 'openPage') {
+        return { title: 'Open a web page', details: labeledCode('URL: ', action.url) }
+      }
+      if (action.type === 'findInPage') {
+        return {
+          title: 'Find text in a web page',
+          details: [...labeledCode('Pattern: ', action.pattern), ...labeledCode('URL: ', action.url)]
+        }
+      }
+      const queries = Array.isArray(action.queries) ? action.queries.map(String) : []
+      const query = item.query || action.query || queries.join(', ')
+      return { title: 'Search the web', details: labeledCode('Query: ', query) }
+    }
+    case 'mcpToolCall': {
+      const name = item.server ? `${item.server}.${item.tool ?? 'tool'}` : String(item.tool ?? 'tool')
+      return { title: `Use ${name}`, details: [pre(JSON.stringify(item.arguments ?? {}, null, 2), 'json')] }
+    }
+    case 'collabAgentToolCall': {
+      const prompt = typeof item.prompt === 'string' ? item.prompt : ''
+      return {
+        title: SUBAGENT_TITLES[String(item.tool)] ?? 'Use a subagent',
+        details: prompt ? [section([text(oneLine(prompt, 220))])] : []
+      }
+    }
+    default:
+      return { title: `Use ${item.type ?? 'tool'}`, details: [] }
+  }
+}
+
+/** "Label: `value`", or nothing for an empty value. */
+function labeledCode(label: string, value: unknown): RendererTaskBlock[] {
+  return typeof value === 'string' && value
+    ? [section([text(label), text(oneLine(value, 220), { code: true })])]
+    : []
+}
+
 /** The title and details of a tool call, from the tool name and arguments. */
 function describeDynamicTool(
   name: string,
@@ -1521,8 +1627,6 @@ function describeDynamicTool(
 ): { title: string; details: RendererTaskBlock[] } {
   const path = stringInput(args, 'file_path', stringInput(args, 'path', stringInput(args, 'notebook_path')))
   const onFile = (verb: string) => ({ title: oneLine(`${verb} ${path || 'file'}`), details: [] })
-  const code = (label: string, value: string) =>
-    value ? [section([text(label), text(oneLine(value, 220), { code: true })])] : []
   switch (name) {
     case 'Read':
     case 'read_file':
@@ -1539,15 +1643,15 @@ function describeDynamicTool(
     case 'Grep':
     case 'Glob':
     case 'search_files':
-      return { title: 'Search files', details: code('Pattern: ', stringInput(args, 'pattern')) }
+      return { title: 'Search files', details: labeledCode('Pattern: ', stringInput(args, 'pattern')) }
     case 'WebSearch':
     case 'web_search':
-      return { title: 'Search the web', details: code('Query: ', stringInput(args, 'query')) }
+      return { title: 'Search the web', details: labeledCode('Query: ', stringInput(args, 'query')) }
     case 'WebFetch':
     case 'web_extract': {
       const urls = Array.isArray(args.urls) ? args.urls.map(String) : []
       const url = stringInput(args, 'url', urls.join(', '))
-      return { title: 'Fetch web pages', details: code('URL: ', url) }
+      return { title: 'Fetch web pages', details: labeledCode('URL: ', url) }
     }
     case 'clarify': {
       // The reply asks the question (harness-server tells the agent to), so
