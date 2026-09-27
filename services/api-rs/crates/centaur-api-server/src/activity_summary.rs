@@ -449,11 +449,33 @@ fn item_fact(value: &Value, normalized_event_type: &str) -> Option<ActivityFact>
             file_change_text(item, completed),
         )),
         "reasoning" => reasoning_item_fact(item, completed),
-        "mcpToolCall" | "mcp_tool_call" | "dynamicToolCall" | "dynamic_tool_call" => {
-            let name = tool_name(item);
+        "mcpToolCall" | "mcp_tool_call" => {
+            let tool = string_at(item, &["tool"]).unwrap_or_else(|| tool_name(item));
+            let name = match string_at(item, &["server"]) {
+                Some(server) => format!("{tool} from {server}"),
+                None => tool,
+            };
             let action = if completed { "finished using" } else { "using" };
             Some(ActivityFact::high("tool", format!("{action} {name}")))
         }
+        "dynamicToolCall" | "dynamic_tool_call" => dynamic_tool_fact(item, completed),
+        "imageView" | "image_view" => {
+            let name = path_tail(&string_at(item, &["path"]).unwrap_or_default(), 1);
+            Some(ActivityFact::high(
+                "tool",
+                if name.is_empty() {
+                    "viewing an image".to_owned()
+                } else {
+                    format!("viewing image {}", one_line(&name, 120))
+                },
+            ))
+        }
+        "contextCompaction" | "context_compaction" => Some(ActivityFact::high(
+            "tool",
+            "summarizing the earlier conversation to free context",
+        )),
+        "webSearch" | "web_search" => Some(ActivityFact::high("tool", web_search_text(item))),
+        "collabAgentToolCall" | "collab_agent_tool_call" => subagent_fact(item),
         "agentMessage" | "agent_message" => agent_message_fact(item, completed),
         "plan" => string_at(item, &["text"]).map(|text| {
             ActivityFact::high("plan", format!("updated plan {}", one_line(&text, 180)))
@@ -462,8 +484,125 @@ fn item_fact(value: &Value, normalized_event_type: &str) -> Option<ActivityFact>
     }
 }
 
+/// A tool call that harness-server forwards as a dynamic tool call: every
+/// Hermes tool, and every Claude Code tool other than Bash. The tool name is
+/// in `tool`, and the arguments are an object or JSON text.
+fn dynamic_tool_fact(item: &Value, completed: bool) -> Option<ActivityFact> {
+    let tool = string_at(item, &["tool"]).unwrap_or_else(|| tool_name(item));
+    let args = match item.get("arguments") {
+        Some(Value::String(text)) => serde_json::from_str(text).unwrap_or(Value::Null),
+        Some(args) => args.clone(),
+        None => Value::Null,
+    };
+    let arg = |keys: &[&str], fallback: &str| {
+        string_field(&args, keys)
+            .map(|value| one_line(&value, 120))
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    let file = || {
+        string_field(&args, &["path", "file_path", "notebook_path"])
+            .map(|path| one_line(&path_tail(&path, 3), 120))
+            .unwrap_or_else(|| "a file".to_owned())
+    };
+    let text = match tool.as_str() {
+        "terminal" | "Bash" | "shell" | "shell_command" => {
+            let command =
+                string_field(&args, &["command", "code"]).unwrap_or_else(|| "command".to_owned());
+            return command_fact(&command, completed);
+        }
+        "todo" | "TodoWrite" => return todo_fact(&args),
+        "read_file" | "Read" => format!("reading {}", file()),
+        "write_file" | "Write" => format!("writing {}", file()),
+        "patch" | "Edit" | "MultiEdit" | "NotebookEdit" => format!("editing {}", file()),
+        "search_files" | "Grep" | "Glob" => {
+            format!("searching files for {}", arg(&["pattern"], "a pattern"))
+        }
+        "web_search" | "WebSearch" => {
+            format!("searching the web for {}", arg(&["query"], "a query"))
+        }
+        "web_extract" | "WebFetch" => {
+            let url = string_field(&args, &["url"])
+                .or_else(|| array_text(args.get("urls")))
+                .unwrap_or_else(|| "a web page".to_owned());
+            format!("reading {}", one_line(&url, 120))
+        }
+        "vision_analyze" => format!(
+            "looking at an image: {}",
+            arg(&["question"], "what it shows")
+        ),
+        "clarify" | "AskUserQuestion" => {
+            format!("asking the user: {}", arg(&["question"], "a question"))
+        }
+        "delegate_task" | "Task" | "Agent" => format!(
+            "delegating to a subagent: {}",
+            arg(&["goal", "description", "prompt"], "a task")
+        ),
+        "skill_view" | "Skill" => {
+            format!("reading the {} skill", arg(&["name", "skill"], "requested"))
+        }
+        "process" | "skills_list" => return Some(ActivityFact::low("tool", "mechanical tool")),
+        name if name.starts_with("browser") => "using the browser".to_owned(),
+        name => {
+            let action = if completed { "finished using" } else { "using" };
+            format!("{action} {name}")
+        }
+    };
+    Some(ActivityFact::high("tool", text))
+}
+
+/// The task in progress of a to-do list, as a plan step.
+fn todo_fact(args: &Value) -> Option<ActivityFact> {
+    let todos = args.get("todos")?.as_array()?;
+    let status = |todo: &&Value| string_at(todo, &["status"]).unwrap_or_default();
+    let current = todos
+        .iter()
+        .find(|todo| status(todo) == "in_progress")
+        .or_else(|| todos.iter().find(|todo| status(todo) == "pending"))?;
+    let step = string_at(current, &["content"]).or_else(|| string_at(current, &["activeForm"]))?;
+    Some(ActivityFact::high(
+        "plan",
+        format!("working on {}", one_line(&step, 180)),
+    ))
+}
+
+fn web_search_text(item: &Value) -> String {
+    let action = item.get("action").unwrap_or(&Value::Null);
+    match string_at(action, &["type"]).as_deref() {
+        Some("openPage") => match string_at(action, &["url"]) {
+            Some(url) => format!("opening web page {}", one_line(&url, 120)),
+            None => "opening a web page".to_owned(),
+        },
+        Some("findInPage") => match string_at(action, &["pattern"]) {
+            Some(pattern) => format!("finding {} in a web page", one_line(&pattern, 120)),
+            None => "searching a web page".to_owned(),
+        },
+        _ => match string_at(item, &["query"])
+            .or_else(|| string_at(action, &["query"]))
+            .or_else(|| array_text(action.get("queries")))
+        {
+            Some(query) => format!("searching the web for {}", one_line(&query, 120)),
+            None => "searching the web".to_owned(),
+        },
+    }
+}
+
+fn subagent_fact(item: &Value) -> Option<ActivityFact> {
+    let text = match string_at(item, &["tool"]).as_deref() {
+        Some("spawnAgent") => match string_at(item, &["prompt"]) {
+            Some(prompt) => format!("starting a subagent: {}", one_line(&prompt, 120)),
+            None => "starting a subagent".to_owned(),
+        },
+        Some("sendInput") => "messaging a subagent".to_owned(),
+        Some("resumeAgent") => "resuming a subagent".to_owned(),
+        Some("wait") => "waiting for subagents".to_owned(),
+        Some("closeAgent") => "stopping a subagent".to_owned(),
+        _ => return None,
+    };
+    Some(ActivityFact::high("tool", text))
+}
+
 fn command_fact(command: &str, completed: bool) -> Option<ActivityFact> {
-    let command = unwrap_shell_command(command);
+    let command = skip_cd_prefix(&unwrap_shell_command(command)).to_owned();
     if is_low_signal_command(&command) {
         return Some(ActivityFact::low(
             "command",
@@ -632,6 +771,12 @@ fn is_low_signal_command(command: &str) -> bool {
                 | "node"
                 | "sh"
                 | "bash"
+                | "cd"
+                | "echo"
+                | "printf"
+                | "export"
+                | "sleep"
+                | "true"
         )
 }
 
@@ -730,6 +875,36 @@ fn strip_plan_marker(value: &str) -> String {
         }
     }
     text.trim().to_owned()
+}
+
+/// The command after any leading `cd <dir> &&` or `cd <dir>;`, which only
+/// sets the directory that the real command runs in.
+fn skip_cd_prefix(command: &str) -> &str {
+    let mut rest = command.trim();
+    while rest.starts_with("cd ") {
+        let end = [
+            rest.find("&&").map(|index| index + 2),
+            rest.find(';').map(|index| index + 1),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let Some(end) = end else {
+            break;
+        };
+        rest = rest[end..].trim_start();
+    }
+    rest
+}
+
+/// The last `parts` components of a path: enough to name the file without
+/// the checkout location.
+fn path_tail(path: &str, parts: usize) -> String {
+    let components = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    components[components.len().saturating_sub(parts)..].join("/")
 }
 
 fn unwrap_shell_command(command: &str) -> String {
@@ -1067,6 +1242,266 @@ mod tests {
             fact,
             ActivityFact::high("commentary", "I'll trace the USDG vault yield source.")
         );
+    }
+
+    fn item_event_fact(method: &str, item: Value) -> Option<ActivityFact> {
+        activity_fact_from_output_event(&event(json!({
+            "method": method,
+            "params": {"item": item}
+        })))
+    }
+
+    // As harness-server sends a Hermes tool call, or a Claude Code tool call
+    // other than Bash.
+    fn tool_call(tool: &str, arguments: Value) -> Value {
+        json!({
+            "id": "call-1",
+            "type": "dynamicToolCall",
+            "namespace": null,
+            "tool": tool,
+            "arguments": arguments,
+            "status": "inProgress"
+        })
+    }
+
+    fn fact_text(fact: Option<ActivityFact>) -> String {
+        fact.map(|fact| fact.text).unwrap_or_default()
+    }
+
+    #[test]
+    fn projects_hermes_terminal_calls_like_commands() {
+        let fact = |args: Value, method: &str| item_event_fact(method, tool_call("terminal", args));
+
+        assert_eq!(
+            fact(
+                json!({"command": "gh pr view 1311 --json url"}),
+                "item/started"
+            ),
+            Some(ActivityFact::high("tool", "using gh"))
+        );
+        assert_eq!(
+            fact(json!({"command": "gh pr view 1311"}), "item/completed"),
+            Some(ActivityFact::high("tool", "finished using gh"))
+        );
+        // Some calls send the command as `code`.
+        assert_eq!(
+            fact(
+                json!({"code": "websearch search --query tps"}),
+                "item/started"
+            ),
+            Some(ActivityFact::high("tool", "using websearch"))
+        );
+        assert_eq!(
+            fact(json!({"command": "git status --short"}), "item/started"),
+            Some(ActivityFact::low("command", "mechanical command"))
+        );
+        // A leading `cd` only sets the directory: name the command after it.
+        assert_eq!(
+            fact(
+                json!({"command": "cd ~/branches/app && gh pr checks 12"}),
+                "item/started"
+            ),
+            Some(ActivityFact::high("tool", "using gh"))
+        );
+        assert_eq!(
+            fact(json!({"command": "echo ===; date"}), "item/started"),
+            Some(ActivityFact::low("command", "mechanical command"))
+        );
+    }
+
+    #[test]
+    fn names_what_hermes_and_claude_code_tools_act_on() {
+        let cases = [
+            (
+                "read_file",
+                json!({"path": "src/worker.py", "limit": 60}),
+                "reading src/worker.py",
+            ),
+            (
+                "Read",
+                json!({"file_path": "README.md"}),
+                "reading README.md",
+            ),
+            (
+                "write_file",
+                json!({"path": "notes.md", "content": "x"}),
+                "writing notes.md",
+            ),
+            (
+                "patch",
+                json!({"path": "web/app.ts", "mode": "replace"}),
+                "editing web/app.ts",
+            ),
+            (
+                "Edit",
+                json!({"file_path": "web/app.ts"}),
+                "editing web/app.ts",
+            ),
+            (
+                "search_files",
+                json!({"pattern": "Chase", "path": "."}),
+                "searching files for Chase",
+            ),
+            (
+                "web_search",
+                json!({"query": "stagehand sdk"}),
+                "searching the web for stagehand sdk",
+            ),
+            (
+                "web_extract",
+                json!({"urls": ["https://example.com"]}),
+                "reading https://example.com",
+            ),
+            (
+                "vision_analyze",
+                json!({"question": "Is the app visible?", "image_url": "shot.png"}),
+                "looking at an image: Is the app visible?",
+            ),
+            (
+                "clarify",
+                json!({"question": "Which PR?", "choices": ["#480", "#476"]}),
+                "asking the user: Which PR?",
+            ),
+            (
+                "delegate_task",
+                json!({"goal": "Review the diff"}),
+                "delegating to a subagent: Review the diff",
+            ),
+            (
+                "skill_view",
+                json!({"name": "agent-browser"}),
+                "reading the agent-browser skill",
+            ),
+            (
+                "browser_exec",
+                json!({"code": "new_tab()"}),
+                "using the browser",
+            ),
+            ("memory", json!({"action": "add"}), "using memory"),
+            // A missing argument does not drop the step.
+            ("read_file", json!({}), "reading a file"),
+            // An absolute path keeps its last 3 parts.
+            (
+                "read_file",
+                json!({"path": "/home/agent/branches/org/app/web/src/ui/RaceDetail.tsx"}),
+                "reading src/ui/RaceDetail.tsx",
+            ),
+        ];
+        for (tool, args, expected) in cases {
+            let fact = item_event_fact("item/started", tool_call(tool, args));
+            assert_eq!(fact, Some(ActivityFact::high("tool", expected)), "{tool}");
+        }
+        assert_eq!(
+            item_event_fact(
+                "item/started",
+                tool_call("process", json!({"action": "kill"}))
+            ),
+            Some(ActivityFact::low("tool", "mechanical tool"))
+        );
+    }
+
+    #[test]
+    fn reads_tool_arguments_given_as_json_text() {
+        let args = Value::String(json!({"path": "src/app.ts"}).to_string());
+        assert_eq!(
+            fact_text(item_event_fact(
+                "item/started",
+                tool_call("read_file", args)
+            )),
+            "reading src/app.ts"
+        );
+    }
+
+    #[test]
+    fn projects_a_todo_list_into_its_current_step() {
+        let fact = item_event_fact(
+            "item/started",
+            tool_call(
+                "todo",
+                json!({"todos": [
+                    {"id": "1", "status": "completed", "content": "Read the runner contract"},
+                    {"id": "2", "status": "in_progress", "content": "Fix the ghost replay"},
+                    {"id": "3", "status": "pending", "content": "Open the PR"}
+                ]}),
+            ),
+        );
+        assert_eq!(
+            fact,
+            Some(ActivityFact::high(
+                "plan",
+                "working on Fix the ghost replay"
+            ))
+        );
+    }
+
+    #[test]
+    fn projects_codex_items_without_a_command() {
+        let cases = [
+            (
+                json!({"type": "imageView", "id": "exec-1", "path": "/home/agent/workspace/feedback.jpg"}),
+                "viewing image feedback.jpg",
+            ),
+            (
+                json!({"type": "contextCompaction", "id": "compact-1"}),
+                "summarizing the earlier conversation to free context",
+            ),
+            (
+                json!({"type": "webSearch", "id": "ws-1", "query": "codex app server", "action": {"type": "search", "query": "codex app server"}}),
+                "searching the web for codex app server",
+            ),
+            (
+                json!({"type": "webSearch", "id": "ws-2", "query": ""}),
+                "searching the web",
+            ),
+            (
+                json!({"type": "webSearch", "id": "ws-3", "query": "", "action": {"type": "openPage", "url": "https://example.com"}}),
+                "opening web page https://example.com",
+            ),
+            (
+                json!({"type": "webSearch", "id": "ws-4", "query": "", "action": {"type": "findInPage", "url": "https://example.com", "pattern": "pricing"}}),
+                "finding pricing in a web page",
+            ),
+            (
+                json!({"type": "collabAgentToolCall", "id": "c-1", "tool": "spawnAgent", "prompt": "Review the diff"}),
+                "starting a subagent: Review the diff",
+            ),
+            (
+                json!({"type": "collabAgentToolCall", "id": "c-2", "tool": "wait", "prompt": null}),
+                "waiting for subagents",
+            ),
+            (
+                json!({"type": "mcpToolCall", "id": "m-1", "server": "docs", "tool": "search", "arguments": {}}),
+                "using search from docs",
+            ),
+        ];
+        for (item, expected) in cases {
+            let fact = item_event_fact("item/started", item.clone());
+            assert_eq!(fact, Some(ActivityFact::high("tool", expected)), "{item}");
+        }
+    }
+
+    #[test]
+    fn different_tool_calls_publish_a_new_status() {
+        // Every Hermes tool call used to become the same "using tool" fact,
+        // which the state drops as a repeat, so the status never changed.
+        let mut state = ExecutionActivity::new(4, None);
+        let now = Instant::now();
+        let interval = Duration::from_secs(8);
+        for (offset, path) in [(0, "src/worker.py"), (9, "src/policy.json")] {
+            let fact = item_event_fact(
+                "item/started",
+                tool_call("read_file", json!({"path": path})),
+            )
+            .unwrap();
+            state.push(fact);
+            assert!(
+                state
+                    .prepare_publish(now + Duration::from_secs(offset), interval)
+                    .is_some(),
+                "{path}"
+            );
+            state.last_published_signature = Some(state.signature());
+        }
     }
 
     #[test]
