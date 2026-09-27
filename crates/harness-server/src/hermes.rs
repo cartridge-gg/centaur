@@ -56,6 +56,12 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(180);
 /// `message.complete` before we stop draining and move on.
 const INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CRON_TICK_SECONDS: u64 = 60;
+/// The file with the durable Hermes session key. It lets a new gateway
+/// resume the session.
+pub(crate) const SESSION_FILE_ENV: &str = "CENTAUR_HERMES_SESSION_FILE";
+/// The session key file in `$HERMES_HOME` when [`SESSION_FILE_ENV`] is unset.
+pub(crate) const PERSISTED_SESSION_FILE: &str = "centaur-session-id";
+
 /// The answer to Hermes's `clarify` tool. A Centaur session runs in a chat
 /// thread, which cannot show an interactive question, so the model asks in
 /// its reply instead.
@@ -272,7 +278,7 @@ impl HermesChild {
             session_id: String::new(),
             stored_session_id: String::new(),
             session_started: false,
-            session_file: env::var_os("CENTAUR_HERMES_SESSION_FILE").map(PathBuf::from),
+            session_file: env::var_os(SESSION_FILE_ENV).map(PathBuf::from),
             pending: VecDeque::new(),
             next_rpc_id: 0,
         };

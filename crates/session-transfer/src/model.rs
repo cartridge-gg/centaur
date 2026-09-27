@@ -7,6 +7,7 @@ use serde_json::Value;
 pub enum Tool {
     Codex,
     Claude,
+    Hermes,
 }
 
 impl Tool {
@@ -16,6 +17,7 @@ impl Tool {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Hermes => "hermes",
         }
     }
 
@@ -25,6 +27,7 @@ impl Tool {
         match self {
             Self::Codex => "Codex CLI",
             Self::Claude => "Claude Code",
+            Self::Hermes => "Hermes Agent",
         }
     }
 }
@@ -42,6 +45,7 @@ impl std::str::FromStr for Tool {
         match s {
             "codex" => Ok(Self::Codex),
             "claude" | "claude-code" | "claudecode" => Ok(Self::Claude),
+            "hermes" => Ok(Self::Hermes),
             _ => Err(crate::Error::UnknownTool(s.to_string())),
         }
     }
@@ -102,6 +106,28 @@ pub struct Message {
     /// The model that wrote an assistant message.
     pub model: Option<String>,
     pub parts: Vec<Part>,
+}
+
+/// Adds a part to a transcript. Consecutive assistant parts share one
+/// message, and so do consecutive tool results. `model` goes on a new
+/// assistant message.
+pub(crate) fn push_part(messages: &mut Vec<Message>, role: Role, part: Part, model: Option<&str>) {
+    let is_result = |p: &Part| matches!(p, Part::ToolResult { .. });
+    if let Some(last) = messages.last_mut().filter(|m| m.role == role)
+        && (role == Role::Assistant || (is_result(&part) && last.parts.iter().all(is_result)))
+    {
+        last.parts.push(part);
+        return;
+    }
+    let model = match role {
+        Role::Assistant => model.map(str::to_owned),
+        Role::User => None,
+    };
+    messages.push(Message {
+        role,
+        model,
+        parts: vec![part],
+    });
 }
 
 #[derive(Debug, Clone, PartialEq)]

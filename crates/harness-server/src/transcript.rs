@@ -1,5 +1,5 @@
-//! `harness-server transcript convert`: converts a Codex or Claude Code
-//! session so that the other harness can resume it with the full history.
+//! `harness-server transcript convert`: converts a Codex, Claude Code or
+//! Hermes session so that another harness can resume it with the full history.
 
 use std::path::PathBuf;
 
@@ -45,7 +45,7 @@ pub struct ConvertRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ConvertReport {
     pub tool: &'static str,
-    pub id: Uuid,
+    pub id: String,
     pub path: PathBuf,
     pub resume_command: String,
     pub bytes: usize,
@@ -127,14 +127,18 @@ pub fn convert_session(request: &ConvertRequest) -> Result<ConvertReport> {
 /// - Claude Code: every conversation line has the new session id, and the
 ///   lines form one chain from the first to the last. `claude --resume`
 ///   loads that chain.
+/// - Hermes: the import payload holds 1 session with the new id, and its
+///   messages are user and assistant text that starts with the user. The
+///   import itself reports a session that Hermes does not store.
 ///
 /// # Errors
 ///
 /// [`HarnessServerError::UnreadableConversion`] with the first problem.
 pub fn check_converted(converted: &Converted) -> Result<()> {
     let checked = match converted.tool {
-        Tool::Codex => check_codex_rollout(&converted.contents, converted.id),
-        Tool::Claude => check_claude_transcript(&converted.contents, converted.id),
+        Tool::Codex => check_codex_rollout(&converted.contents, &converted.id),
+        Tool::Claude => check_claude_transcript(&converted.contents, &converted.id),
+        Tool::Hermes => check_hermes_payload(&converted.contents, &converted.id),
     };
     checked.map_err(|reason| HarnessServerError::UnreadableConversion {
         tool: converted.tool.label(),
@@ -142,7 +146,7 @@ pub fn check_converted(converted: &Converted) -> Result<()> {
     })
 }
 
-fn check_codex_rollout(contents: &str, id: Uuid) -> std::result::Result<(), String> {
+fn check_codex_rollout(contents: &str, id: &str) -> std::result::Result<(), String> {
     let mut messages = 0;
     for (index, line) in contents.lines().enumerate() {
         let number = index + 1;
@@ -150,7 +154,7 @@ fn check_codex_rollout(contents: &str, id: Uuid) -> std::result::Result<(), Stri
             .map_err(|error| format!("line {number} is not a rollout line: {error}"))?;
         match line.item {
             RolloutItem::SessionMeta(meta) if index == 0 => {
-                if meta.meta.id.to_string() != id.to_string() {
+                if meta.meta.id.to_string() != id {
                     return Err(format!(
                         "session_meta has the id {}, not {id}",
                         meta.meta.id
@@ -168,8 +172,7 @@ fn check_codex_rollout(contents: &str, id: Uuid) -> std::result::Result<(), Stri
     Ok(())
 }
 
-fn check_claude_transcript(contents: &str, id: Uuid) -> std::result::Result<(), String> {
-    let id = id.to_string();
+fn check_claude_transcript(contents: &str, id: &str) -> std::result::Result<(), String> {
     let mut previous: Option<String> = None;
     for (index, line) in contents.lines().enumerate() {
         let number = index + 1;
@@ -189,7 +192,7 @@ fn check_claude_transcript(contents: &str, id: Uuid) -> std::result::Result<(), 
         if !matches!(kind, "user" | "assistant") {
             continue;
         }
-        if record.get("sessionId").and_then(Value::as_str) != Some(id.as_str()) {
+        if record.get("sessionId").and_then(Value::as_str) != Some(id) {
             return Err(format!("line {number} has no session id"));
         }
         if record.pointer("/message/role").and_then(Value::as_str) != Some(kind)
@@ -216,6 +219,45 @@ fn check_claude_transcript(contents: &str, id: Uuid) -> std::result::Result<(), 
     Ok(())
 }
 
+fn check_hermes_payload(contents: &str, id: &str) -> std::result::Result<(), String> {
+    let payload: Value = serde_json::from_str(contents)
+        .map_err(|error| format!("the import payload is not JSON: {error}"))?;
+    let Some([session]) = payload.as_array().map(Vec::as_slice) else {
+        return Err("the import payload does not hold exactly 1 session".to_owned());
+    };
+    if session.get("id").and_then(Value::as_str) != Some(id) {
+        return Err(format!("the imported session is not {id}"));
+    }
+    let messages = session
+        .get("messages")
+        .and_then(Value::as_array)
+        .filter(|messages| !messages.is_empty())
+        .ok_or_else(|| "the session has no messages".to_owned())?;
+    for (index, message) in messages.iter().enumerate() {
+        let number = index + 1;
+        let role = message.get("role").and_then(Value::as_str);
+        if !matches!(role, Some("user" | "assistant")) {
+            return Err(format!(
+                "message {number} is not a user or assistant message"
+            ));
+        }
+        if index == 0 && role != Some("user") {
+            return Err("the first message is not a user message".to_owned());
+        }
+        if !message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.trim().is_empty())
+        {
+            return Err(format!("message {number} has no text"));
+        }
+        if !message.get("timestamp").is_some_and(Value::is_number) {
+            return Err(format!("message {number} has no timestamp"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -225,14 +267,18 @@ mod tests {
     use super::*;
 
     fn converted(from: Tool, fixture: &str) -> Converted {
+        let to = match from {
+            Tool::Claude => Tool::Codex,
+            Tool::Codex | Tool::Hermes => Tool::Claude,
+        };
+        converted_to(from, fixture, to)
+    }
+
+    fn converted_to(from: Tool, fixture: &str, to: Tool) -> Converted {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../session-transfer/tests/fixtures")
             .join(fixture);
         let session = session_transfer::discover::read_session(from, &path).unwrap();
-        let to = match from {
-            Tool::Codex => Tool::Claude,
-            Tool::Claude => Tool::Codex,
-        };
         let target = Target {
             home: std::env::temp_dir().join("never-written"),
             cwd: "/work/app".to_owned(),
@@ -300,7 +346,50 @@ mod tests {
             if let Err(error) = check_converted(&converted(from, fixture)) {
                 panic!("{fixture}: {error}");
             }
+            if let Err(error) = check_converted(&converted_to(from, fixture, Tool::Hermes)) {
+                panic!("{fixture} to Hermes: {error}");
+            }
         }
+    }
+
+    #[test]
+    fn a_broken_hermes_payload_fails_the_check() {
+        let payload = converted_to(
+            Tool::Codex,
+            "codex/recorded-codex-0.154.jsonl",
+            Tool::Hermes,
+        );
+        let with = |change: &dyn Fn(&mut Value)| {
+            let mut value: Value = serde_json::from_str(&payload.contents).unwrap();
+            change(&mut value);
+            let mut changed = payload.clone();
+            changed.contents = value.to_string();
+            reason(&changed)
+        };
+        assert_eq!(
+            with(&|value| value[0]["id"] = json!("20990101_000000_ffffff")),
+            format!("the imported session is not {}", payload.id)
+        );
+        assert_eq!(
+            with(&|value| value[0]["messages"] = json!([])),
+            "the session has no messages"
+        );
+        assert_eq!(
+            with(&|value| value[0]["messages"][0]["role"] = json!("assistant")),
+            "the first message is not a user message"
+        );
+        assert_eq!(
+            with(&|value| value[0]["messages"][1]["role"] = json!("tool")),
+            "message 2 is not a user or assistant message"
+        );
+        assert_eq!(
+            with(&|value| value[0]["messages"][1]["content"] = json!(" ")),
+            "message 2 has no text"
+        );
+        assert_eq!(
+            with(&|value| *value = json!([value[0].clone(), value[0].clone()])),
+            "the import payload does not hold exactly 1 session"
+        );
     }
 
     #[test]

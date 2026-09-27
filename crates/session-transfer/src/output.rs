@@ -27,22 +27,33 @@ pub struct Target {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Converted {
     pub tool: Tool,
-    pub id: Uuid,
+    /// Id of the new session: [`Target::id`], or for Hermes a Hermes id.
+    pub id: String,
+    /// The session file, or for Hermes the database.
     pub path: PathBuf,
     /// Command that continues the session in the target tool.
     pub resume_command: String,
-    /// The JSONL file contents.
+    /// The JSONL file contents, or for Hermes the import payload.
     pub contents: String,
 }
 
 impl Converted {
-    /// Writes the session file. It never overwrites an existing file.
+    /// Writes the session. It never overwrites an existing session. A Hermes
+    /// session is imported into its database with the Python in
+    /// `$HERMES_PYTHON`, or else `python3` (see [`crate::hermes::import`]).
     ///
     /// # Errors
     ///
-    /// [`Error::AlreadyExists`] if the file exists, and [`Error::Write`] if
-    /// the directory or the file cannot be written.
+    /// [`Error::AlreadyExists`] if the file exists, [`Error::Write`] if
+    /// the directory or the file cannot be written, and
+    /// [`Error::HermesImport`] if the Hermes import fails.
     pub fn write(&self) -> Result<()> {
+        if self.tool == Tool::Hermes {
+            let python = std::env::var_os(crate::hermes::PYTHON_ENV)
+                .filter(|python| !python.is_empty())
+                .unwrap_or_else(|| "python3".into());
+            return crate::hermes::import(self, &python);
+        }
         let write_error = |source| Error::Write {
             path: self.path.clone(),
             source,

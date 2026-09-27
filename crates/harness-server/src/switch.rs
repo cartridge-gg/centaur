@@ -67,6 +67,7 @@ use uuid::Uuid;
 
 use crate::claude::{CLAUDE_SESSION_PERSIST_ENV, PERSISTED_SESSION_FILE};
 use crate::codex::{CODEX_THREAD_PERSIST_ENV, PERSISTED_THREAD_FILE};
+use crate::hermes::{PERSISTED_SESSION_FILE as HERMES_SESSION_FILE, SESSION_FILE_ENV};
 use crate::server::{BlocksState, parse_blocks_line_with_state};
 use crate::util::{env_flag_enabled, write_value};
 use crate::{HarnessServerError, Result};
@@ -108,6 +109,7 @@ fn harness_name(tool: Tool) -> &'static str {
     match tool {
         Tool::Codex => "codex",
         Tool::Claude => "claudecode",
+        Tool::Hermes => "hermes",
     }
 }
 
@@ -123,6 +125,8 @@ fn other(tool: Tool) -> Tool {
     match tool {
         Tool::Codex => Tool::Claude,
         Tool::Claude => Tool::Codex,
+        // Only Codex and Claude Code run under the supervisor.
+        Tool::Hermes => unreachable!("Hermes does not run under the switch supervisor"),
     }
 }
 
@@ -130,6 +134,7 @@ fn subcommand(tool: Tool) -> &'static str {
     match tool {
         Tool::Codex => "codex",
         Tool::Claude => "claude-code",
+        Tool::Hermes => "hermes",
     }
 }
 
@@ -138,11 +143,15 @@ fn persisted_id_file(tool: Tool, homes: &Homes) -> PathBuf {
     match tool {
         Tool::Codex => homes.codex.join(PERSISTED_THREAD_FILE),
         Tool::Claude => homes.claude.join(PERSISTED_SESSION_FILE),
+        Tool::Hermes => env::var_os(SESSION_FILE_ENV)
+            .filter(|path| !path.is_empty())
+            .map_or_else(|| homes.hermes.join(HERMES_SESSION_FILE), PathBuf::from),
     }
 }
 
 /// The file of session `id` of `tool`, found by its name: Codex names a
 /// rollout after its thread id, Claude Code a transcript after its session id.
+/// Hermes keeps every session in its database.
 fn session_file(tool: Tool, id: &str, homes: &Homes) -> Option<PathBuf> {
     fn walk(dir: &Path, matches: &dyn Fn(&str) -> bool, depth: usize) -> Option<PathBuf> {
         for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -173,6 +182,10 @@ fn session_file(tool: Tool, id: &str, homes: &Homes) -> Option<PathBuf> {
         Tool::Claude => {
             let name = format!("{id}.jsonl");
             walk(&homes.claude.join("projects"), &|file| file == name, 1)
+        }
+        Tool::Hermes => {
+            let db = homes.hermes.join(session_transfer::hermes::DATABASE_FILE);
+            db.is_file().then_some(db)
         }
     }
 }
@@ -1297,6 +1310,7 @@ mod tests {
         let homes = Homes {
             codex: root.join("codex"),
             claude: root.join("claude"),
+            hermes: root.join("hermes"),
         };
         let rollout = homes
             .codex

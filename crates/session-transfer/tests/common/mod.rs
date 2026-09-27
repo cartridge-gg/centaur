@@ -30,6 +30,7 @@ pub fn render_like_sessport(
         home: PathBuf::from(match to {
             Tool::Claude => CLAUDE_HOME,
             Tool::Codex => CODEX_HOME,
+            Tool::Hermes => unreachable!("sessport does not write Hermes sessions"),
         }),
         cwd: cwd
             .or(session.cwd.as_deref())
@@ -52,5 +53,6 @@ pub fn render_like_sessport(
             })
         }
         Tool::Codex => codex::render_session(session, &target, &options, "openai"),
+        Tool::Hermes => unreachable!("sessport does not write Hermes sessions"),
     }
 }
