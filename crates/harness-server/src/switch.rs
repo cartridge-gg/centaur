@@ -1,17 +1,19 @@
-//! Switchable blocks mode: moves a session between Codex and Claude Code when
-//! the model provider of the active harness has no capacity left.
+//! Switchable blocks mode: moves a session between Codex, Claude Code and
+//! Hermes when the model provider of the active harness has no capacity left.
 //!
-//! With `CENTAUR_HARNESS_SWITCHING=1`, `harness-server codex` and
-//! `harness-server claude-code` run the blocks server of the harness as a
-//! child process and relay its stdin and stdout lines. The child keeps its
-//! session id on the state volume (`centaur-thread-id`, `centaur-session-id`).
+//! With `CENTAUR_HARNESS_SWITCHING=1`, `harness-server codex`,
+//! `harness-server claude-code` and `harness-server hermes` run the blocks
+//! server of the harness as a child process and relay its stdin and stdout
+//! lines. The child keeps its session id on the state volume
+//! (`centaur-thread-id`, `centaur-session-id`, and for Hermes
+//! `$CENTAUR_HERMES_SESSION_FILE`).
 //!
 //! When a turn fails because the provider is exhausted (the child marks the
 //! line with `params.centaur.providerExhausted`), this process:
 //!
 //! 1. holds back the failure, so the client does not see the turn end;
-//! 2. converts the native session into the format of the other harness;
-//! 3. starts the other child, which resumes the converted session;
+//! 2. converts the native session into the format of the failover harness;
+//! 3. starts the child of that harness, which resumes the converted session;
 //! 4. prints a `centaur/providerFailover` notification;
 //! 5. sends the turn again. If the turn already did work, it sends a request
 //!    to continue instead, because the work is in the history.
@@ -20,14 +22,16 @@
 //! directive to a user line:
 //!
 //! ```json
-//! {"type": "user", "centaur": {"harness": "claudecode", "mode": "requested", "failover": {"enabled": true, "model": "..."}}}
+//! {"type": "user", "centaur": {"harness": "claudecode", "mode": "requested", "failover": {"enabled": true, "harness": "codex", "model": "..."}}}
 //! ```
 //!
 //! If `harness` is not the active harness, the session moves before the turn
 //! starts. `mode: "requested"` says that the user asked for the harness; the
 //! notice then has that mode instead of `proactive`. `failover.enabled: false`
-//! turns off the switch for the turn, and `failover.model` is the model for
-//! the turn after a switch.
+//! turns off the switch for the turn, `failover.harness` is the harness that
+//! the turn moves to, and `failover.model` is the model for the turn after a
+//! switch. Without `failover.harness`, Codex and Claude Code move to each
+//! other, and Hermes does not move.
 //!
 //! The session has one transcript: the one of the active harness. Each switch
 //! converts it, so the history of every turn goes with the session. The
@@ -117,17 +121,20 @@ fn parse_harness(name: &str) -> Option<Tool> {
     match name.trim().to_ascii_lowercase().as_str() {
         "codex" => Some(Tool::Codex),
         "claudecode" | "claude-code" | "claude" => Some(Tool::Claude),
+        "hermes" => Some(Tool::Hermes),
         _ => None,
     }
 }
 
-fn other(tool: Tool) -> Tool {
-    match tool {
-        Tool::Codex => Tool::Claude,
-        Tool::Claude => Tool::Codex,
-        // Only Codex and Claude Code run under the supervisor.
-        Tool::Hermes => unreachable!("Hermes does not run under the switch supervisor"),
-    }
+/// The harness that a turn on `from` moves to when its provider is
+/// exhausted: `named` (the `failover.harness` of the directive), or else the
+/// other of Codex and Claude Code. Hermes moves only to a named harness.
+fn failover_target(from: Tool, named: Option<Tool>) -> Option<Tool> {
+    named.filter(|to| *to != from).or(match from {
+        Tool::Codex => Some(Tool::Claude),
+        Tool::Claude => Some(Tool::Codex),
+        Tool::Hermes => None,
+    })
 }
 
 fn subcommand(tool: Tool) -> &'static str {
@@ -207,6 +214,8 @@ fn write_line_file(path: &Path, line: &str) -> io::Result<()> {
 #[serde(default)]
 struct FailoverDirective {
     enabled: bool,
+    /// The harness that the turn moves to.
+    harness: Option<String>,
     model: Option<String>,
 }
 
@@ -214,8 +223,20 @@ impl Default for FailoverDirective {
     fn default() -> Self {
         Self {
             enabled: true,
+            harness: None,
             model: None,
         }
+    }
+}
+
+impl FailoverDirective {
+    /// The named harness, if this build knows it.
+    fn target(&self) -> Option<Tool> {
+        let name = self.harness.as_deref()?;
+        parse_harness(name).or_else(|| {
+            eprintln!("harness-server: cannot fail over to harness `{name}`");
+            None
+        })
     }
 }
 
@@ -411,6 +432,7 @@ impl HarnessChild {
         tool: Tool,
         generation: u64,
         events: &Sender<Event>,
+        homes: &Homes,
         moved: bool,
         converted: bool,
     ) -> Result<Self> {
@@ -421,6 +443,8 @@ impl HarnessChild {
             .env_remove(RESUME_REQUIRED_ENV)
             .env(CODEX_THREAD_PERSIST_ENV, "1")
             .env(CLAUDE_SESSION_PERSIST_ENV, "1")
+            // Hermes keeps its session key where the switch reads it.
+            .env(SESSION_FILE_ENV, persisted_id_file(Tool::Hermes, homes))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -430,7 +454,8 @@ impl HarnessChild {
         if moved {
             command
                 .env_remove("CODEX_CONTINUE_THREAD_ID")
-                .env_remove("AMP_CONTINUE_THREAD_ID");
+                .env_remove("AMP_CONTINUE_THREAD_ID")
+                .env_remove("HERMES_CONTINUE_SESSION_ID");
         }
         let mut process = command.spawn()?;
         let stdin = process.stdin.take();
@@ -530,6 +555,8 @@ struct Turn {
     input: Option<TurnInput>,
     progressed: bool,
     may_fail_over: bool,
+    /// The harness that the turn moves to when its provider is exhausted.
+    target: Option<Tool>,
 }
 
 /// The session that the next harness resumes, and where it came from.
@@ -646,7 +673,7 @@ impl Supervisor {
         }
         let (events_tx, events) = mpsc::channel();
         spawn_stdin_reader(events_tx.clone());
-        let child = HarnessChild::spawn(active, 0, &events_tx, active != requested, false)?;
+        let child = HarnessChild::spawn(active, 0, &events_tx, &homes, active != requested, false)?;
         let supervisor = Self {
             events_tx,
             events,
@@ -755,14 +782,20 @@ impl Supervisor {
                 Some(turn) => turn.id = id,
                 None => {
                     let input = self.queued.pop_front();
-                    let may_fail_over = input
-                        .as_ref()
-                        .is_none_or(|input| input.failover.enabled && !input.replayed);
+                    let target = failover_target(
+                        self.child.tool,
+                        input.as_ref().and_then(|input| input.failover.target()),
+                    );
+                    let may_fail_over = target.is_some()
+                        && input
+                            .as_ref()
+                            .is_none_or(|input| input.failover.enabled && !input.replayed);
                     self.turn = Some(Turn {
                         id,
                         input,
                         progressed: false,
                         may_fail_over,
+                        target,
                     });
                 }
             }
@@ -802,12 +835,17 @@ impl Supervisor {
         self.emit_line(line)
     }
 
-    /// Moves the running turn to the other harness. `trigger` is the line
+    /// Moves the running turn to its failover harness. `trigger` is the line
     /// that reported the exhausted provider; it is not printed.
     fn fail_over(&mut self, mut trigger: Value, exhausted: Value) -> Result<()> {
         let mut turn = self.turn.take().expect("a running turn");
         let from = self.child.tool;
-        let to = other(from);
+        let Some(to) = turn.target else {
+            // `may_fail_over` requires a target; fail as without a switch.
+            turn.may_fail_over = false;
+            self.turn = Some(turn);
+            return self.emit_value(&trigger);
+        };
         let ended = ends_turn(&trigger, turn.id.as_deref());
         let trailing = if turn.progressed {
             TrailingPrompt::Keep
@@ -1100,6 +1138,7 @@ impl Supervisor {
             to,
             self.child.generation + 1,
             &self.events_tx,
+            &self.homes,
             true,
             converted,
         )?;
@@ -1197,12 +1236,40 @@ mod tests {
 
     #[test]
     fn harness_names_match_the_control_plane() {
-        for tool in [Tool::Codex, Tool::Claude] {
+        for tool in [Tool::Codex, Tool::Claude, Tool::Hermes] {
             assert_eq!(parse_harness(harness_name(tool)), Some(tool));
-            assert_eq!(other(other(tool)), tool);
         }
         assert_eq!(parse_harness("claude-code"), Some(Tool::Claude));
         assert_eq!(parse_harness("amp"), None);
+    }
+
+    #[test]
+    fn a_turn_fails_over_to_the_named_harness_or_the_default_pair() {
+        assert_eq!(failover_target(Tool::Codex, None), Some(Tool::Claude));
+        assert_eq!(failover_target(Tool::Claude, None), Some(Tool::Codex));
+        // Hermes moves only when the control plane names a harness.
+        assert_eq!(failover_target(Tool::Hermes, None), None);
+        assert_eq!(
+            failover_target(Tool::Hermes, Some(Tool::Claude)),
+            Some(Tool::Claude)
+        );
+        assert_eq!(
+            failover_target(Tool::Codex, Some(Tool::Hermes)),
+            Some(Tool::Hermes)
+        );
+        // The active harness is not a target.
+        assert_eq!(
+            failover_target(Tool::Codex, Some(Tool::Codex)),
+            Some(Tool::Claude)
+        );
+
+        let mut line = json!({"type": "user", "centaur": {"failover": {"harness": "claudecode"}}});
+        assert_eq!(
+            take_directive(&mut line).failover.target(),
+            Some(Tool::Claude)
+        );
+        let mut line = json!({"type": "user", "centaur": {"failover": {"harness": "gemini"}}});
+        assert_eq!(take_directive(&mut line).failover.target(), None);
     }
 
     #[test]

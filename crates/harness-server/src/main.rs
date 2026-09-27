@@ -121,6 +121,7 @@ fn run() -> Result<()> {
         CliCommand::ClaudeCode(command) => run_mode(HarnessKind::ClaudeCode, command.mode),
         CliCommand::Amp(command) => run_mode(HarnessKind::Amp, command.mode),
         CliCommand::Nanocodex => run_nanocodex_blocks_server(),
+        CliCommand::Hermes if switching_enabled() => run_switchable_blocks_server(Tool::Hermes),
         CliCommand::Hermes => run_hermes_blocks_server(),
         CliCommand::ValidateJsonrpc => run_validate_jsonrpc(),
         CliCommand::ValidateAgentDeltas => run_validate_agent_deltas(),

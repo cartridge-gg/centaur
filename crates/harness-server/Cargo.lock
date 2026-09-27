@@ -1744,6 +1744,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "session-transfer",

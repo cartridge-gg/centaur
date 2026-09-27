@@ -317,8 +317,19 @@ impl HermesChild {
         )?;
         if let Some(resume) = resume {
             // A failed resume must not silently replace an existing conversation.
-            let result = self.rpc("session.resume", json!({"session_id": resume, "cols": 200}))?;
+            // The source sets the platform of the live session, as on create.
+            let result = self.rpc(
+                "session.resume",
+                json!({"session_id": resume, "cols": 200, "source": "centaur"}),
+            )?;
             return self.accept_session(&result, true);
+        }
+        // A session that a harness switch converted: without its history, the
+        // switch goes back to the session it came from.
+        if crate::switch::resume_required() {
+            return Err(HarnessServerError::Protocol(
+                "the converted Hermes session to resume has no session key".into(),
+            ));
         }
 
         let mut params = json!({
