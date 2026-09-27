@@ -307,8 +307,9 @@ Codex, api-rs fails fast at startup if the broker credential is missing.
 A subscription or an account pool can run out of capacity: a usage limit, or
 every account rate limited. Without failover, each turn on that harness fails
 until the provider resets. With `apiRs.providerFailover.enabled: true`, a
-Codex session continues on Claude Code, and a Claude Code session continues
-on Codex:
+Codex session continues on Claude Code, and a Claude Code or Hermes session
+continues on Codex. A Hermes session that moved to Codex continues on Claude
+Code if the Codex provider is exhausted too:
 
 1. The harness server in the sandbox detects the exhausted provider. Native
    usage-limit errors always count. Set `apiRs.providerExhaustedMarkers` to
@@ -316,7 +317,9 @@ on Codex:
    error counts too. Put the code in the error message: Codex keeps only the
    message. For Claude Code, return a `rate_limit_error` or `api_error` body
    with `x-should-retry: false`. Claude Code retries an `overloaded_error`
-   and then shows a generic overload text without the proxy's message.
+   and then shows a generic overload text without the proxy's message. Hermes
+   has no native usage-limit error: add a marker that its provider error
+   contains, for example the error text of the proxy or of OpenRouter.
 2. It holds back the failure, converts the native session (the full history,
    with tool calls as text), and resumes it on the other harness in the same
    sandbox. The workspace and the state volume stay.
@@ -342,8 +345,10 @@ A session has one transcript: the native session of the harness that it runs
 on. Each switch converts that transcript for the other harness, so the history
 of every turn goes with the session, also when it switches back. A request
 with `harness_explicit: true` for the harness that the session left (for
-example `--codex` in Slack) moves the session back in the same sandbox, with a
-conversion of the current transcript. After the sandbox is replaced, the
+example `--codex` or `--hermes` in Slack) moves the session back in the same
+sandbox, with a conversion of the current transcript. A session goes back to
+Hermes through the Hermes session import, with the Python in
+`$HERMES_PYTHON`. After the sandbox is replaced, the
 request restarts the session on that harness, as before.
 
 A conversion never changes or deletes the session that it reads. That session
@@ -395,7 +400,8 @@ apiRs:
     threadPrefixes: ""
 ```
 
-Both harnesses need credentials. Only sandboxes created after the change can
+Each harness that a session can move to needs credentials: a Hermes sandbox
+needs the Codex credentials too. Only sandboxes created after the change can
 switch; a running or paused sandbox keeps its old behavior until it is
 replaced.
 

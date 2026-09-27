@@ -55,27 +55,38 @@ impl ProviderFailoverConfig {
 /// converted session and went back (`revert`).
 pub(crate) const FAILOVER_MODES: [&str; 4] = ["reactive", "proactive", "requested", "revert"];
 
+/// The harnesses whose sessions can fail over.
+pub(crate) const FAILOVER_HARNESSES: [HarnessType; 3] = [
+    HarnessType::Codex,
+    HarnessType::ClaudeCode,
+    HarnessType::Hermes,
+];
+
 /// Creates the metrics of switches and of turns that failed on an exhausted
 /// provider at 0. These events are rare, and `increase()` cannot see the first
 /// increment of a series that starts at 1; each process start begins new
-/// series.
+/// series. A switch goes to the failover target, or back from it (`requested`,
+/// `revert`), so each pair has both directions.
 pub(crate) fn init_metrics(failover_enabled: bool) {
-    for harness in [HarnessType::Codex, HarnessType::ClaudeCode] {
+    for harness in FAILOVER_HARNESSES {
         init_session_failure(harness.as_ref(), crate::PROVIDER_EXHAUSTED_FAILURE_CLASS);
-        if let Some(other) = failover_target(&harness).filter(|_| failover_enabled) {
+        if let Some(target) = failover_target(&harness).filter(|_| failover_enabled) {
             for mode in FAILOVER_MODES {
-                init_session_provider_failover(harness.as_ref(), other.as_ref(), mode);
+                init_session_provider_failover(harness.as_ref(), target.as_ref(), mode);
+                init_session_provider_failover(target.as_ref(), harness.as_ref(), mode);
             }
         }
     }
 }
 
-/// The harness that a session on `harness` fails over to.
+/// The harness that a session on `harness` fails over to. Codex and Claude
+/// Code fail over to each other, and Hermes to Codex. So a Hermes session
+/// can move on to Claude Code when the Codex provider is exhausted too.
 pub(crate) fn failover_target(harness: &HarnessType) -> Option<HarnessType> {
     match harness {
         HarnessType::Codex => Some(HarnessType::ClaudeCode),
-        HarnessType::ClaudeCode => Some(HarnessType::Codex),
-        HarnessType::Amp | HarnessType::Nanocodex | HarnessType::Hermes => None,
+        HarnessType::ClaudeCode | HarnessType::Hermes => Some(HarnessType::Codex),
+        HarnessType::Amp | HarnessType::Nanocodex => None,
     }
 }
 
@@ -93,8 +104,10 @@ pub(crate) struct FailoverDirective {
     /// The harness for the turn. When the sandbox runs another one, it moves
     /// the session before the turn starts.
     pub harness: HarnessType,
-    /// The session may move to the other harness if the provider fails.
+    /// The session may move to `target` if the provider fails.
     pub enabled: bool,
+    /// The failover target of `harness`.
+    pub target: Option<HarnessType>,
     /// The model after such a move.
     pub model: Option<String>,
     /// The user lines were written for another harness: their model,
@@ -108,6 +121,9 @@ pub(crate) struct FailoverDirective {
 impl FailoverDirective {
     fn to_value(&self) -> Value {
         let mut failover = json!({"enabled": self.enabled});
+        if let Some(target) = &self.target {
+            failover["harness"] = json!(target.as_ref());
+        }
         if let Some(model) = &self.model {
             failover["model"] = json!(model);
         }
@@ -262,16 +278,19 @@ mod tests {
     }
 
     #[test]
-    fn only_codex_and_claude_code_fail_over() {
-        assert_eq!(
-            failover_target(&HarnessType::Codex),
-            Some(HarnessType::ClaudeCode)
-        );
-        assert_eq!(
-            failover_target(&HarnessType::ClaudeCode),
-            Some(HarnessType::Codex)
-        );
-        assert_eq!(failover_target(&HarnessType::Hermes), None);
+    fn codex_claude_code_and_hermes_fail_over() {
+        for (harness, target) in [
+            (HarnessType::Codex, Some(HarnessType::ClaudeCode)),
+            (HarnessType::ClaudeCode, Some(HarnessType::Codex)),
+            (HarnessType::Hermes, Some(HarnessType::Codex)),
+            (HarnessType::Amp, None),
+            (HarnessType::Nanocodex, None),
+        ] {
+            assert_eq!(failover_target(&harness), target, "{harness}");
+        }
+        for harness in FAILOVER_HARNESSES {
+            assert!(failover_target(&harness).is_some(), "{harness}");
+        }
     }
 
     #[test]
@@ -288,6 +307,7 @@ mod tests {
         let directive = FailoverDirective {
             harness: HarnessType::ClaudeCode,
             enabled: true,
+            target: Some(HarnessType::Codex),
             model: Some("gpt-5.5".to_owned()),
             retarget_model: None,
             requested: false,
@@ -300,7 +320,8 @@ mod tests {
         let user: Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(
             user["centaur"],
-            json!({"harness": "claudecode", "failover": {"enabled": true, "model": "gpt-5.5"}})
+            json!({"harness": "claudecode",
+                   "failover": {"enabled": true, "harness": "codex", "model": "gpt-5.5"}})
         );
         assert_eq!(user["model"], "claude-opus-5-5");
         assert!(!lines[1].contains("centaur"));
@@ -312,6 +333,7 @@ mod tests {
         let directive = FailoverDirective {
             harness: HarnessType::ClaudeCode,
             enabled: false,
+            target: None,
             model: None,
             retarget_model: Some(Some("claude-opus-5-5".to_owned())),
             requested: true,
@@ -339,6 +361,11 @@ mod tests {
             notice.provider_exhausted().unwrap()["resetAt"],
             1_790_220_376
         );
+
+        let back = FailoverNotice::parse(&json!({"method": "centaur/providerFailover",
+            "params": {"from": "codex", "to": "hermes", "mode": "requested"}}))
+        .unwrap();
+        assert_eq!(back.to, HarnessType::Hermes);
 
         let unknown = json!({"method": "centaur/providerFailover", "params": {"from": "codex", "to": "gemini"}});
         assert_eq!(FailoverNotice::parse(&unknown), None);
@@ -391,7 +418,12 @@ mod tests {
         centaur_telemetry::prometheus_handle().unwrap();
         init_metrics(true);
         let metrics = centaur_telemetry::render_metrics().unwrap();
-        for (from, to) in [("codex", "claudecode"), ("claudecode", "codex")] {
+        for (from, to) in [
+            ("codex", "claudecode"),
+            ("claudecode", "codex"),
+            ("hermes", "codex"),
+            ("codex", "hermes"),
+        ] {
             for mode in FAILOVER_MODES {
                 let series = format!(
                     r#"centaur_session_provider_failovers_total{{from="{from}",to="{to}",mode="{mode}"}} "#
@@ -399,7 +431,7 @@ mod tests {
                 assert!(metrics.contains(&series), "{series}");
             }
         }
-        for harness in ["codex", "claudecode"] {
+        for harness in ["codex", "claudecode", "hermes"] {
             let series = format!(
                 r#"centaur_session_failures_total{{failure_class="provider_exhausted",harness="{harness}"}} "#
             );

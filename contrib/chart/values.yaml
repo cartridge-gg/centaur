@@ -532,11 +532,12 @@ apiRs:
   # its whole account pool is rate limited. Such a failure is reported as
   # `provider_exhausted`. Native usage-limit errors are recognized without it.
   providerExhaustedMarkers: ""
-  # Continue a Codex or Claude Code session on the other harness when the
-  # model provider of its harness has no capacity left. The sandbox converts
-  # the session and resumes it on the other harness, in the same turn, and
-  # the client gets a `session.provider_failover` event. Only sandboxes
-  # created after the change can switch.
+  # Continue a session on another harness when the model provider of its
+  # harness has no capacity left: Codex moves to Claude Code, and Claude Code
+  # and Hermes move to Codex. The sandbox converts the session and resumes it
+  # on the other harness, in the same turn, and the client gets a
+  # `session.provider_failover` event. Only sandboxes created after the
+  # change can switch.
   #   models: comma-separated `harness=model` pairs for the model after a
   #     switch, for example "codex=gpt-5-codex". Empty: the harness default.
   #   threadPrefixes: comma-separated thread key prefixes of the sessions
