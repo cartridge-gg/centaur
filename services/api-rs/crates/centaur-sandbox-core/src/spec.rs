@@ -193,6 +193,11 @@ pub struct Mount {
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_path: Option<String>,
+    /// State shared by many sandboxes (for example a claim every session
+    /// mounts), as opposed to state that belongs to one sandbox. Capability
+    /// checks drop shared mounts for principals that must not see team state.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared: bool,
 }
 
 impl Mount {
@@ -202,7 +207,13 @@ impl Mount {
             target_path: target_path.into(),
             read_only: false,
             sub_path: None,
+            shared: false,
         }
+    }
+
+    pub fn shared(mut self) -> Self {
+        self.shared = true;
+        self
     }
 
     pub fn read_only(mut self) -> Self {

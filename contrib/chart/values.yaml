@@ -405,6 +405,18 @@ sandbox:
     size: 10Gi
     storageClassName: ""
     mountPath: /home/agent/state
+  # Existing PersistentVolumeClaims mounted into session sandboxes. Every
+  # matching sandbox mounts the same claim, so their sessions share its files
+  # (for example Hermes's memory and learned skills: link
+  # $HERMES_HOME/memories and $HERMES_HOME/skills into it). Create the claim
+  # yourself; api-rs never creates or deletes it. `harnesses` limits the mount
+  # to those harnesses (empty: all); `readOnly` defaults to false. Principals
+  # without full repo-cache access never get these mounts.
+  #   sharedVolumes:
+  #     - claimName: hermes-shared
+  #       mountPath: /home/agent/shared
+  #       harnesses: [hermes]
+  sharedVolumes: []
   # Requests/limits for the agent container of every sandbox pod, per-session
   # and warm (k8s resources map).
   resources: {}

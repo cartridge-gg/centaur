@@ -413,12 +413,46 @@ pub enum SandboxWorkloadMode {
         image: String,
         env: Vec<(String, String)>,
         mounts: Vec<Mount>,
+        /// Existing claims mounted into the sandboxes of their harnesses.
+        shared_volumes: Vec<SharedVolume>,
         /// Applied to every sandbox pod, per-session and warm.
         resources: Option<ResourceRequirements>,
         /// The harness used for warm sandboxes and as the workload default.
         /// Per-session sandboxes run the session's own harness.
         harness: HarnessType,
     },
+}
+
+/// An existing claim that every session sandbox of the listed harnesses
+/// mounts, so those sessions share one copy of its files (for example
+/// Hermes's memory and learned skills). Only principals with full repo-cache
+/// access get it: the files are team state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SharedVolume {
+    pub claim_name: String,
+    pub mount_path: String,
+    pub read_only: bool,
+    /// Empty means every harness.
+    pub harnesses: Vec<HarnessType>,
+}
+
+impl SharedVolume {
+    fn applies_to(&self, harness: &HarnessType) -> bool {
+        self.harnesses.is_empty() || self.harnesses.contains(harness)
+    }
+
+    fn mount(&self) -> Mount {
+        let mount = Mount::new(
+            centaur_sandbox_core::MountKind::NamedVolume(self.claim_name.clone()),
+            self.mount_path.clone(),
+        )
+        .shared();
+        if self.read_only {
+            mount.read_only()
+        } else {
+            mount
+        }
+    }
 }
 
 /// What to do when a session already exists with a different harness.
@@ -5254,6 +5288,7 @@ impl SandboxWorkloadMode {
             image: image.into(),
             env: env.into_iter().collect(),
             mounts: Vec::new(),
+            shared_volumes: Vec::new(),
             resources: None,
             harness,
         }
@@ -5263,6 +5298,14 @@ impl SandboxWorkloadMode {
         match &mut self {
             Self::MockAppServer { .. } => {}
             Self::CodexAppServer { mounts, .. } => mounts.push(mount),
+        }
+        self
+    }
+
+    pub fn shared_volume(mut self, volume: SharedVolume) -> Self {
+        match &mut self {
+            Self::MockAppServer { .. } => {}
+            Self::CodexAppServer { shared_volumes, .. } => shared_volumes.push(volume),
         }
         self
     }
@@ -5316,6 +5359,7 @@ impl SandboxWorkloadMode {
                 image,
                 env,
                 mounts,
+                shared_volumes,
                 resources,
                 ..
             } => {
@@ -5334,6 +5378,9 @@ impl SandboxWorkloadMode {
                 }
                 for mount in mounts {
                     spec = spec.mount(mount.clone());
+                }
+                for volume in shared_volumes.iter().filter(|v| v.applies_to(harness)) {
+                    spec = spec.mount(volume.mount());
                 }
                 for (name, value) in env {
                     spec = spec.env(name.clone(), value.clone());
@@ -6995,10 +7042,12 @@ fn apply_sandbox_capabilities(spec: &mut SandboxSpec, capabilities: &SessionSand
     match capabilities.repo_cache {
         SessionRepoCacheAccess::None => {
             spec.mounts
-                .retain(|mount| mount.target_path != SANDBOX_REPOS_MOUNT_PATH);
+                .retain(|mount| mount.target_path != SANDBOX_REPOS_MOUNT_PATH && !mount.shared);
             remove_spec_env(spec, CENTAUR_SKILL_DIRS_ENV);
         }
         SessionRepoCacheAccess::Public => {
+            // Shared claims hold team state; only full repo-cache access sees it.
+            spec.mounts.retain(|mount| !mount.shared);
             scope_repo_cache_mounts_to_public(spec);
             scope_skill_dirs_to_public(spec);
         }
@@ -9692,6 +9741,81 @@ mod tests {
             harness_thread_id_from_output_line(r#"{"type":"turn.started","turn_id":"turn-1"}"#),
             None
         );
+    }
+
+    fn hermes_shared_volume() -> SharedVolume {
+        SharedVolume {
+            claim_name: "hermes-shared".to_owned(),
+            mount_path: "/home/agent/shared".to_owned(),
+            read_only: false,
+            harnesses: vec![HarnessType::Hermes],
+        }
+    }
+
+    #[test]
+    fn shared_volumes_mount_only_into_their_harnesses() {
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            Vec::<(String, String)>::new(),
+            HarnessType::Codex,
+        )
+        .shared_volume(hermes_shared_volume())
+        .shared_volume(SharedVolume {
+            claim_name: "docs".to_owned(),
+            mount_path: "/mnt/docs".to_owned(),
+            read_only: true,
+            harnesses: Vec::new(),
+        });
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+
+        let hermes = workload.spec(&thread_key, &HarnessType::Hermes, None);
+        let codex = workload.spec(&thread_key, &HarnessType::Codex, None);
+
+        let paths = |spec: &SandboxSpec| {
+            spec.mounts
+                .iter()
+                .map(|mount| mount.target_path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&hermes), ["/home/agent/shared", "/mnt/docs"]);
+        assert_eq!(paths(&codex), ["/mnt/docs"]);
+        let shared = &hermes.mounts[0];
+        assert_eq!(
+            shared.kind,
+            MountKind::NamedVolume("hermes-shared".to_owned())
+        );
+        assert!(shared.shared && !shared.read_only);
+        assert!(hermes.mounts[1].shared && hermes.mounts[1].read_only);
+    }
+
+    #[test]
+    fn only_full_repo_cache_access_keeps_shared_volumes() {
+        for (access, kept) in [
+            (SessionRepoCacheAccess::None, false),
+            (SessionRepoCacheAccess::Public, false),
+            (SessionRepoCacheAccess::All, true),
+        ] {
+            let mut spec = SandboxSpec::new("mock")
+                .mount(hermes_shared_volume().mount())
+                .mount(Mount::new(MountKind::EmptyDir, "/workspace"));
+            let capabilities = SessionSandboxCapabilities {
+                repo_cache: access.clone(),
+                observability_enabled: true,
+            };
+
+            apply_sandbox_capabilities(&mut spec, &capabilities);
+
+            let has_shared = spec
+                .mounts
+                .iter()
+                .any(|mount| mount.target_path == "/home/agent/shared");
+            assert_eq!(has_shared, kept, "{access:?}");
+            assert!(
+                spec.mounts
+                    .iter()
+                    .any(|mount| mount.target_path == "/workspace")
+            );
+        }
     }
 
     #[test]

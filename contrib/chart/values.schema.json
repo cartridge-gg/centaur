@@ -260,6 +260,23 @@
         "serviceAccountName": { "type": "string" },
         "reposPath": { "type": "string" },
         "resources": { "type": "object" },
+        "sharedVolumes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["claimName", "mountPath"],
+            "properties": {
+              "claimName": { "type": "string", "minLength": 1 },
+              "mountPath": { "type": "string", "pattern": "^/" },
+              "readOnly": { "type": "boolean" },
+              "harnesses": {
+                "type": "array",
+                "items": { "enum": ["codex", "amp", "claudecode", "nanocodex", "hermes"] }
+              }
+            }
+          }
+        },
         "telemetry": {
           "type": "object",
           "properties": {

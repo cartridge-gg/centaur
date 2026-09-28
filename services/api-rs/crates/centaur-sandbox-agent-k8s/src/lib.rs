@@ -1135,6 +1135,18 @@ fn build_agent_sandbox(
         volume_mounts.extend(tools::agent_volume_mounts_json(repo_cache_tools));
         volumes.extend(tools::volumes_json(repo_cache_tools));
     }
+    // Two volumes at one path make Kubernetes refuse the pod, which would only
+    // show as a sandbox that never becomes ready.
+    let mut mount_paths = std::collections::HashSet::new();
+    for mount in &volume_mounts {
+        if let Some(path) = mount["mountPath"].as_str()
+            && !mount_paths.insert(path.to_owned())
+        {
+            return Err(SandboxError::InvalidSpec(format!(
+                "two volumes mount at {path}"
+            )));
+        }
+    }
     insert_optional(
         &mut container,
         "volumeMounts",
@@ -1169,9 +1181,14 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
-    // fsGroup makes the tools emptyDir and the state claim writable by the
-    // agent uid; a freshly provisioned claim is root-owned otherwise.
-    if repo_cache_tools.is_some() || config.state_volume.is_some() {
+    // fsGroup makes the tools emptyDir, the state claim, and writable shared
+    // claims writable by the agent uid; a freshly provisioned claim is
+    // root-owned otherwise.
+    let writable_claim = spec
+        .mounts
+        .iter()
+        .any(|mount| !mount.read_only && matches!(mount.kind, MountKind::NamedVolume(_)));
+    if repo_cache_tools.is_some() || config.state_volume.is_some() || writable_claim {
         pod_spec["securityContext"] = tools::pod_security_context_json();
     }
     insert_optional(
@@ -2222,6 +2239,63 @@ mod tests {
                 .is_none_or(|env| env.iter().all(|env| env.name != STATE_DIR_ENV))
         );
         assert!(sandbox.spec.pod_template.spec.security_context.is_none());
+    }
+
+    #[test]
+    fn shared_claim_renders_as_a_writable_pvc_with_fs_group() {
+        let spec = SandboxSpec::new("centaur-agent:latest").mount(
+            centaur_sandbox_core::Mount::new(
+                MountKind::NamedVolume("hermes-shared".to_owned()),
+                "/home/agent/shared",
+            )
+            .shared(),
+        );
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        let pod = serde_json::to_value(&sandbox.spec.pod_template.spec).unwrap();
+        assert_eq!(
+            pod["volumes"][0]["persistentVolumeClaim"],
+            json!({"claimName": "hermes-shared", "readOnly": false})
+        );
+        let mount = &pod["containers"][0]["volumeMounts"][0];
+        assert_eq!(mount["mountPath"], "/home/agent/shared");
+        assert_eq!(mount["readOnly"], false);
+        assert_eq!(mount["name"], pod["volumes"][0]["name"]);
+        // No state volume and no tools: the writable claim alone needs fsGroup.
+        assert_eq!(pod["securityContext"]["fsGroup"], 1001);
+
+        let read_only = SandboxSpec::new("centaur-agent:latest").mount(
+            centaur_sandbox_core::Mount::new(
+                MountKind::NamedVolume("docs".to_owned()),
+                "/mnt/docs",
+            )
+            .read_only(),
+        );
+        let sandbox =
+            build_agent_sandbox(&SandboxId::new("asbx-test"), &read_only, &config).unwrap();
+        assert!(sandbox.spec.pod_template.spec.security_context.is_none());
+    }
+
+    #[test]
+    fn two_volumes_at_one_path_are_refused() {
+        let spec =
+            SandboxSpec::new("centaur-agent:latest").mount(centaur_sandbox_core::Mount::new(
+                MountKind::NamedVolume("hermes-shared".to_owned()),
+                "/home/agent/state",
+            ));
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings())
+            .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"));
+
+        let error = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("two volumes mount at /home/agent/state"),
+            "{error}"
+        );
     }
 
     #[test]
