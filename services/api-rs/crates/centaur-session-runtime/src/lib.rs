@@ -45,7 +45,7 @@ use futures_util::{FutureExt, SinkExt, Stream, StreamExt, future::BoxFuture, str
 use provider_failover::{
     FailoverDirective, FailoverNotice, PROVIDER_FAILOVER_EVENT, PROVIDER_FAILOVER_METADATA_KEY,
     execution_allows_failover, failover_record, failover_target, kept_after_failover,
-    switch_pending, switched_in,
+    switch_pending, switched_in, with_left,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2451,13 +2451,16 @@ impl SessionRuntime {
                             if kept_after_failover(record.as_ref(), harness_type, &existing)
                                 && switched_in(record.as_ref(), current_sandbox.as_deref()) =>
                         {
-                            let mut requested = failover_record(
-                                &existing_harness,
-                                harness_type,
-                                "requested",
-                                None,
-                                None,
-                                current_sandbox.as_deref(),
+                            let mut requested = with_left(
+                                failover_record(
+                                    &existing_harness,
+                                    harness_type,
+                                    "requested",
+                                    None,
+                                    None,
+                                    current_sandbox.as_deref(),
+                                ),
+                                record.as_ref(),
                             );
                             requested["pending"] = json!(true);
                             if self
@@ -2683,8 +2686,10 @@ impl SessionRuntime {
         if allowed && current_exhausted && !other_exhausted && !requested {
             retarget_model = Some(config.model_for(&other).map(str::to_owned));
             if session.sandbox_id.is_none() {
-                let record =
-                    failover_record(&harness, &other, "proactive", execution_id, None, None);
+                let record = with_left(
+                    failover_record(&harness, &other, "proactive", execution_id, None, None),
+                    record.as_ref(),
+                );
                 if self
                     .store
                     .fail_over_session_harness(&session.thread_key, &harness, &other, &record)
@@ -7265,13 +7270,31 @@ async fn record_provider_failover(
     let reset_at = exhausted
         .and_then(|exhausted| exhausted.get("resetAt"))
         .and_then(Value::as_i64);
-    let record = failover_record(
-        &notice.from,
-        &notice.to,
-        &notice.mode,
-        Some(execution_id),
-        reset_at,
-        Some(sandbox_id),
+    // The last switch, for the harnesses that the session left in this sandbox.
+    let previous = ctx
+        .store
+        .session_metadata_value(thread_key, PROVIDER_FAILOVER_METADATA_KEY)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_provider_failover_record_failed",
+                thread_key = %thread_key,
+                %error,
+                "failed to read the last switch"
+            );
+            None
+        });
+    let record = with_left(
+        failover_record(
+            &notice.from,
+            &notice.to,
+            &notice.mode,
+            Some(execution_id),
+            reset_at,
+            Some(sandbox_id),
+        ),
+        previous.as_ref(),
     );
     match ctx
         .store
@@ -13903,7 +13926,7 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hermes_session_fails_over_to_codex_and_can_go_back() {
+    async fn a_hermes_session_fails_over_twice_and_can_go_back() {
         let Some(store) = test_store().await else {
             return;
         };
@@ -13975,7 +13998,35 @@ mod adoption_tests {
         assert_eq!(directive.target, Some(HarnessType::ClaudeCode));
         assert!(directive.enabled);
 
-        // The user names Hermes: the sandbox of the switch moves the session
+        // The Codex provider is exhausted too: the session moves on to
+        // Claude Code, and the record keeps both harnesses that it left.
+        let notice = FailoverNotice::parse(&json!({"method": "centaur/providerFailover",
+            "params": {"from": "codex", "to": "claudecode", "mode": "reactive", "history": "converted",
+                       "providerExhausted": {"signal": "poolMarker"}}}))
+        .unwrap();
+        record_provider_failover(&ctx, &thread_key, "sbx-hermes", "exec-failover-2", &notice).await;
+        let session = store.get_session(&thread_key).await.expect("load session");
+        assert_eq!(session.harness_type, HarnessType::ClaudeCode);
+        let record = session_metadata(&store, &thread_key).await["provider_failover"].clone();
+        assert_eq!(record["left"], json!(["hermes", "codex"]));
+
+        // A client that did not see the switches still asks for Hermes: the
+        // session stays on Claude Code with its sandbox.
+        let outcome = runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Hermes,
+                None,
+                Some(json!({})),
+                HarnessConflictPolicy::Restart,
+            )
+            .await
+            .expect("load session");
+        assert!(!outcome.harness_switched);
+        assert_eq!(outcome.session.harness_type, HarnessType::ClaudeCode);
+        assert_eq!(outcome.session.sandbox_id.as_deref(), Some("sbx-hermes"));
+
+        // The user names Hermes: the sandbox of the switches moves the session
         // back, although the Hermes provider is still exhausted.
         let outcome = runtime
             .create_or_get_session(
@@ -13990,6 +14041,12 @@ mod adoption_tests {
         assert!(!outcome.harness_switched);
         assert_eq!(outcome.session.harness_type, HarnessType::Hermes);
         assert_eq!(outcome.session.sandbox_id.as_deref(), Some("sbx-hermes"));
+        let requested = outcome
+            .provider_failover
+            .clone()
+            .expect("the switch record");
+        assert_eq!(requested["from"], "claudecode");
+        assert_eq!(requested["left"], json!(["codex", "claudecode"]));
         let (session, directive) = runtime
             .plan_provider_failover(outcome.session, None, None)
             .await

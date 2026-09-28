@@ -240,19 +240,65 @@ pub(crate) fn switch_pending(record: Option<&Value>) -> bool {
         == Some(true)
 }
 
+/// The harnesses that the session left in the switches of the sandbox of
+/// `record`, oldest first. A record from before this list names only `from`.
+pub(crate) fn left_harnesses(record: Option<&Value>) -> Vec<String> {
+    let Some(record) = record else {
+        return Vec::new();
+    };
+    match record.get("left").and_then(Value::as_array) {
+        Some(left) => left
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        None => record
+            .get("from")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// `record`, a switch from [`failover_record`], with `left`: the harnesses
+/// that the session left in the switches of this sandbox, oldest first, with
+/// the `from` of this switch last. The list of `previous` goes on while the
+/// sandbox stays, so a session that left Hermes and then Codex has both. The
+/// harness that the session runs on is never in it.
+pub(crate) fn with_left(mut record: Value, previous: Option<&Value>) -> Value {
+    let sandbox_id = record.get("sandbox_id").and_then(Value::as_str);
+    let mut left = if switched_in(previous, sandbox_id) {
+        left_harnesses(previous)
+    } else {
+        Vec::new()
+    };
+    let from = record
+        .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let to = record.get("to").and_then(Value::as_str).unwrap_or_default();
+    left.retain(|harness| harness != from && harness != to);
+    if !from.is_empty() {
+        left.push(from.to_owned());
+    }
+    record["left"] = json!(left);
+    record
+}
+
 /// True when the session left `requested` in a failover and still runs on
 /// `existing`: a request for `requested` is from a client that did not see
-/// the switch.
+/// the switch, or, with `harness_explicit`, a request to go back. The session
+/// can have left more than one harness in its sandbox.
 pub(crate) fn kept_after_failover(
     record: Option<&Value>,
     requested: &HarnessType,
     existing: &str,
 ) -> bool {
-    let Some(record) = record else {
-        return false;
-    };
-    record.get("from").and_then(Value::as_str) == Some(requested.as_ref())
-        && record.get("to").and_then(Value::as_str) == Some(existing)
+    record.is_some_and(|record| record.get("to").and_then(Value::as_str) == Some(existing))
+        && left_harnesses(record)
+            .iter()
+            .any(|harness| harness == requested.as_ref())
 }
 
 #[cfg(test)]
@@ -409,6 +455,70 @@ mod tests {
         assert!(!kept_after_failover(
             None,
             &HarnessType::Codex,
+            "claudecode"
+        ));
+    }
+
+    #[test]
+    fn a_session_remembers_every_harness_that_it_left_in_its_sandbox() {
+        let switch =
+            |from: HarnessType, to: HarnessType, sandbox: &str, previous: Option<&Value>| {
+                with_left(
+                    failover_record(&from, &to, "reactive", None, None, Some(sandbox)),
+                    previous,
+                )
+            };
+        let first = switch(HarnessType::Hermes, HarnessType::Codex, "sbx-1", None);
+        assert_eq!(left_harnesses(Some(&first)), ["hermes"]);
+        let second = switch(
+            HarnessType::Codex,
+            HarnessType::ClaudeCode,
+            "sbx-1",
+            Some(&first),
+        );
+        assert_eq!(left_harnesses(Some(&second)), ["hermes", "codex"]);
+        for requested in [HarnessType::Hermes, HarnessType::Codex] {
+            assert!(
+                kept_after_failover(Some(&second), &requested, "claudecode"),
+                "{requested}"
+            );
+        }
+        assert!(!kept_after_failover(
+            Some(&second),
+            &HarnessType::Hermes,
+            "codex"
+        ));
+
+        // Back on Hermes: the list has the other two, and never the harness
+        // that the session runs on.
+        let back = switch(
+            HarnessType::ClaudeCode,
+            HarnessType::Hermes,
+            "sbx-1",
+            Some(&second),
+        );
+        assert_eq!(left_harnesses(Some(&back)), ["codex", "claudecode"]);
+
+        // A switch in another sandbox starts a new list.
+        let elsewhere = switch(
+            HarnessType::Codex,
+            HarnessType::ClaudeCode,
+            "sbx-2",
+            Some(&second),
+        );
+        assert_eq!(left_harnesses(Some(&elsewhere)), ["codex"]);
+
+        // A record from before the list names only `from`.
+        let old = json!({"from": "codex", "to": "claudecode", "sandbox_id": "sbx-1"});
+        assert_eq!(left_harnesses(Some(&old)), ["codex"]);
+        assert!(kept_after_failover(
+            Some(&old),
+            &HarnessType::Codex,
+            "claudecode"
+        ));
+        assert!(!kept_after_failover(
+            Some(&old),
+            &HarnessType::Hermes,
             "claudecode"
         ));
     }

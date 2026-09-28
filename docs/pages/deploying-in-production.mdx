@@ -344,9 +344,13 @@ A harness that is not listed is not known to be exhausted.
 A session has one transcript: the native session of the harness that it runs
 on. Each switch converts that transcript for the other harness, so the history
 of every turn goes with the session, also when it switches back. A request
-with `harness_explicit: true` for the harness that the session left (for
-example `--codex` or `--hermes` in Slack) moves the session back in the same
-sandbox, with a conversion of the current transcript. A session goes back to
+with `harness_explicit: true` for a harness that the session left in its
+sandbox (for example `--codex` or `--hermes` in Slack) moves the session back
+in the same sandbox, with a conversion of the current transcript. The session
+remembers every harness that it left there: after Hermes, then Codex, then
+Claude Code, both `--hermes` and `--codex` go back. A client that did not see
+a switch and still asks for one of these harnesses gets the session where it
+is. A session goes back to
 Hermes through the Hermes session import, with the Python in
 `$HERMES_PYTHON`. After the sandbox is replaced, the
 request restarts the session on that harness, as before.
