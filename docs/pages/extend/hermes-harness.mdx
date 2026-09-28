@@ -45,7 +45,7 @@ inside a Centaur sandbox:
 |---|---|
 | `HERMES_PYTHON` | Interpreter whose environment has `hermes-agent` installed. The sandbox image sets this to the baked-in `/opt/hermes/bin/python3`. |
 | `HERMES_BIN` | The `hermes` CLI used for cron ticks (default: `hermes` on PATH). |
-| `HERMES_HOME` | Hermes state root (config, sessions, memories, skills, cron). Mount a per-team volume here to persist learning across sandboxes. |
+| `HERMES_HOME` | Hermes state root (config, sessions, memories, skills, cron). Keep it per session; share only `memories/` and `skills/` (see Persistence model). |
 | `HERMES_CONTINUE_SESSION_ID` | Explicit durable Hermes session key to resume; takes precedence over the saved key. A failed resume is an error, never a new conversation. |
 | `CENTAUR_HERMES_SESSION_FILE` | Optional file for automatically saving and loading the durable conversation key. Use a persistent path unique to this Centaur session, alongside its persistent `HERMES_HOME`. |
 | `HERMES_CRON_TICK_SECONDS` | Cron tick interval; `0` disables the ticker. |
@@ -74,11 +74,40 @@ until the first submitted turn; compaction updates the saved key. Keep this file
 unique to the Centaur session, even when sharing other Hermes state. Missing
 or corrupt durable history fails explicitly instead of silently starting over.
 
-Everything Hermes learns lives under `HERMES_HOME`. With the default
-throwaway sandbox, memory and skills last only as long as the sandbox; to
-get compounding, cross-thread learning, mount a persistent volume at
-`HERMES_HOME` (per team or per deployment, matching your permission
-boundaries — a shared volume means shared memory).
+Everything Hermes learns lives under `HERMES_HOME`: curated memory in
+`memories/` and learned skills in `skills/`. With the default throwaway
+sandbox they last only as long as the sandbox. To share them across
+sandboxes, mount one claim into every Hermes sandbox with
+`sandbox.sharedVolumes` and, before the gateway starts, link
+`$HERMES_HOME/memories` and `$HERMES_HOME/skills` to folders on it:
+
+```yaml
+sandbox:
+  sharedVolumes:
+    - claimName: hermes-shared
+      mountPath: /home/agent/shared
+      harnesses: [hermes]
+```
+
+Do not share the whole `HERMES_HOME`: it also holds the session database,
+`config.yaml`, and the session file above, which must stay per session.
+What sharing means:
+
+- Memory writes are safe across sandboxes: Hermes re-reads `MEMORY.md` under
+  a file lock before each change (the lock needs every pod on one kernel,
+  which a `ReadWriteOnce` claim guarantees). `USER.md` is in the same folder,
+  so it is shared too; turn it off with `memory.user_profile_enabled: false`
+  if one user profile for everyone is wrong for you.
+- Skill usage records (`skills/.usage.json`) are shared, so a skill the
+  background review created in one sandbox stays curator-managed in all of
+  them. `skill_manage` takes no lock: two writes to the same skill at the
+  same instant leave the later one.
+- Never leave a link whose target is missing: Hermes fails to load its
+  config. Replace the link with an empty folder when the mount is absent.
+- Hermes follows symbolic links when it scans skills, so remove links under
+  the shared `skills/` folder; one link to `/` would stall every session.
+- A new session loads the shared memory and skill index when it starts; a
+  resumed session keeps the system prompt it started with.
 
 ## Images and interruption
 
