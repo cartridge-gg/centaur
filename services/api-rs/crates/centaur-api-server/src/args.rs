@@ -34,7 +34,7 @@ use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
     KeepaliveConfig, PersonaRegistry, ProviderFailoverConfig, ProviderHealthProbeConfig,
     SandboxCapacityConfig, SandboxWorkloadMode, SessionEventRetentionConfig,
-    SessionPrincipalAdmission, SessionSandboxCleanupConfig,
+    SessionPrincipalAdmission, SessionSandboxCleanupConfig, SharedVolume,
 };
 use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
@@ -43,6 +43,19 @@ use tracing::{info, warn};
 use crate::{ServerError, activity_summary::ActivitySummaryConfig};
 
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
+/// Paths a shared volume may not cover: the entrypoint deletes and relinks
+/// the first five into the state volume, and the backend mounts the rest.
+const SHARED_VOLUME_RESERVED_PATHS: [&str; 9] = [
+    "/home/agent/.codex",
+    "/home/agent/.claude",
+    "/home/agent/uploads",
+    "/home/agent/branches",
+    "/home/agent/workspace",
+    "/firewall-certs",
+    "/app/tools",
+    "/tools-bootstrap",
+    "/tools-github-token",
+];
 const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
 const SLACK_BOT_TOKEN_ENV: &str = "SLACK_BOT_TOKEN";
 
@@ -751,6 +764,18 @@ struct SandboxArgs {
     /// into this because api-rs creates these pods at runtime.
     #[arg(long = "session-sandbox-resources", env = "SESSION_SANDBOX_RESOURCES")]
     sandbox_resources_json: Option<String>,
+    /// Existing PersistentVolumeClaims mounted into session sandboxes, as a
+    /// JSON list: `[{"claimName": "hermes-shared", "mountPath":
+    /// "/home/agent/shared", "readOnly": false, "harnesses": ["hermes"]}]`.
+    /// Every matching sandbox mounts the same claim, so they share its files.
+    /// `harnesses` is optional (empty means all). Principals without full
+    /// repo-cache access never get these mounts. The chart renders
+    /// `sandbox.sharedVolumes` into this.
+    #[arg(
+        long = "session-sandbox-shared-volumes",
+        env = "SESSION_SANDBOX_SHARED_VOLUMES"
+    )]
+    shared_volumes_json: Option<String>,
     #[arg(
         long = "session-sandbox-ready-timeout-secs",
         alias = "kubernetes-sandbox-ready-timeout-s",
@@ -1205,6 +1230,12 @@ impl SandboxArgs {
     }
 
     fn local_workload_mode(&self) -> Result<SandboxWorkloadMode, ServerError> {
+        if !self.shared_volumes()?.is_empty() {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_SHARED_VOLUMES requires --session-sandbox-backend agent-k8s"
+                    .to_owned(),
+            ));
+        }
         match self.workload {
             SandboxWorkloadKind::Mock => Ok(SandboxWorkloadMode::mock_app_server(
                 self.agent_image
@@ -1242,9 +1273,76 @@ impl SandboxArgs {
                             .read_only(),
                     );
                 }
+                for volume in self.shared_volumes()? {
+                    workload = workload.shared_volume(volume);
+                }
                 Ok(workload)
             }
         }
+    }
+
+    /// The claims in `SESSION_SANDBOX_SHARED_VOLUMES`. An invalid list stops
+    /// startup: a bad mount would otherwise only show as sandboxes that never
+    /// become ready.
+    fn shared_volumes(&self) -> Result<Vec<SharedVolume>, ServerError> {
+        let Some(raw) = self
+            .shared_volumes_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        else {
+            return Ok(Vec::new());
+        };
+        let entries = serde_json::from_str::<Vec<SharedVolumeEntry>>(raw).map_err(|error| {
+            ServerError::UnsupportedConfig(format!(
+                "SESSION_SANDBOX_SHARED_VOLUMES must be a JSON list of \
+                 {{claimName, mountPath, readOnly?, harnesses?}}: {error}"
+            ))
+        })?;
+        let mut reserved = vec![
+            SANDBOX_REPOS_MOUNT_PATH,
+            self.state_volume_mount_path.trim(),
+        ];
+        reserved.extend(SHARED_VOLUME_RESERVED_PATHS);
+        let mut volumes: Vec<SharedVolume> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let claim_name = entry.claim_name.trim();
+            if claim_name.is_empty() {
+                return Err(ServerError::UnsupportedConfig(
+                    "SESSION_SANDBOX_SHARED_VOLUMES: claimName must not be empty".to_owned(),
+                ));
+            }
+            let mount_path = entry.mount_path.trim();
+            if !mount_path.starts_with('/')
+                || mount_path == "/"
+                || mount_path.ends_with('/')
+                || mount_path
+                    .split('/')
+                    .any(|part| part == "." || part == "..")
+            {
+                return Err(ServerError::UnsupportedConfig(format!(
+                    "SESSION_SANDBOX_SHARED_VOLUMES: mountPath {mount_path:?} must be an \
+                     absolute path inside the sandbox"
+                )));
+            }
+            let taken = reserved
+                .iter()
+                .copied()
+                .chain(volumes.iter().map(|volume| volume.mount_path.as_str()))
+                .find(|other| paths_overlap(mount_path, other));
+            if let Some(other) = taken {
+                return Err(ServerError::UnsupportedConfig(format!(
+                    "SESSION_SANDBOX_SHARED_VOLUMES: mountPath {mount_path:?} overlaps {other:?}"
+                )));
+            }
+            volumes.push(SharedVolume {
+                claim_name: claim_name.to_owned(),
+                mount_path: mount_path.to_owned(),
+                read_only: entry.read_only,
+                harnesses: entry.harnesses,
+            });
+        }
+        Ok(volumes)
     }
 
     fn repos_mount_kind(&self, repos_path: String) -> MountKind {
@@ -2268,6 +2366,22 @@ impl IronProxyArgs {
         }
         names.into_iter().collect()
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SharedVolumeEntry {
+    claim_name: String,
+    mount_path: String,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    harnesses: Vec<HarnessType>,
+}
+
+/// Whether one path equals the other or contains it.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
 }
 
 fn resource_requirements(
@@ -4234,6 +4348,125 @@ mod tests {
         let error = args.sandbox.container_workload_mode().unwrap_err();
         assert!(error.to_string().contains("SESSION_SANDBOX_RESOURCES"));
         assert!(error.to_string().contains("unknown field `request`"));
+    }
+
+    fn shared_volume_args(extra: &[&str]) -> Args {
+        let mut argv = vec![
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+        ];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).unwrap()
+    }
+
+    fn shared_volume_error(json: &str) -> String {
+        shared_volume_args(&["--session-sandbox-shared-volumes", json])
+            .sandbox
+            .container_workload_mode()
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn shared_volumes_reach_the_session_workload() {
+        let args = shared_volume_args(&[
+            "--session-sandbox-shared-volumes",
+            r#"[{"claimName":"hermes-shared","mountPath":"/home/agent/shared","harnesses":["hermes"]},
+                {"claimName":"docs","mountPath":"/mnt/docs","readOnly":true}]"#,
+        ]);
+
+        let SandboxWorkloadMode::CodexAppServer { shared_volumes, .. } =
+            args.sandbox.container_workload_mode().unwrap()
+        else {
+            panic!("expected codex app server workload");
+        };
+
+        assert_eq!(
+            shared_volumes,
+            vec![
+                SharedVolume {
+                    claim_name: "hermes-shared".to_owned(),
+                    mount_path: "/home/agent/shared".to_owned(),
+                    read_only: false,
+                    harnesses: vec![HarnessType::Hermes],
+                },
+                SharedVolume {
+                    claim_name: "docs".to_owned(),
+                    mount_path: "/mnt/docs".to_owned(),
+                    read_only: true,
+                    harnesses: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn blank_shared_volumes_are_unset() {
+        for value in ["", "  ", "[]"] {
+            let args = shared_volume_args(&["--session-sandbox-shared-volumes", value]);
+            assert_eq!(
+                args.sandbox.shared_volumes().unwrap(),
+                Vec::new(),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_volumes_reject_malformed_json_and_unknown_fields() {
+        let error = shared_volume_error("{not json");
+        assert!(error.contains("SESSION_SANDBOX_SHARED_VOLUMES"), "{error}");
+        let error =
+            shared_volume_error(r#"[{"claimName":"c","mountPath":"/mnt/c","subPath":"x"}]"#);
+        assert!(error.contains("unknown field `subPath`"), "{error}");
+        let error = shared_volume_error(
+            r#"[{"claimName":"c","mountPath":"/mnt/c","harnesses":["claude-code"]}]"#,
+        );
+        assert!(error.contains("SESSION_SANDBOX_SHARED_VOLUMES"), "{error}");
+        let error = shared_volume_error(r#"[{"claimName":" ","mountPath":"/mnt/c"}]"#);
+        assert!(error.contains("claimName"), "{error}");
+    }
+
+    #[test]
+    fn shared_volumes_reject_paths_the_sandbox_already_uses() {
+        for path in [
+            "relative",
+            "/",
+            "/mnt/c/",
+            "/mnt/../etc",
+            "/home/agent",
+            "/home",
+            "/home/agent/github",
+            "/home/agent/github/x",
+            "/home/agent/uploads",
+            "/home/agent/state",
+            "/home/agent/state/hermes",
+            "/firewall-certs",
+            "/app/tools",
+        ] {
+            let json = format!(r#"[{{"claimName":"c","mountPath":"{path}"}}]"#);
+            let error = shared_volume_error(&json);
+            assert!(error.contains("mountPath"), "{path}: {error}");
+        }
+        let error = shared_volume_error(
+            r#"[{"claimName":"a","mountPath":"/mnt/a"},{"claimName":"b","mountPath":"/mnt/a/b"}]"#,
+        );
+        assert!(error.contains("overlaps"), "{error}");
+    }
+
+    #[test]
+    fn shared_volumes_need_the_kubernetes_backend() {
+        let args = shared_volume_args(&[
+            "--session-sandbox-backend",
+            "local",
+            "--session-sandbox-shared-volumes",
+            r#"[{"claimName":"c","mountPath":"/mnt/c"}]"#,
+        ]);
+        let error = args.sandbox.local_workload_mode().unwrap_err().to_string();
+        assert!(error.contains("agent-k8s"), "{error}");
     }
 
     #[test]

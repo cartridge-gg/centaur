@@ -429,6 +429,10 @@ spec:
             - name: SESSION_SANDBOX_TOLERATIONS
               value: {{ toJson .Values.sandbox.tolerations | quote }}
 {{- end }}
+{{- if and .Values.sandbox.sharedVolumes (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_SHARED_VOLUMES")) }}
+            - name: SESSION_SANDBOX_SHARED_VOLUMES
+              value: {{ toJson .Values.sandbox.sharedVolumes | quote }}
+{{- end }}
 {{- if and .Values.sandbox.runtimeClassName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_RUNTIME_CLASS_NAME")) }}
             - name: SESSION_SANDBOX_RUNTIME_CLASS_NAME
               value: {{ .Values.sandbox.runtimeClassName | quote }}
