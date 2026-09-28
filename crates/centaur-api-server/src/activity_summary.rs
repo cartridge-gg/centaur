@@ -1847,8 +1847,7 @@ mod tests {
         // Every Hermes tool call used to become the same "using tool" fact,
         // which the state drops as a repeat, so the status never changed.
         let now = Instant::now();
-        let mut state =
-            ExecutionActivity::new(ThreadKey::parse("test:thread").unwrap(), 4, None, now);
+        let mut state = activity(now);
         let interval = Duration::from_secs(8);
         for (offset, path) in [(0, "src/worker.py"), (9, "src/policy.json")] {
             let fact = item_event_fact(
