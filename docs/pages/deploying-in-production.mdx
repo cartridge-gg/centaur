@@ -307,9 +307,10 @@ Codex, api-rs fails fast at startup if the broker credential is missing.
 A subscription or an account pool can run out of capacity: a usage limit, or
 every account rate limited. Without failover, each turn on that harness fails
 until the provider resets. With `apiRs.providerFailover.enabled: true`, a
-Codex session continues on Claude Code, and a Claude Code or Hermes session
-continues on Codex. A Hermes session that moved to Codex continues on Claude
-Code if the Codex provider is exhausted too:
+Codex session continues on Claude Code, and a Claude Code session continues
+on Codex. A Hermes session continues on Codex, or on Claude Code when the Codex
+provider is known to be exhausted. A Hermes session that moved to Codex
+continues on Claude Code if the Codex provider is exhausted later:
 
 1. The harness server in the sandbox detects the exhausted provider. Native
    usage-limit errors always count. Set `apiRs.providerExhaustedMarkers` to

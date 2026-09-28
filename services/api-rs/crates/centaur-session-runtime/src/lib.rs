@@ -44,8 +44,8 @@ use dashmap::{DashMap, DashSet};
 use futures_util::{FutureExt, SinkExt, Stream, StreamExt, future::BoxFuture, stream};
 use provider_failover::{
     FailoverDirective, FailoverNotice, PROVIDER_FAILOVER_EVENT, PROVIDER_FAILOVER_METADATA_KEY,
-    execution_allows_failover, failover_record, failover_target, kept_after_failover,
-    switch_pending, switched_in, with_left,
+    execution_allows_failover, failover_candidates, failover_record, first_available,
+    kept_after_failover, switch_pending, switched_in, with_left,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2650,9 +2650,11 @@ impl SessionRuntime {
 
     /// Decides what the sandbox may do if the model provider of the session's
     /// harness has no capacity left, and returns the directive for the user
-    /// lines. When the provider is already known to be exhausted, the session
-    /// moves before the turn: a session without a sandbox starts on the other
-    /// harness; a sandbox is asked to move the session itself.
+    /// lines. The failover target is the first failover candidate whose
+    /// provider is not known to be exhausted. When the provider of the
+    /// session is already known to be exhausted, the session moves to that
+    /// candidate before the turn: a session without a sandbox starts on it; a
+    /// sandbox is asked to move the session itself.
     async fn plan_provider_failover(
         &self,
         mut session: Session,
@@ -2664,9 +2666,10 @@ impl SessionRuntime {
         if !config.enabled {
             return Ok((session, None));
         }
-        let Some(other) = failover_target(&session.harness_type) else {
+        let candidates = failover_candidates(&session.harness_type);
+        if candidates.is_empty() {
             return Ok((session, None));
-        };
+        }
         // The user asked for this harness, and the sandbox did not move the
         // session yet: no proactive move away from it in this turn.
         let record = self
@@ -2677,13 +2680,16 @@ impl SessionRuntime {
             && switched_in(record.as_ref(), session.sandbox_id.as_deref());
         let allowed =
             config.allows(&session.thread_key) && execution_allows_failover(execution_metadata);
+        let exhausted = self.exhausted_harnesses().await;
         let original = session.harness_type.clone();
-        let current_exhausted = self.provider_exhausted(&original).await;
-        let other_exhausted = self.provider_exhausted(&other).await;
 
         let mut harness = original.clone();
         let mut retarget_model = None;
-        if allowed && current_exhausted && !other_exhausted && !requested {
+        if allowed
+            && exhausted.contains(original.as_ref())
+            && !requested
+            && let Some(other) = first_available(candidates, &exhausted).cloned()
+        {
             retarget_model = Some(config.model_for(&other).map(str::to_owned));
             if session.sandbox_id.is_none() {
                 let record = with_left(
@@ -2724,20 +2730,15 @@ impl SessionRuntime {
             }
             // The sandbox moves the session and reports it; the session row
             // changes then.
-            harness = other.clone();
+            harness = other;
         }
-        // The turn runs on `harness`, and fails over to its target. After a
-        // move, that target is not always the harness that the session left:
-        // a Hermes session moves to Codex, and Codex fails over to Claude Code.
-        let target = failover_target(&harness);
-        // Never fail over to a provider that is known to be exhausted.
-        let target_exhausted = match &target {
-            None => true,
-            Some(target) if *target == other => other_exhausted,
-            Some(target) if *target == original => current_exhausted,
-            Some(target) => self.provider_exhausted(target).await,
-        };
-        let enabled = allowed && !target_exhausted;
+        // The turn runs on `harness`, and fails over to its first candidate
+        // that is not exhausted. After a move, that is not always the harness
+        // that the session left: a Hermes session moves to Codex, and Codex
+        // fails over to Claude Code. Never to a provider that is known to be
+        // exhausted: without such a candidate, the turn cannot fail over.
+        let target = first_available(failover_candidates(&harness), &exhausted).cloned();
+        let enabled = allowed && target.is_some();
         let model = target
             .as_ref()
             .and_then(|target| config.model_for(target).map(str::to_owned));
@@ -2762,20 +2763,19 @@ impl SessionRuntime {
         Ok(self.store.exhausted_providers().await?)
     }
 
-    /// True while the model provider of `harness` is known to be exhausted.
-    /// A failed lookup counts as healthy.
-    async fn provider_exhausted(&self, harness: &HarnessType) -> bool {
-        match self.store.provider_exhausted_until(harness).await {
-            Ok(until) => until.is_some(),
+    /// The names of the harnesses whose model provider is known to be
+    /// exhausted now. A failed lookup counts as healthy.
+    async fn exhausted_harnesses(&self) -> HashSet<String> {
+        match self.store.exhausted_providers().await {
+            Ok(exhausted) => exhausted.into_iter().map(|(harness, _)| harness).collect(),
             Err(error) => {
                 warn!(
                     component = COMPONENT_SESSION_RUNTIME,
                     event = "provider_health_lookup_failed",
-                    harness = %harness,
                     %error,
                     "failed to read model provider health"
                 );
-                false
+                HashSet::new()
             }
         }
     }
@@ -13926,6 +13926,120 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hermes_session_skips_an_exhausted_codex() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime =
+            runtime_with(&store, backend).with_provider_failover(ProviderFailoverConfig {
+                enabled: true,
+                models: [
+                    (HarnessType::Codex, "gpt-x".to_owned()),
+                    (HarnessType::ClaudeCode, "claude-x".to_owned()),
+                ]
+                .into(),
+                ..Default::default()
+            });
+        let exhaust = |harness: HarnessType| {
+            let store = store.clone();
+            async move {
+                store
+                    .mark_provider_exhausted(
+                        &harness,
+                        std::time::SystemTime::now() + Duration::from_secs(600),
+                        "pool empty",
+                    )
+                    .await
+                    .expect("mark exhausted");
+            }
+        };
+        let new_hermes_session = |name: &str| {
+            let store = store.clone();
+            let thread_key =
+                ThreadKey::parse(format!("test:{name}-{}", uuid::Uuid::new_v4())).unwrap();
+            async move {
+                let session = store
+                    .create_or_get_session(
+                        &thread_key,
+                        &HarnessType::Hermes,
+                        None,
+                        json!({}),
+                        Default::default(),
+                    )
+                    .await
+                    .expect("create session");
+                (thread_key, session)
+            }
+        };
+
+        // Codex is exhausted: a Hermes turn may fail over to Claude Code,
+        // with the Claude Code model.
+        exhaust(HarnessType::Codex).await;
+        let (thread_key, _) = new_hermes_session("skip-codex").await;
+        store
+            .update_sandbox_id(&thread_key, Some("sbx-skip"))
+            .await
+            .expect("set sandbox id");
+        let session = store.get_session(&thread_key).await.expect("load session");
+        let (session, directive) = runtime
+            .plan_provider_failover(session, None, None)
+            .await
+            .expect("plan");
+        let directive = directive.expect("a directive");
+        assert_eq!(session.harness_type, HarnessType::Hermes);
+        assert_eq!(directive.harness, HarnessType::Hermes);
+        assert_eq!(directive.target, Some(HarnessType::ClaudeCode));
+        assert!(directive.enabled);
+        assert_eq!(directive.model.as_deref(), Some("claude-x"));
+
+        // Claude Code is exhausted too: no target, so no failover.
+        exhaust(HarnessType::ClaudeCode).await;
+        let (_, directive) = runtime
+            .plan_provider_failover(session, None, None)
+            .await
+            .expect("plan");
+        let directive = directive.expect("a directive");
+        assert_eq!(directive.target, None);
+        assert!(!directive.enabled);
+        let lines = directive.apply(vec![json!({"type": "user", "text": "hi"}).to_string()]);
+        let user: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(user["centaur"]["failover"], json!({"enabled": false}));
+
+        // Hermes and Codex are exhausted, and Claude Code is healthy: a
+        // session without a sandbox starts on Claude Code. Its only
+        // candidate, Codex, is exhausted, so that turn cannot fail over.
+        assert!(
+            store
+                .clear_provider_exhausted(&HarnessType::ClaudeCode, "capacity again")
+                .await
+                .expect("clear claude code")
+        );
+        exhaust(HarnessType::Hermes).await;
+        let (thread_key, session) = new_hermes_session("hermes-and-codex").await;
+        let (session, directive) = runtime
+            .plan_provider_failover(session, None, None)
+            .await
+            .expect("plan");
+        let directive = directive.expect("a directive");
+        assert_eq!(session.harness_type, HarnessType::ClaudeCode);
+        assert_eq!(directive.harness, HarnessType::ClaudeCode);
+        assert_eq!(directive.retarget_model, Some(Some("claude-x".to_owned())));
+        assert_eq!(directive.target, None);
+        assert!(!directive.enabled);
+        let event = events(&store, &thread_key)
+            .await
+            .into_iter()
+            .find(|event| event.event_type == "session.provider_failover")
+            .expect("failover event");
+        assert_eq!(event.payload["from"], "hermes");
+        assert_eq!(event.payload["to"], "claudecode");
+        assert_eq!(event.payload["mode"], "proactive");
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hermes_session_fails_over_twice_and_can_go_back() {
         let Some(store) = test_store().await else {
             return;
@@ -14058,7 +14172,10 @@ mod adoption_tests {
         let user: Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(user["centaur"]["harness"], "hermes");
         assert_eq!(user["centaur"]["mode"], "requested");
-        assert_eq!(user["centaur"]["failover"]["harness"], "codex");
+        // The Codex provider is still exhausted: a failover from Hermes goes
+        // to Claude Code, the next candidate.
+        assert_eq!(user["centaur"]["failover"]["harness"], "claudecode");
+        assert_eq!(user["centaur"]["failover"]["enabled"], true);
         reset_test_store(&store).await;
     }
 

@@ -7,7 +7,7 @@
 //! the sandbox with a `centaur` directive on each user line, and records the
 //! switch when the sandbox reports it with a `centaur/providerFailover` line.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use centaur_session_core::{HarnessType, ThreadKey};
 use centaur_telemetry::{init_session_failure, init_session_provider_failover};
@@ -65,29 +65,44 @@ pub(crate) const FAILOVER_HARNESSES: [HarnessType; 3] = [
 /// Creates the metrics of switches and of turns that failed on an exhausted
 /// provider at 0. These events are rare, and `increase()` cannot see the first
 /// increment of a series that starts at 1; each process start begins new
-/// series. A switch goes to the failover target, or back from it (`requested`,
-/// `revert`), so each pair has both directions.
+/// series. A switch goes to a failover candidate, or back from it
+/// (`requested`, `revert`), so each pair has both directions.
 pub(crate) fn init_metrics(failover_enabled: bool) {
     for harness in FAILOVER_HARNESSES {
         init_session_failure(harness.as_ref(), crate::PROVIDER_EXHAUSTED_FAILURE_CLASS);
-        if let Some(target) = failover_target(&harness).filter(|_| failover_enabled) {
+        if !failover_enabled {
+            continue;
+        }
+        for candidate in failover_candidates(&harness) {
             for mode in FAILOVER_MODES {
-                init_session_provider_failover(harness.as_ref(), target.as_ref(), mode);
-                init_session_provider_failover(target.as_ref(), harness.as_ref(), mode);
+                init_session_provider_failover(harness.as_ref(), candidate.as_ref(), mode);
+                init_session_provider_failover(candidate.as_ref(), harness.as_ref(), mode);
             }
         }
     }
 }
 
-/// The harness that a session on `harness` fails over to. Codex and Claude
-/// Code fail over to each other, and Hermes to Codex. So a Hermes session
-/// can move on to Claude Code when the Codex provider is exhausted too.
-pub(crate) fn failover_target(harness: &HarnessType) -> Option<HarnessType> {
+/// The harnesses that a session on `harness` can fail over to, in order of
+/// preference. Codex and Claude Code fail over to each other. Hermes fails
+/// over to Codex, or to Claude Code when the Codex provider is exhausted too.
+pub(crate) fn failover_candidates(harness: &HarnessType) -> &'static [HarnessType] {
     match harness {
-        HarnessType::Codex => Some(HarnessType::ClaudeCode),
-        HarnessType::ClaudeCode | HarnessType::Hermes => Some(HarnessType::Codex),
-        HarnessType::Amp | HarnessType::Nanocodex => None,
+        HarnessType::Codex => &[HarnessType::ClaudeCode],
+        HarnessType::ClaudeCode => &[HarnessType::Codex],
+        HarnessType::Hermes => &[HarnessType::Codex, HarnessType::ClaudeCode],
+        HarnessType::Amp | HarnessType::Nanocodex => &[],
     }
+}
+
+/// The first of `candidates` whose provider is not known to be exhausted.
+/// `exhausted` has the names of the exhausted harnesses.
+pub(crate) fn first_available<'a>(
+    candidates: &'a [HarnessType],
+    exhausted: &HashSet<String>,
+) -> Option<&'a HarnessType> {
+    candidates
+        .iter()
+        .find(|candidate| !exhausted.contains(candidate.as_ref()))
 }
 
 /// False when the requester turned failover off for the execution.
@@ -325,18 +340,44 @@ mod tests {
 
     #[test]
     fn codex_claude_code_and_hermes_fail_over() {
-        for (harness, target) in [
-            (HarnessType::Codex, Some(HarnessType::ClaudeCode)),
-            (HarnessType::ClaudeCode, Some(HarnessType::Codex)),
-            (HarnessType::Hermes, Some(HarnessType::Codex)),
-            (HarnessType::Amp, None),
-            (HarnessType::Nanocodex, None),
+        use HarnessType::{Amp, ClaudeCode, Codex, Hermes, Nanocodex};
+        for (harness, candidates) in [
+            (Codex, &[ClaudeCode][..]),
+            (ClaudeCode, &[Codex][..]),
+            (Hermes, &[Codex, ClaudeCode][..]),
+            (Amp, &[][..]),
+            (Nanocodex, &[][..]),
         ] {
-            assert_eq!(failover_target(&harness), target, "{harness}");
+            assert_eq!(failover_candidates(&harness), candidates, "{harness}");
         }
         for harness in FAILOVER_HARNESSES {
-            assert!(failover_target(&harness).is_some(), "{harness}");
+            assert!(!failover_candidates(&harness).is_empty(), "{harness}");
         }
+    }
+
+    #[test]
+    fn the_first_candidate_that_is_not_exhausted_is_the_target() {
+        let hermes = failover_candidates(&HarnessType::Hermes);
+        let exhausted = |names: &[&str]| -> HashSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        assert_eq!(
+            first_available(hermes, &exhausted(&[])),
+            Some(&HarnessType::Codex)
+        );
+        assert_eq!(
+            first_available(hermes, &exhausted(&["hermes"])),
+            Some(&HarnessType::Codex)
+        );
+        assert_eq!(
+            first_available(hermes, &exhausted(&["codex"])),
+            Some(&HarnessType::ClaudeCode)
+        );
+        assert_eq!(
+            first_available(hermes, &exhausted(&["codex", "claudecode"])),
+            None
+        );
+        assert_eq!(first_available(&[], &exhausted(&[])), None);
     }
 
     #[test]
@@ -533,6 +574,8 @@ mod tests {
             ("claudecode", "codex"),
             ("hermes", "codex"),
             ("codex", "hermes"),
+            ("hermes", "claudecode"),
+            ("claudecode", "hermes"),
         ] {
             for mode in FAILOVER_MODES {
                 let series = format!(

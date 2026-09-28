@@ -704,8 +704,9 @@ struct SandboxArgs {
     )]
     provider_exhausted_markers: String,
     /// Continue a session on another harness when the model provider of its
-    /// harness has no capacity left: Codex moves to Claude Code, and Claude
-    /// Code and Hermes move to Codex. Sandboxes get
+    /// harness has no capacity left: Codex moves to Claude Code, Claude Code
+    /// moves to Codex, and Hermes moves to Codex, or to Claude Code when the
+    /// Codex provider is known to be exhausted. Sandboxes get
     /// CENTAUR_HARNESS_SWITCHING=1, and the harness server converts the
     /// session. Sandboxes created before this setting keep their old
     /// behavior.
