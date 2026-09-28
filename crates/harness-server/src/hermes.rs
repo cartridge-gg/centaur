@@ -810,7 +810,7 @@ fn user_input_text(input: &[UserInput]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use codex_app_server_protocol::UserInput;
+    use crate::protocol::UserInput;
     use serde_json::json;
 
     use crate::traits::{NormalizedContent, NormalizedEvent};
