@@ -166,6 +166,10 @@ jobs:
         with:
           workspaces: crates/harness-server
 
+      # The HEIC attachment tests decode real files with heif-convert.
+      - name: Install libheif
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libheif-examples libheif-plugin-libde265
+
       - name: Format
         working-directory: crates/harness-server
         run: cargo fmt --all --check
