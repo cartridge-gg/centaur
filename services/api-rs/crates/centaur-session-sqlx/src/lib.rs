@@ -2006,6 +2006,48 @@ impl PgSessionStore {
             .collect())
     }
 
+    /// Records the remaining usage of the model provider of `harness`, in
+    /// percent, from a health check. `None`: the check did not report it.
+    pub async fn record_provider_remaining(
+        &self,
+        harness: &HarnessType,
+        remaining_percent: Option<f64>,
+    ) -> Result<(), SessionStoreError> {
+        sqlx::query(
+            r#"
+            insert into provider_health (harness, exhausted_until, remaining_percent, remaining_checked_at)
+            values ($1, now(), $2, now())
+            on conflict (harness) do update
+            set remaining_percent = excluded.remaining_percent,
+                remaining_checked_at = excluded.remaining_checked_at
+            "#,
+        )
+        .bind(harness.to_string())
+        .bind(remaining_percent)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The remaining usage of each model provider in percent, by harness,
+    /// from health checks at most `max_age` old.
+    pub async fn provider_remaining(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<Vec<(String, f64)>, SessionStoreError> {
+        Ok(sqlx::query_as(
+            r#"
+            select harness, remaining_percent from provider_health
+            where remaining_percent is not null
+              and remaining_checked_at > now() - make_interval(secs => $1)
+            order by harness
+            "#,
+        )
+        .bind(max_age.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn update_harness_thread_id(
         &self,
         thread_key: &ThreadKey,

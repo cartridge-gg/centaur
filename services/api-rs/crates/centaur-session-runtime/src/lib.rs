@@ -44,7 +44,7 @@ use dashmap::{DashMap, DashSet};
 use futures_util::{FutureExt, SinkExt, Stream, StreamExt, future::BoxFuture, stream};
 use provider_failover::{
     FailoverDirective, FailoverNotice, PROVIDER_FAILOVER_EVENT, PROVIDER_FAILOVER_METADATA_KEY,
-    execution_allows_failover, failover_candidates, failover_record, first_available,
+    ProviderCapacity, execution_allows_failover, failover_candidates, failover_record,
     kept_after_failover, switch_pending, switched_in, with_left,
 };
 use serde::{Deserialize, Serialize};
@@ -193,6 +193,9 @@ pub struct SessionRuntime {
     /// None refuses both.
     keepalive: Option<KeepaliveConfig>,
     provider_failover: ProviderFailoverConfig,
+    /// How long a remaining usage from a provider health check counts. None:
+    /// no health checks, so failover candidates keep their order.
+    provider_remaining_max_age: Option<Duration>,
     stdout_owner_id: String,
     /// Set once a shutdown handoff begins; fences new stdout-owner claims
     /// so an execution cannot start on a control plane that is about to
@@ -1112,6 +1115,7 @@ impl SessionRuntime {
             warm_pool: None,
             keepalive: None,
             provider_failover: ProviderFailoverConfig::default(),
+            provider_remaining_max_age: None,
             personas: None,
             session_title_generator: None,
             session_title_in_flight: Arc::new(DashSet::new()),
@@ -1164,8 +1168,10 @@ impl SessionRuntime {
 
     /// Checks the configured provider health URLs on an interval and keeps
     /// `provider_health` in step with them. No endpoints: no checks.
-    pub fn with_provider_health_probe(self, config: ProviderHealthProbeConfig) -> Self {
+    pub fn with_provider_health_probe(mut self, config: ProviderHealthProbeConfig) -> Self {
         if !config.endpoints.is_empty() {
+            self.provider_remaining_max_age =
+                Some(config.interval * provider_health::REMAINING_MAX_AGE_CHECKS);
             provider_health::ProviderHealthProbe::new(self.store.clone(), config).spawn();
         }
         self
@@ -2650,11 +2656,12 @@ impl SessionRuntime {
 
     /// Decides what the sandbox may do if the model provider of the session's
     /// harness has no capacity left, and returns the directive for the user
-    /// lines. The failover target is the first failover candidate whose
-    /// provider is not known to be exhausted. When the provider of the
-    /// session is already known to be exhausted, the session moves to that
-    /// candidate before the turn: a session without a sandbox starts on it; a
-    /// sandbox is asked to move the session itself.
+    /// lines. The failover target is the failover candidate that
+    /// [`ProviderCapacity::choose`] picks: never an exhausted provider, and
+    /// the one with the most usage left when the health checks report it.
+    /// When the provider of the session is already known to be exhausted,
+    /// the session moves to that candidate before the turn: a session without
+    /// a sandbox starts on it; a sandbox is asked to move the session itself.
     async fn plan_provider_failover(
         &self,
         mut session: Session,
@@ -2680,15 +2687,15 @@ impl SessionRuntime {
             && switched_in(record.as_ref(), session.sandbox_id.as_deref());
         let allowed =
             config.allows(&session.thread_key) && execution_allows_failover(execution_metadata);
-        let exhausted = self.exhausted_harnesses().await;
+        let capacity = self.provider_capacity().await;
         let original = session.harness_type.clone();
 
         let mut harness = original.clone();
         let mut retarget_model = None;
         if allowed
-            && exhausted.contains(original.as_ref())
+            && capacity.is_exhausted(&original)
             && !requested
-            && let Some(other) = first_available(candidates, &exhausted).cloned()
+            && let Some(other) = capacity.choose(candidates).cloned()
         {
             retarget_model = Some(config.model_for(&other).map(str::to_owned));
             if session.sandbox_id.is_none() {
@@ -2732,12 +2739,12 @@ impl SessionRuntime {
             // changes then.
             harness = other;
         }
-        // The turn runs on `harness`, and fails over to its first candidate
-        // that is not exhausted. After a move, that is not always the harness
-        // that the session left: a Hermes session moves to Codex, and Codex
-        // fails over to Claude Code. Never to a provider that is known to be
-        // exhausted: without such a candidate, the turn cannot fail over.
-        let target = first_available(failover_candidates(&harness), &exhausted).cloned();
+        // The turn runs on `harness`, and fails over to one of its
+        // candidates. After a move, that is not always the harness that the
+        // session left: a Hermes session moves to Codex, and Codex fails over
+        // to Claude Code. Never to a provider that is known to be exhausted:
+        // without such a candidate, the turn cannot fail over.
+        let target = capacity.choose(failover_candidates(&harness)).cloned();
         let enabled = allowed && target.is_some();
         let model = target
             .as_ref()
@@ -2763,20 +2770,39 @@ impl SessionRuntime {
         Ok(self.store.exhausted_providers().await?)
     }
 
-    /// The names of the harnesses whose model provider is known to be
-    /// exhausted now. A failed lookup counts as healthy.
-    async fn exhausted_harnesses(&self) -> HashSet<String> {
-        match self.store.exhausted_providers().await {
+    /// What is known now about the model provider of each harness: which
+    /// are exhausted, and the recent remaining usage from the health checks.
+    /// A failed lookup counts as healthy, and a failed usage lookup as an
+    /// unknown usage.
+    async fn provider_capacity(&self) -> ProviderCapacity {
+        let failed = |error: SessionStoreError| {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "provider_health_lookup_failed",
+                %error,
+                "failed to read model provider health"
+            );
+        };
+        let exhausted = match self.store.exhausted_providers().await {
             Ok(exhausted) => exhausted.into_iter().map(|(harness, _)| harness).collect(),
             Err(error) => {
-                warn!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "provider_health_lookup_failed",
-                    %error,
-                    "failed to read model provider health"
-                );
+                failed(error);
                 HashSet::new()
             }
+        };
+        let remaining = match self.provider_remaining_max_age {
+            Some(max_age) => match self.store.provider_remaining(max_age).await {
+                Ok(remaining) => remaining.into_iter().collect(),
+                Err(error) => {
+                    failed(error);
+                    HashMap::new()
+                }
+            },
+            None => HashMap::new(),
+        };
+        ProviderCapacity {
+            exhausted,
+            remaining,
         }
     }
 
@@ -13567,12 +13593,27 @@ mod adoption_tests {
             }
         };
 
+        let remaining = || {
+            let store = store.clone();
+            async move {
+                store
+                    .provider_remaining(Duration::from_secs(600))
+                    .await
+                    .expect("read remaining usage")
+            }
+        };
+
         // The pool is empty until its reported reset.
         let reset = unix_secs_from_now(1200);
-        *codex.lock().unwrap() = (200, format!(r#"{{"exhausted":true,"reset_at":{reset}}}"#));
+        *codex.lock().unwrap() = (
+            200,
+            format!(r#"{{"exhausted":true,"reset_at":{reset},"remaining_percent":0}}"#),
+        );
         probe.check_all().await;
         assert_eq!(until(HarnessType::Codex).await, Some(reset));
         assert_eq!(until(HarnessType::ClaudeCode).await, None);
+        // Claude Code reports no usage.
+        assert_eq!(remaining().await, [("codex".to_owned(), 0.0)]);
         assert!(
             auth.lock()
                 .unwrap()
@@ -13589,17 +13630,32 @@ mod adoption_tests {
         *codex.lock().unwrap() = (200, r#"{"status":"ok"}"#.to_owned());
         probe.check_all().await;
         assert_eq!(until(HarnessType::Codex).await, Some(reset));
+        assert_eq!(remaining().await, [("codex".to_owned(), 0.0)]);
 
         // Capacity again: the mark ends before its reset time.
-        *codex.lock().unwrap() = (200, r#"{"exhausted":false,"reset_at":null}"#.to_owned());
+        *codex.lock().unwrap() = (
+            200,
+            r#"{"exhausted":false,"reset_at":null,"remaining_percent":42.5}"#.to_owned(),
+        );
         probe.check_all().await;
         assert_eq!(until(HarnessType::Codex).await, None);
+        assert_eq!(remaining().await, [("codex".to_owned(), 42.5)]);
+        // A check that is too old does not count.
+        assert!(
+            store
+                .provider_remaining(Duration::ZERO)
+                .await
+                .expect("read remaining usage")
+                .is_empty()
+        );
 
-        // No reset time: the cooldown applies, and each check renews it.
+        // No reset time: the cooldown applies, and each check renews it. A
+        // report without a usage clears the last one.
         *codex.lock().unwrap() = (200, r#"{"exhausted":true,"reset_at":null}"#.to_owned());
         probe.check_all().await;
         let cooldown = until(HarnessType::Codex).await.expect("exhausted");
         assert!(cooldown >= unix_secs_from_now(0) + 14 * 60);
+        assert!(remaining().await.is_empty());
         reset_test_store(&store).await;
     }
 
@@ -14036,6 +14092,107 @@ mod adoption_tests {
         assert_eq!(event.payload["from"], "hermes");
         assert_eq!(event.payload["to"], "claudecode");
         assert_eq!(event.payload["mode"], "proactive");
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hermes_session_fails_over_to_the_provider_with_more_usage_left() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let mut runtime =
+            runtime_with(&store, backend).with_provider_failover(ProviderFailoverConfig {
+                enabled: true,
+                models: [
+                    (HarnessType::Codex, "gpt-x".to_owned()),
+                    (HarnessType::ClaudeCode, "claude-x".to_owned()),
+                ]
+                .into(),
+                ..Default::default()
+            });
+        runtime.provider_remaining_max_age = Some(Duration::from_secs(180));
+        let thread_key =
+            ThreadKey::parse(format!("test:most-left-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Hermes,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some("sbx-most-left"))
+            .await
+            .expect("set sandbox id");
+        let record = |harness: HarnessType, remaining: Option<f64>| {
+            let store = store.clone();
+            async move {
+                store
+                    .record_provider_remaining(&harness, remaining)
+                    .await
+                    .expect("record remaining usage");
+            }
+        };
+        let target = |runtime: &SessionRuntime| {
+            let store = store.clone();
+            let thread_key = thread_key.clone();
+            let runtime = runtime.clone();
+            async move {
+                let session = store.get_session(&thread_key).await.expect("load session");
+                let (session, directive) = runtime
+                    .plan_provider_failover(session, None, None)
+                    .await
+                    .expect("plan");
+                assert_eq!(session.harness_type, HarnessType::Hermes);
+                let directive = directive.expect("a directive");
+                assert!(directive.enabled);
+                (directive.target.expect("a target"), directive.model)
+            }
+        };
+        let codex = (HarnessType::Codex, Some("gpt-x".to_owned()));
+        let claude = (HarnessType::ClaudeCode, Some("claude-x".to_owned()));
+
+        // No usage known: the order of preference.
+        assert_eq!(target(&runtime).await, codex);
+
+        // Claude Code has more usage left.
+        record(HarnessType::Codex, Some(20.0)).await;
+        record(HarnessType::ClaudeCode, Some(60.0)).await;
+        assert_eq!(target(&runtime).await, claude);
+
+        // Codex has more usage left.
+        record(HarnessType::Codex, Some(70.0)).await;
+        assert_eq!(target(&runtime).await, codex);
+
+        // Too old to count, or no health checks: the order of preference.
+        record(HarnessType::Codex, Some(10.0)).await;
+        assert_eq!(target(&runtime).await, claude);
+        let mut stale = runtime.clone();
+        stale.provider_remaining_max_age = Some(Duration::ZERO);
+        assert_eq!(target(&stale).await, codex);
+        stale.provider_remaining_max_age = None;
+        assert_eq!(target(&stale).await, codex);
+
+        // The last check of Claude Code reported no usage.
+        record(HarnessType::ClaudeCode, None).await;
+        assert_eq!(target(&runtime).await, codex);
+
+        // An exhausted provider is never the target, whatever its usage.
+        record(HarnessType::ClaudeCode, Some(90.0)).await;
+        store
+            .mark_provider_exhausted(
+                &HarnessType::ClaudeCode,
+                std::time::SystemTime::now() + Duration::from_secs(600),
+                "pool empty",
+            )
+            .await
+            .expect("mark exhausted");
+        assert_eq!(target(&runtime).await, codex);
         reset_test_store(&store).await;
     }
 

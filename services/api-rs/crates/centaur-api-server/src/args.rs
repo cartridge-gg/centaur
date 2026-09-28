@@ -706,7 +706,8 @@ struct SandboxArgs {
     /// Continue a session on another harness when the model provider of its
     /// harness has no capacity left: Codex moves to Claude Code, Claude Code
     /// moves to Codex, and Hermes moves to Codex, or to Claude Code when the
-    /// Codex provider is known to be exhausted. Sandboxes get
+    /// Codex provider is known to be exhausted or the health checks report
+    /// more usage left for Claude Code. Sandboxes get
     /// CENTAUR_HARNESS_SWITCHING=1, and the harness server converts the
     /// session. Sandboxes created before this setting keep their old
     /// behavior.
@@ -737,7 +738,10 @@ struct SandboxArgs {
     /// The health URL of each harness's model provider, as comma-separated
     /// `harness=url` pairs. api-rs checks them on an interval: an answer of
     /// `{"exhausted": true, "reset_at": <Unix seconds>}` marks the provider
-    /// exhausted, and `{"exhausted": false}` clears it early.
+    /// exhausted, and `{"exhausted": false}` clears it early. An optional
+    /// `"remaining_percent"` ranks the failover candidates that are not
+    /// exhausted. A harness with a failover model gets `model=<model>` added
+    /// to its URL, unless the URL names a model.
     #[arg(
         long = "session-provider-health-urls",
         env = "SESSION_PROVIDER_HEALTH_URLS",
@@ -1873,6 +1877,7 @@ impl SandboxArgs {
     }
 
     fn provider_health_probe_config(&self) -> Result<ProviderHealthProbeConfig, ServerError> {
+        let models = self.provider_failover_config()?.models;
         let mut endpoints = Vec::new();
         for pair in self
             .provider_health_urls
@@ -1886,12 +1891,17 @@ impl SandboxArgs {
                 (url.starts_with("https://") || url.starts_with("http://"))
                     .then(|| (harness, url.to_owned()))
             });
-            let Some(endpoint) = parsed else {
-                return Err(ServerError::UnsupportedConfig(format!(
+            let invalid = || {
+                ServerError::UnsupportedConfig(format!(
                     "SESSION_PROVIDER_HEALTH_URLS: `{pair}` is not `harness=http(s)://...`"
-                )));
+                ))
             };
-            endpoints.push(endpoint);
+            let (harness, url) = parsed.ok_or_else(invalid)?;
+            let url = match models.get(&harness) {
+                Some(model) => with_model_query(&url, model).ok_or_else(invalid)?,
+                None => url,
+            };
+            endpoints.push((harness, url));
         }
         if !endpoints.is_empty() && self.provider_health_interval_secs == 0 {
             return Err(ServerError::UnsupportedConfig(
@@ -2669,6 +2679,18 @@ fn clean_optional_value(value: Option<&str>) -> Option<String> {
     non_empty(value).map(ToOwned::to_owned)
 }
 
+/// Adds `model=<model>` to a provider health URL, so that its remaining usage
+/// counts the limits of the model that a session gets after it moves there.
+/// A URL that names a model keeps it. `None` when the URL is not valid.
+fn with_model_query(url: &str, model: &str) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.query_pairs().any(|(key, _)| key == "model") {
+        return Some(url.to_owned());
+    }
+    parsed.query_pairs_mut().append_pair("model", model);
+    Some(parsed.into())
+}
+
 fn upsert_spec_env(spec: &mut SandboxSpec, name: String, value: String) {
     if let Some(existing) = spec.env.iter_mut().find(|env| env.name == name) {
         existing.value = value;
@@ -3240,6 +3262,35 @@ mod tests {
         assert_eq!(config.bearer_token.as_deref(), Some("key-1"));
         assert_eq!(config.interval, Duration::from_secs(30));
 
+        // A harness with a failover model asks for the usage of that model,
+        // unless its URL names one.
+        let config = Args::try_parse_from(base.iter().copied().chain([
+            "--session-provider-health-urls",
+            "codex=https://pool.example/openai/pool-health?model=gpt-5.5, claudecode=https://pool.example/anthropic/pool-health, hermes=https://pool.example/openrouter/health",
+            "--session-provider-failover-models",
+            "codex=gpt-5-codex, claudecode=claude-opus-4-7",
+        ]))
+        .unwrap()
+        .provider_health_probe_config()
+        .unwrap();
+        assert_eq!(
+            config.endpoints,
+            [
+                (
+                    HarnessType::Codex,
+                    "https://pool.example/openai/pool-health?model=gpt-5.5".to_owned()
+                ),
+                (
+                    HarnessType::ClaudeCode,
+                    "https://pool.example/anthropic/pool-health?model=claude-opus-4-7".to_owned()
+                ),
+                (
+                    HarnessType::Hermes,
+                    "https://pool.example/openrouter/health".to_owned()
+                ),
+            ]
+        );
+
         for (urls, interval) in [
             ("codex", "60"),
             ("gemini=https://pool.example", "60"),
@@ -3258,6 +3309,19 @@ mod tests {
                 "{urls} {interval}"
             );
         }
+    }
+
+    #[test]
+    fn the_model_query_keeps_the_other_parameters_and_is_encoded() {
+        assert_eq!(
+            with_model_query("https://pool.example/health?pool=a", "opus[1m]").as_deref(),
+            Some("https://pool.example/health?pool=a&model=opus%5B1m%5D")
+        );
+        assert_eq!(
+            with_model_query("https://pool.example/health?model=sonnet", "opus").as_deref(),
+            Some("https://pool.example/health?model=sonnet")
+        );
+        assert_eq!(with_model_query("https://", "opus"), None);
     }
 
     #[test]
