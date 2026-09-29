@@ -84,7 +84,7 @@ pub(crate) fn init_metrics(failover_enabled: bool) {
 
 /// The harnesses that a session on `harness` can fail over to, in order of
 /// preference. Codex and Claude Code fail over to each other. Hermes fails
-/// over to Codex, or to Claude Code when the Codex provider is exhausted too.
+/// over to Codex or Claude Code ([`ProviderCapacity::choose`]).
 pub(crate) fn failover_candidates(harness: &HarnessType) -> &'static [HarnessType] {
     match harness {
         HarnessType::Codex => &[HarnessType::ClaudeCode],
@@ -94,15 +94,45 @@ pub(crate) fn failover_candidates(harness: &HarnessType) -> &'static [HarnessTyp
     }
 }
 
-/// The first of `candidates` whose provider is not known to be exhausted.
-/// `exhausted` has the names of the exhausted harnesses.
-pub(crate) fn first_available<'a>(
-    candidates: &'a [HarnessType],
-    exhausted: &HashSet<String>,
-) -> Option<&'a HarnessType> {
-    candidates
-        .iter()
-        .find(|candidate| !exhausted.contains(candidate.as_ref()))
+/// What api-rs knows now about the model provider of each harness, by
+/// harness name.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProviderCapacity {
+    /// The providers that are known to be exhausted.
+    pub exhausted: HashSet<String>,
+    /// The remaining usage of a provider in percent, from a recent health
+    /// check.
+    pub remaining: HashMap<String, f64>,
+}
+
+impl ProviderCapacity {
+    pub(crate) fn is_exhausted(&self, harness: &HarnessType) -> bool {
+        self.exhausted.contains(harness.as_ref())
+    }
+
+    /// The failover target among `candidates`. An exhausted provider is never
+    /// a target. When each candidate that is not exhausted has a recent
+    /// remaining usage, the one with the most usage left wins, and the earlier
+    /// one on a tie. Else the first candidate that is not exhausted wins.
+    pub(crate) fn choose<'a>(&self, candidates: &'a [HarnessType]) -> Option<&'a HarnessType> {
+        let mut available = candidates
+            .iter()
+            .filter(|candidate| !self.is_exhausted(candidate));
+        let first = available.next()?;
+        let Some(&remaining) = self.remaining.get(first.as_ref()) else {
+            return Some(first);
+        };
+        let mut best = (first, remaining);
+        for candidate in available {
+            let Some(&remaining) = self.remaining.get(candidate.as_ref()) else {
+                return Some(first);
+            };
+            if remaining > best.1 {
+                best = (candidate, remaining);
+            }
+        }
+        Some(best.0)
+    }
 }
 
 /// False when the requester turned failover off for the execution.
@@ -355,29 +385,59 @@ mod tests {
         }
     }
 
+    fn capacity(exhausted: &[&str], remaining: &[(&str, f64)]) -> ProviderCapacity {
+        ProviderCapacity {
+            exhausted: exhausted.iter().map(|name| (*name).to_owned()).collect(),
+            remaining: remaining
+                .iter()
+                .map(|(name, remaining)| ((*name).to_owned(), *remaining))
+                .collect(),
+        }
+    }
+
     #[test]
-    fn the_first_candidate_that_is_not_exhausted_is_the_target() {
+    fn without_usage_the_first_candidate_that_is_not_exhausted_is_the_target() {
         let hermes = failover_candidates(&HarnessType::Hermes);
-        let exhausted = |names: &[&str]| -> HashSet<String> {
-            names.iter().map(|name| (*name).to_owned()).collect()
+        let choose = |exhausted: &[&str]| capacity(exhausted, &[]).choose(hermes).cloned();
+        assert_eq!(choose(&[]), Some(HarnessType::Codex));
+        assert_eq!(choose(&["hermes"]), Some(HarnessType::Codex));
+        assert_eq!(choose(&["codex"]), Some(HarnessType::ClaudeCode));
+        assert_eq!(choose(&["codex", "claudecode"]), None);
+        assert_eq!(capacity(&[], &[]).choose(&[]), None);
+    }
+
+    #[test]
+    fn the_candidate_with_the_most_usage_left_is_the_target() {
+        let hermes = failover_candidates(&HarnessType::Hermes);
+        let choose = |exhausted: &[&str], remaining: &[(&str, f64)]| {
+            capacity(exhausted, remaining).choose(hermes).cloned()
         };
+        // Both known: the most usage left wins, the order of preference on a
+        // tie.
+        let both = |codex, claude| [("codex", codex), ("claudecode", claude)];
         assert_eq!(
-            first_available(hermes, &exhausted(&[])),
-            Some(&HarnessType::Codex)
+            choose(&[], &both(20.0, 60.0)),
+            Some(HarnessType::ClaudeCode)
         );
+        assert_eq!(choose(&[], &both(60.0, 20.0)), Some(HarnessType::Codex));
+        assert_eq!(choose(&[], &both(40.0, 40.0)), Some(HarnessType::Codex));
+        // An exhausted provider never wins, whatever its usage says.
         assert_eq!(
-            first_available(hermes, &exhausted(&["hermes"])),
-            Some(&HarnessType::Codex)
+            choose(&["claudecode"], &both(5.0, 90.0)),
+            Some(HarnessType::Codex)
         );
+        assert_eq!(choose(&["codex", "claudecode"], &both(50.0, 50.0)), None);
+        // One unknown: the order of preference.
         assert_eq!(
-            first_available(hermes, &exhausted(&["codex"])),
-            Some(&HarnessType::ClaudeCode)
+            choose(&[], &[("claudecode", 90.0)]),
+            Some(HarnessType::Codex)
         );
+        assert_eq!(choose(&[], &[("codex", 1.0)]), Some(HarnessType::Codex));
+        // The usage of an unrelated harness does not matter.
         assert_eq!(
-            first_available(hermes, &exhausted(&["codex", "claudecode"])),
-            None
+            choose(&["codex"], &[("hermes", 99.0)]),
+            Some(HarnessType::ClaudeCode)
         );
-        assert_eq!(first_available(&[], &exhausted(&[])), None);
     }
 
     #[test]
