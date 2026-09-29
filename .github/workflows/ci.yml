@@ -270,6 +270,10 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The HEIC attachment tests decode real files with heif-convert.
+      - name: Install libheif
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libheif-examples libheif-plugin-libde265
+
       - name: Test
         run: cargo test --locked -p harness-server
 
