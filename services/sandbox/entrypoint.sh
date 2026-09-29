@@ -60,12 +60,12 @@ if [ -n "${CENTAUR_STATE_DIR:-}" ] && { [ ! -d "$STATE_DIR" ] || [ ! -w "$STATE_
     exit 1
 fi
 if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
-    mkdir -p "$STATE_DIR/workspace" "$STATE_DIR/uploads" "$STATE_DIR/branches" "$STATE_DIR/codex" "$STATE_DIR/claude" "$STATE_DIR/pi" "$STATE_DIR/omp"
+    mkdir -p "$STATE_DIR/workspace" "$STATE_DIR/uploads" "$STATE_DIR/branches" "$STATE_DIR/codex" "$STATE_DIR/claude" "$STATE_DIR/pi" "$STATE_DIR/omp" "$STATE_DIR/hermes"
     # Idempotent across restarts of the same volume: an existing link is
     # replaced, an image-provided directory seeds the state dir with any file
     # not already there (never overwriting persisted state) before the link
     # takes its place.
-    for _centaur_pair in "codex:.codex" "claude:.claude" "pi:.pi" "omp:.omp" "uploads:uploads" "branches:branches"; do
+    for _centaur_pair in "codex:.codex" "claude:.claude" "pi:.pi" "omp:.omp" "hermes:.hermes" "uploads:uploads" "branches:branches"; do
         _centaur_state="${STATE_DIR}/${_centaur_pair%%:*}"
         _centaur_home="${HOME_DIR}/${_centaur_pair##*:}"
         if [ -L "$_centaur_home" ]; then

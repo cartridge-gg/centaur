@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 use crate::error::{Error, Result};
 use crate::js;
 use crate::lenient::{Lenient, lenient, tool_input};
-use crate::model::{Message, Part, Role, Session, Tool, ToolInput};
+use crate::model::{Message, Part, Role, Session, Tool, ToolInput, push_part};
 use crate::synthetic::is_synthetic_user_text;
 
 pub static ROLLOUT_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -129,25 +129,8 @@ impl SessionBuilder {
         }
     }
 
-    /// Adds a part to the transcript. Consecutive assistant parts share one
-    /// message, and so do consecutive tool results.
     fn push(&mut self, role: Role, part: Part) {
-        let is_result = |p: &Part| matches!(p, Part::ToolResult { .. });
-        if let Some(last) = self.messages.last_mut().filter(|m| m.role == role)
-            && (role == Role::Assistant || (is_result(&part) && last.parts.iter().all(is_result)))
-        {
-            last.parts.push(part);
-            return;
-        }
-        let model = match role {
-            Role::Assistant => self.model.clone(),
-            Role::User => None,
-        };
-        self.messages.push(Message {
-            role,
-            model,
-            parts: vec![part],
-        });
+        push_part(&mut self.messages, role, part, self.model.as_deref());
     }
 
     fn finish(self, path: &Path) -> Session {
