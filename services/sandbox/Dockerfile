@@ -8,6 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ARG CA_CERTIFICATES_VERSION=20260816ubuntu0.24.04.2
 
 # ── System packages (cached unless base image or package pins change) ─────────
+# libheif-examples + its HEVC decoder plugin: harness-server converts HEIC
+# attachments (the iPhone camera default) with heif-convert.
 RUN --mount=type=cache,id=sandbox-apt-cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=sandbox-apt-lib,target=/var/lib/apt,sharing=locked \
     printf '%s\n' "Acquire::Retries \"5\";" "Acquire::http::Timeout \"30\";" "Acquire::https::Timeout \"30\";" > /etc/apt/apt.conf.d/80-network-retries \
@@ -15,6 +17,7 @@ RUN --mount=type=cache,id=sandbox-apt-cache,target=/var/cache/apt,sharing=locked
     openssh-client git curl wget ca-certificates=${CA_CERTIFICATES_VERSION} gnupg lsb-release sudo \
     build-essential pkg-config cmake ninja-build \
     ffmpeg ghostscript dvisvgm file \
+    libheif-examples libheif-plugin-libde265 \
     libssl-dev libclang-dev protobuf-compiler \
     libcairo2-dev libpango1.0-dev \
     ripgrep fd-find jq tree tmux unzip xz-utils gettext-base vim \
