@@ -845,7 +845,7 @@ function untilText(exhausted: unknown): string {
   return ` until ${resetAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`
 }
 
-const HARNESS_LABELS: Record<string, string> = { codex: 'Codex', claudecode: 'Claude Code' }
+const HARNESS_LABELS: Record<string, string> = { codex: 'Codex', claudecode: 'Claude Code', hermes: 'Hermes' }
 
 function harnessLabel(name: unknown): string {
   return typeof name === 'string' ? (HARNESS_LABELS[name] ?? name) : 'another harness'

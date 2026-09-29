@@ -44,10 +44,11 @@ use crate::{ServerError, activity_summary::ActivitySummaryConfig};
 
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 /// Paths a shared volume may not cover: the entrypoint deletes and relinks
-/// the first five into the state volume, and the backend mounts the rest.
-const SHARED_VOLUME_RESERVED_PATHS: [&str; 9] = [
+/// the first six into the state volume, and the backend mounts the rest.
+const SHARED_VOLUME_RESERVED_PATHS: [&str; 10] = [
     "/home/agent/.codex",
     "/home/agent/.claude",
+    "/home/agent/.hermes",
     "/home/agent/uploads",
     "/home/agent/branches",
     "/home/agent/workspace",
@@ -649,9 +650,9 @@ struct SandboxArgs {
     /// Give every session sandbox a persistent state volume: one
     /// PersistentVolumeClaim per sandbox, created from the Sandbox's
     /// `volumeClaimTemplates`, kept across an idle pause and deleted with the
-    /// sandbox. The entrypoint links `~/.codex`, `~/.claude`, `~/uploads` and
-    /// `~/branches` into it, so a resumed session keeps its harness history and
-    /// working copies. The chart renders `sandbox.stateVolume.*` into these.
+    /// sandbox. The entrypoint links `~/.codex`, `~/.claude`, `~/.hermes`,
+    /// `~/uploads` and `~/branches` into it, so a resumed session keeps its
+    /// harness history and working copies. The chart renders `sandbox.stateVolume.*` into these.
     #[arg(
         long = "session-sandbox-state-volume-enabled",
         env = "SESSION_SANDBOX_STATE_VOLUME_ENABLED",
@@ -702,8 +703,10 @@ struct SandboxArgs {
         default_value = ""
     )]
     provider_exhausted_markers: String,
-    /// Continue a Codex or Claude Code session on the other harness when the
-    /// model provider of its harness has no capacity left. Sandboxes get
+    /// Continue a session on another harness when the model provider of its
+    /// harness has no capacity left: Codex moves to Claude Code, Claude Code
+    /// moves to Codex, and Hermes moves to Codex, or to Claude Code when the
+    /// Codex provider is known to be exhausted. Sandboxes get
     /// CENTAUR_HARNESS_SWITCHING=1, and the harness server converts the
     /// session. Sandboxes created before this setting keep their old
     /// behavior.
@@ -4442,6 +4445,8 @@ mod tests {
             "/home/agent/github",
             "/home/agent/github/x",
             "/home/agent/uploads",
+            "/home/agent/.hermes",
+            "/home/agent/.hermes/memories",
             "/home/agent/state",
             "/home/agent/state/hermes",
             "/firewall-certs",

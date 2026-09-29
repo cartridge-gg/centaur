@@ -4,12 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-description = "Convert Codex CLI and Claude Code sessions into each other, so that a session can continue on the other harness"
+description = "Convert Codex CLI, Claude Code and Hermes Agent sessions into each other, so that a session can continue on another harness"
 publish = false
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 regex = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
 ryu = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }

@@ -1,7 +1,8 @@
 //! The switchable mode (`CENTAUR_HARNESS_SWITCHING=1`): a session moves
-//! between Codex and Claude Code when the model provider is exhausted. Shell
-//! scripts stand in for the `codex` and `claude` CLIs; the session files are
-//! the recorded fixtures of session-transfer.
+//! between Codex, Claude Code and Hermes when the model provider is
+//! exhausted. Shell scripts stand in for the `codex` and `claude` CLIs and
+//! for the Python of Hermes; the sessions are the recorded fixtures of
+//! session-transfer.
 
 #![cfg(unix)]
 
@@ -27,6 +28,13 @@ const CLAUDE_SESSION_ID: &str = "19fa6065-e665-49b6-9565-cf655fa8bc17";
 /// The first prompt of both recorded sessions.
 const FIRST_PROMPT: &str = "Read calc.py and test_calc.py.";
 const PROMPT: &str = "Fix the failing test.";
+const HERMES_FIXTURE: &str = "hermes/recorded-hermes-0.20.0-rotation.sql";
+/// The recorded Hermes session ended in a compaction, which continued in
+/// `HERMES_TIP_ID`.
+const HERMES_SESSION_ID: &str = "20260927_141754_17bd65";
+const HERMES_TIP_ID: &str = "20260927_141856_05140e";
+/// A prompt of the recorded Hermes session.
+const HERMES_PROMPT: &str = "Run `git log --oneline` and tell me the last commit message.";
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 fn fixture(name: &str) -> PathBuf {
@@ -123,6 +131,61 @@ echo '{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","tex
 echo '{"type":"result","subtype":"success","result":"claude answer"}'
 "#;
 
+/// A fake Python of Hermes. With `-c` it is the session import: it saves the
+/// payload and reports its id as imported. With `-m tui_gateway.entry` it is
+/// the gateway: `prompt.submit` prints the lines of `$FAKE_HERMES_TURN_LINES`
+/// (with `LIVE_ID` replaced) while that file exists, or an answer. With
+/// `FAKE_HERMES_RESUME_FAILS=1`, `session.resume` fails as Hermes does for a
+/// session that it does not have.
+const FAKE_HERMES_PYTHON: &str = r#"#!/bin/sh
+if [ "${1:-}" = "-c" ]; then
+  payload=$(cat)
+  printf '%s
+' "$payload" > "$FAKE_LOG_DIR/hermes-import.json"
+  id=$(printf '%s' "$payload" | sed -n 's/^\[{"id":"\([^"]*\)".*/\1/p')
+  printf '{"ok": true, "imported_ids": ["%s"], "skipped_ids": []}
+' "$id"
+  exit 0
+fi
+live=live-1
+request_id() { printf '%s' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'; }
+printf '{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready"}}
+'
+while IFS= read -r line; do
+  printf '%s
+' "$line" >> "$FAKE_LOG_DIR/hermes.log"
+  id=$(request_id "$line")
+  case "$line" in
+    *'"method":"session.create"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"session_id":"%s","stored_session_id":"20260927_120000_aaaaaa"}}
+' "$id" "$live" ;;
+    *'"method":"session.resume"'*)
+      key=$(printf '%s' "$line" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
+      if [ "${FAKE_HERMES_RESUME_FAILS:-}" = "1" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":4007,"message":"session not found"}}
+' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"session_id":"%s","session_key":"%s"}}
+' "$id" "$live" "$key"
+      fi ;;
+    *'"method":"prompt.submit"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}
+' "$id"
+      if [ -n "${FAKE_HERMES_TURN_LINES:-}" ] && [ -f "$FAKE_HERMES_TURN_LINES" ]; then
+        sed "s/LIVE_ID/$live/g" "$FAKE_HERMES_TURN_LINES"
+        continue
+      fi
+      printf '{"jsonrpc":"2.0","method":"event","params":{"type":"message.complete","session_id":"%s","payload":{"text":"hermes answer","status":"complete"}}}
+' "$live" ;;
+    *'"method":"session.interrupt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}
+' "$id"
+      printf '{"jsonrpc":"2.0","method":"event","params":{"type":"message.complete","session_id":"%s","payload":{"text":"","status":"interrupted"}}}
+' "$live" ;;
+  esac
+done
+"#;
+
 /// A state volume with a workspace, the fake CLIs and their logs.
 struct Sandbox {
     root: PathBuf,
@@ -136,13 +199,22 @@ impl Sandbox {
             "harness-server-switching-{name}-{}",
             Uuid::new_v4().simple()
         ));
-        for dir in ["workspace", "codex", "claude", "state", "bin", "logs"] {
+        for dir in [
+            "workspace",
+            "codex",
+            "claude",
+            "hermes",
+            "state",
+            "bin",
+            "logs",
+        ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         // The harness resolves its cwd without symlinks.
         let root = root.canonicalize().unwrap();
         write_script(&root.join("bin/codex"), FAKE_CODEX);
         write_script(&root.join("bin/claude"), FAKE_CLAUDE);
+        write_script(&root.join("bin/hermes-python"), FAKE_HERMES_PYTHON);
         let path = |dir: &str| root.join(dir).to_string_lossy().into_owned();
         let env = vec![
             ("CENTAUR_HARNESS_SWITCHING", "1".to_string()),
@@ -155,6 +227,9 @@ impl Sandbox {
             ("CENTAUR_STATE_DIR", path("state")),
             ("CODEX_BIN", path("bin/codex")),
             ("CLAUDE_BIN", path("bin/claude")),
+            ("HERMES_HOME", path("hermes")),
+            ("HERMES_PYTHON", path("bin/hermes-python")),
+            ("HERMES_CRON_TICK_SECONDS", "0".to_string()),
             ("FAKE_LOG_DIR", path("logs")),
             ("HOME", root.to_string_lossy().into_owned()),
         ]
@@ -239,6 +314,21 @@ impl Sandbox {
         .unwrap();
     }
 
+    /// The recorded Hermes session, as the active Hermes session.
+    fn seed_hermes_session(&self) {
+        let conn = rusqlite::Connection::open(self.path("hermes/state.db")).unwrap();
+        // The dump creates `messages` before `sessions`, which its foreign
+        // key references.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(&std::fs::read_to_string(fixture(HERMES_FIXTURE)).unwrap())
+            .unwrap();
+        std::fs::write(
+            self.path("hermes/centaur-session-id"),
+            format!("{HERMES_SESSION_ID}\n"),
+        )
+        .unwrap();
+    }
+
     fn spawn(&self, harness: &str) -> Server {
         let mut command = Command::new(env!("CARGO_BIN_EXE_harness-server"));
         command
@@ -254,6 +344,8 @@ impl Sandbox {
             "OPENROUTER_MODEL",
             "CLAUDE_MODEL",
             "CODEX_CONTINUE_THREAD_ID",
+            "HERMES_CONTINUE_SESSION_ID",
+            "CENTAUR_HERMES_SESSION_FILE",
         ] {
             command.env_remove(key);
         }
@@ -1219,4 +1311,205 @@ fn a_session_that_cannot_move_stays_and_says_so() {
     assert!(sandbox.log("claude.log").is_empty());
     assert_eq!(sandbox.read("state/centaur-active-harness"), "codex\n");
     assert_eq!(journal_modes(&sandbox), ["revert"]);
+}
+
+/// A failed Hermes turn: the gateway ends it with the error of an exhausted
+/// provider pool.
+fn hermes_exhaustion() -> Vec<Value> {
+    vec![json!({"jsonrpc": "2.0", "method": "event", "params": {
+        "type": "message.complete", "session_id": "LIVE_ID",
+        "payload": {"text": "", "status": "error", "error": "API Error: 503 pool_exhausted"}}})]
+}
+
+fn statuses(output: &[Value]) -> Vec<&Value> {
+    output
+        .iter()
+        .filter(|l| l["method"] == "turn/completed")
+        .map(|l| &l["params"]["turn"]["status"])
+        .collect()
+}
+
+#[test]
+fn hermes_pool_exhaustion_moves_the_turn_to_the_named_harness() {
+    let mut sandbox = Sandbox::new("hermes-to-claude");
+    sandbox.seed_hermes_session();
+    let lines = sandbox.lines_file("exhausted.jsonl", &hermes_exhaustion());
+    sandbox.set("FAKE_HERMES_TURN_LINES", lines);
+
+    let mut server = sandbox.spawn("hermes");
+    let mut line = user_line(PROMPT);
+    line["centaur"] = json!({"failover": {"harness": "claudecode"}});
+    server.send(line);
+    let output = server.read_turn();
+    server.finish();
+
+    let [notice] = notices(&output)[..] else {
+        panic!("one notice: {output:#?}");
+    };
+    assert_eq!(notice["from"], "hermes");
+    assert_eq!(notice["to"], "claudecode");
+    assert_eq!(notice["mode"], "reactive");
+    assert_eq!(notice["resume"], "replay");
+    assert_eq!(notice["history"], "converted");
+    assert_eq!(notice["sourceSessionId"], HERMES_SESSION_ID);
+    assert_eq!(notice["providerExhausted"]["signal"], "poolMarker");
+    let session_id = notice["sessionId"].as_str().unwrap();
+
+    // Only the Claude turn reaches the client.
+    assert_eq!(statuses(&output), ["completed"]);
+    assert_eq!(agent_texts(&output), ["claude answer"]);
+
+    // Hermes resumed its session as a Centaur session.
+    let hermes = sandbox.log("hermes.log");
+    let resume = hermes
+        .lines()
+        .find(|l| l.contains(r#""method":"session.resume""#))
+        .expect("session.resume");
+    assert!(
+        resume.contains(&format!(r#""session_id":"{HERMES_SESSION_ID}""#)),
+        "{resume}"
+    );
+    assert!(resume.contains(r#""source":"centaur""#), "{resume}");
+
+    // Claude resumes the history of the newest Hermes session of the
+    // compaction chain, and gets the prompt again.
+    let claude = sandbox.log("claude.log");
+    assert!(
+        claude.contains(&format!("--resume {session_id}")),
+        "{claude}"
+    );
+    assert!(claude.contains(PROMPT), "{claude}");
+    let converted =
+        std::fs::read_to_string(sandbox.claude_project().join(format!("{session_id}.jsonl")))
+            .unwrap();
+    assert!(converted.contains("imported from Hermes Agent into Claude Code"));
+    assert!(converted.contains(HERMES_TIP_ID));
+    assert!(converted.contains(HERMES_PROMPT));
+    assert_eq!(sandbox.read("state/centaur-active-harness"), "claudecode\n");
+    assert_eq!(
+        sandbox.read("claude/centaur-session-id"),
+        format!("{session_id}\n")
+    );
+    let journal = sandbox.read("state/centaur-failover-journal.jsonl");
+    let entry: Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        entry["sourcePath"].as_str().unwrap(),
+        sandbox.path("hermes/state.db").to_str().unwrap()
+    );
+}
+
+#[test]
+fn a_hermes_turn_without_a_named_harness_fails_as_before() {
+    let mut sandbox = Sandbox::new("hermes-no-target");
+    sandbox.seed_hermes_session();
+    let lines = sandbox.lines_file("exhausted.jsonl", &hermes_exhaustion());
+    sandbox.set("FAKE_HERMES_TURN_LINES", lines);
+
+    let mut server = sandbox.spawn("hermes");
+    server.send(user_line(PROMPT));
+    let output = server.read_turn();
+    server.finish();
+
+    assert!(notices(&output).is_empty(), "{output:#?}");
+    let completed = output
+        .iter()
+        .find(|l| l["method"] == "turn/completed")
+        .unwrap();
+    assert_eq!(completed["params"]["turn"]["status"], "failed");
+    assert_eq!(
+        completed["params"]["centaur"]["providerExhausted"]["signal"],
+        "poolMarker"
+    );
+    assert_eq!(sandbox.read("state/centaur-active-harness"), "hermes\n");
+    assert!(sandbox.log("claude.log").is_empty());
+}
+
+#[test]
+fn a_requested_switch_to_hermes_imports_the_session() {
+    let sandbox = Sandbox::new("claude-to-hermes");
+    sandbox.seed_claude_session();
+
+    let mut server = sandbox.spawn("claude-code");
+    let mut line = user_line(PROMPT);
+    line["centaur"] = json!({"harness": "hermes", "mode": "requested"});
+    server.send(line);
+    let output = server.read_turn();
+    server.finish();
+
+    let [notice] = notices(&output)[..] else {
+        panic!("one notice: {output:#?}");
+    };
+    assert_eq!(notice["from"], "claudecode");
+    assert_eq!(notice["to"], "hermes");
+    assert_eq!(notice["mode"], "requested");
+    assert_eq!(notice["history"], "converted");
+    assert_eq!(notice["sourceSessionId"], CLAUDE_SESSION_ID);
+    let session_id = notice["sessionId"].as_str().unwrap();
+    assert_eq!(agent_texts(&output), ["hermes answer"]);
+
+    // The import got the Claude history for the new Hermes session.
+    let payload: Value =
+        serde_json::from_str(&sandbox.log("hermes-import.json")).expect("an import payload");
+    assert_eq!(payload[0]["id"], session_id);
+    assert_eq!(payload[0]["source"], "centaur");
+    let first = payload[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        first.contains("imported from Claude Code into Hermes Agent"),
+        "{first}"
+    );
+    assert!(first.contains(FIRST_PROMPT), "{first}");
+
+    // Hermes resumes the imported session, and gets the prompt.
+    let hermes = sandbox.log("hermes.log");
+    let resume = hermes
+        .lines()
+        .find(|l| l.contains(r#""method":"session.resume""#))
+        .expect("session.resume");
+    assert!(
+        resume.contains(&format!(r#""session_id":"{session_id}""#)),
+        "{resume}"
+    );
+    assert!(
+        hermes
+            .lines()
+            .any(|l| l.contains(r#""method":"prompt.submit""#) && l.contains(PROMPT))
+    );
+    assert_eq!(
+        sandbox.read("hermes/centaur-session-id"),
+        format!("{session_id}\n")
+    );
+    assert_eq!(sandbox.read("state/centaur-active-harness"), "hermes\n");
+}
+
+#[test]
+fn hermes_that_cannot_resume_the_import_sends_the_session_back_to_claude() {
+    let mut sandbox = Sandbox::new("hermes-revert");
+    sandbox.seed_claude_session();
+    sandbox.set("FAKE_HERMES_RESUME_FAILS", "1");
+
+    let mut server = sandbox.spawn("claude-code");
+    let mut line = user_line(PROMPT);
+    line["centaur"] = json!({"harness": "hermes", "mode": "requested"});
+    server.send(line);
+    let output = server.read_until_end();
+    server.finish();
+
+    let modes: Vec<&Value> = notices(&output).iter().map(|n| &n["mode"]).collect();
+    assert_eq!(modes, ["requested", "revert"], "{output:#?}");
+    let revert = notices(&output)[1];
+    assert_eq!(revert["from"], "hermes");
+    assert_eq!(revert["to"], "claudecode");
+    assert_eq!(revert["sessionId"], CLAUDE_SESSION_ID);
+    // The turn ends with the failure; the next turn runs on Claude.
+    let failure = output.last().unwrap();
+    assert_eq!(
+        failure["params"]["centaur"]["failover"]["status"],
+        "reverted"
+    );
+    assert_eq!(sandbox.read("state/centaur-active-harness"), "claudecode\n");
+    assert_eq!(
+        sandbox.read("claude/centaur-session-id"),
+        format!("{CLAUDE_SESSION_ID}\n")
+    );
+    assert!(!sandbox.path("hermes/centaur-session-id").exists());
 }

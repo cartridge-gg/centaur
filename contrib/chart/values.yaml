@@ -395,8 +395,9 @@ sandbox:
   # Persistent per-sandbox state: one PersistentVolumeClaim per session
   # sandbox (created from the Sandbox's volumeClaimTemplates, kept across an
   # idle pause, deleted with the sandbox) mounted at `mountPath`. The sandbox
-  # entrypoint links ~/.codex, ~/.claude, ~/uploads and ~/branches into it,
-  # so a resumed session keeps its harness history and its working copies.
+  # entrypoint links ~/.codex, ~/.claude, ~/.hermes, ~/uploads and ~/branches
+  # into it, so a resumed session keeps its harness history and its working
+  # copies.
   # The cluster needs a StorageClass that can provision the claims; with no
   # default class set `storageClassName` explicitly. Warm-pool sandboxes are
   # not created while this is on (a warm pod cannot gain a claim later).
@@ -532,11 +533,13 @@ apiRs:
   # its whole account pool is rate limited. Such a failure is reported as
   # `provider_exhausted`. Native usage-limit errors are recognized without it.
   providerExhaustedMarkers: ""
-  # Continue a Codex or Claude Code session on the other harness when the
-  # model provider of its harness has no capacity left. The sandbox converts
-  # the session and resumes it on the other harness, in the same turn, and
-  # the client gets a `session.provider_failover` event. Only sandboxes
-  # created after the change can switch.
+  # Continue a session on another harness when the model provider of its
+  # harness has no capacity left: Codex moves to Claude Code, Claude Code
+  # moves to Codex, and Hermes moves to Codex, or to Claude Code when the Codex
+  # provider is known to be exhausted. The sandbox converts the session and
+  # resumes it on the other harness, in the same turn, and the client gets a
+  # `session.provider_failover` event. Only sandboxes created after the
+  # change can switch.
   #   models: comma-separated `harness=model` pairs for the model after a
   #     switch, for example "codex=gpt-5-codex". Empty: the harness default.
   #   threadPrefixes: comma-separated thread key prefixes of the sessions

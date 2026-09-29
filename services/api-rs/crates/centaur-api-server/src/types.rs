@@ -51,7 +51,7 @@ pub struct CreateSessionResponse {
 }
 
 /// `GET /api/provider-health`: the model providers that have no capacity left
-/// now, by harness (`codex`, `claudecode`). A harness that is not listed is
+/// now, by harness (`codex`, `claudecode`, `hermes`). A harness that is not listed is
 /// not known to be exhausted.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ProviderHealthResponse {

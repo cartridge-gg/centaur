@@ -96,7 +96,7 @@ pub fn render_session(
 
     Converted {
         tool: Tool::Claude,
-        id: target.id,
+        id: target.id.to_string(),
         path: target
             .home
             .join("projects")

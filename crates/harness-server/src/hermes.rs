@@ -56,6 +56,12 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(180);
 /// `message.complete` before we stop draining and move on.
 const INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CRON_TICK_SECONDS: u64 = 60;
+/// The file with the durable Hermes session key. It lets a new gateway
+/// resume the session.
+pub(crate) const SESSION_FILE_ENV: &str = "CENTAUR_HERMES_SESSION_FILE";
+/// The session key file in `$HERMES_HOME` when [`SESSION_FILE_ENV`] is unset.
+pub(crate) const PERSISTED_SESSION_FILE: &str = "centaur-session-id";
+
 /// The answer to Hermes's `clarify` tool. A Centaur session runs in a chat
 /// thread, which cannot show an interactive question, so the model asks in
 /// its reply instead.
@@ -272,7 +278,7 @@ impl HermesChild {
             session_id: String::new(),
             stored_session_id: String::new(),
             session_started: false,
-            session_file: env::var_os("CENTAUR_HERMES_SESSION_FILE").map(PathBuf::from),
+            session_file: env::var_os(SESSION_FILE_ENV).map(PathBuf::from),
             pending: VecDeque::new(),
             next_rpc_id: 0,
         };
@@ -311,8 +317,19 @@ impl HermesChild {
         )?;
         if let Some(resume) = resume {
             // A failed resume must not silently replace an existing conversation.
-            let result = self.rpc("session.resume", json!({"session_id": resume, "cols": 200}))?;
+            // The source sets the platform of the live session, as on create.
+            let result = self.rpc(
+                "session.resume",
+                json!({"session_id": resume, "cols": 200, "source": "centaur"}),
+            )?;
             return self.accept_session(&result, true);
+        }
+        // A session that a harness switch converted: without its history, the
+        // switch goes back to the session it came from.
+        if crate::switch::resume_required() {
+            return Err(HarnessServerError::Protocol(
+                "the converted Hermes session to resume has no session key".into(),
+            ));
         }
 
         let mut params = json!({

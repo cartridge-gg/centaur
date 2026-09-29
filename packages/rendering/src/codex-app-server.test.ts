@@ -958,6 +958,29 @@ describe('CodexAppServerRendererEventMapper provider exhaustion', () => {
     })
   })
 
+  it('names Hermes in a switch from and back to it', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = [
+      ...mapper.process({
+        method: 'centaur/providerFailover',
+        params: { from: 'hermes', to: 'codex', mode: 'reactive', history: 'converted' }
+      }),
+      ...mapper.process({
+        method: 'centaur/providerFailover',
+        params: { from: 'codex', to: 'hermes', mode: 'requested', history: 'converted' }
+      })
+    ]
+    const titles = events
+      .filter(event => event.type === 'renderer.task.update')
+      .map(event => (event as any).task.title)
+    expect([...new Set(titles)]).toEqual(['Switched to Codex', 'Switched to Hermes'])
+    expect(events.at(-1)).toMatchObject({
+      task: {
+        details: [{ type: 'text', text: 'As requested, this session continues on Hermes with its history.' }]
+      }
+    })
+  })
+
   it('shows a revert to the session from before the switch', () => {
     const mapper = new CodexAppServerRendererEventMapper()
     const switched = { from: 'codex', to: 'claudecode', mode: 'reactive', history: 'converted' }

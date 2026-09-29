@@ -7,7 +7,7 @@
 //! the sandbox with a `centaur` directive on each user line, and records the
 //! switch when the sandbox reports it with a `centaur/providerFailover` line.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use centaur_session_core::{HarnessType, ThreadKey};
 use centaur_telemetry::{init_session_failure, init_session_provider_failover};
@@ -55,28 +55,54 @@ impl ProviderFailoverConfig {
 /// converted session and went back (`revert`).
 pub(crate) const FAILOVER_MODES: [&str; 4] = ["reactive", "proactive", "requested", "revert"];
 
+/// The harnesses whose sessions can fail over.
+pub(crate) const FAILOVER_HARNESSES: [HarnessType; 3] = [
+    HarnessType::Codex,
+    HarnessType::ClaudeCode,
+    HarnessType::Hermes,
+];
+
 /// Creates the metrics of switches and of turns that failed on an exhausted
 /// provider at 0. These events are rare, and `increase()` cannot see the first
 /// increment of a series that starts at 1; each process start begins new
-/// series.
+/// series. A switch goes to a failover candidate, or back from it
+/// (`requested`, `revert`), so each pair has both directions.
 pub(crate) fn init_metrics(failover_enabled: bool) {
-    for harness in [HarnessType::Codex, HarnessType::ClaudeCode] {
+    for harness in FAILOVER_HARNESSES {
         init_session_failure(harness.as_ref(), crate::PROVIDER_EXHAUSTED_FAILURE_CLASS);
-        if let Some(other) = failover_target(&harness).filter(|_| failover_enabled) {
+        if !failover_enabled {
+            continue;
+        }
+        for candidate in failover_candidates(&harness) {
             for mode in FAILOVER_MODES {
-                init_session_provider_failover(harness.as_ref(), other.as_ref(), mode);
+                init_session_provider_failover(harness.as_ref(), candidate.as_ref(), mode);
+                init_session_provider_failover(candidate.as_ref(), harness.as_ref(), mode);
             }
         }
     }
 }
 
-/// The harness that a session on `harness` fails over to.
-pub(crate) fn failover_target(harness: &HarnessType) -> Option<HarnessType> {
+/// The harnesses that a session on `harness` can fail over to, in order of
+/// preference. Codex and Claude Code fail over to each other. Hermes fails
+/// over to Codex, or to Claude Code when the Codex provider is exhausted too.
+pub(crate) fn failover_candidates(harness: &HarnessType) -> &'static [HarnessType] {
     match harness {
-        HarnessType::Codex => Some(HarnessType::ClaudeCode),
-        HarnessType::ClaudeCode => Some(HarnessType::Codex),
-        HarnessType::Amp | HarnessType::Nanocodex | HarnessType::Hermes => None,
+        HarnessType::Codex => &[HarnessType::ClaudeCode],
+        HarnessType::ClaudeCode => &[HarnessType::Codex],
+        HarnessType::Hermes => &[HarnessType::Codex, HarnessType::ClaudeCode],
+        HarnessType::Amp | HarnessType::Nanocodex => &[],
     }
+}
+
+/// The first of `candidates` whose provider is not known to be exhausted.
+/// `exhausted` has the names of the exhausted harnesses.
+pub(crate) fn first_available<'a>(
+    candidates: &'a [HarnessType],
+    exhausted: &HashSet<String>,
+) -> Option<&'a HarnessType> {
+    candidates
+        .iter()
+        .find(|candidate| !exhausted.contains(candidate.as_ref()))
 }
 
 /// False when the requester turned failover off for the execution.
@@ -93,8 +119,10 @@ pub(crate) struct FailoverDirective {
     /// The harness for the turn. When the sandbox runs another one, it moves
     /// the session before the turn starts.
     pub harness: HarnessType,
-    /// The session may move to the other harness if the provider fails.
+    /// The session may move to `target` if the provider fails.
     pub enabled: bool,
+    /// The failover target of `harness`.
+    pub target: Option<HarnessType>,
     /// The model after such a move.
     pub model: Option<String>,
     /// The user lines were written for another harness: their model,
@@ -108,6 +136,9 @@ pub(crate) struct FailoverDirective {
 impl FailoverDirective {
     fn to_value(&self) -> Value {
         let mut failover = json!({"enabled": self.enabled});
+        if let Some(target) = &self.target {
+            failover["harness"] = json!(target.as_ref());
+        }
         if let Some(model) = &self.model {
             failover["model"] = json!(model);
         }
@@ -224,19 +255,65 @@ pub(crate) fn switch_pending(record: Option<&Value>) -> bool {
         == Some(true)
 }
 
+/// The harnesses that the session left in the switches of the sandbox of
+/// `record`, oldest first. A record from before this list names only `from`.
+pub(crate) fn left_harnesses(record: Option<&Value>) -> Vec<String> {
+    let Some(record) = record else {
+        return Vec::new();
+    };
+    match record.get("left").and_then(Value::as_array) {
+        Some(left) => left
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        None => record
+            .get("from")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// `record`, a switch from [`failover_record`], with `left`: the harnesses
+/// that the session left in the switches of this sandbox, oldest first, with
+/// the `from` of this switch last. The list of `previous` goes on while the
+/// sandbox stays, so a session that left Hermes and then Codex has both. The
+/// harness that the session runs on is never in it.
+pub(crate) fn with_left(mut record: Value, previous: Option<&Value>) -> Value {
+    let sandbox_id = record.get("sandbox_id").and_then(Value::as_str);
+    let mut left = if switched_in(previous, sandbox_id) {
+        left_harnesses(previous)
+    } else {
+        Vec::new()
+    };
+    let from = record
+        .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let to = record.get("to").and_then(Value::as_str).unwrap_or_default();
+    left.retain(|harness| harness != from && harness != to);
+    if !from.is_empty() {
+        left.push(from.to_owned());
+    }
+    record["left"] = json!(left);
+    record
+}
+
 /// True when the session left `requested` in a failover and still runs on
 /// `existing`: a request for `requested` is from a client that did not see
-/// the switch.
+/// the switch, or, with `harness_explicit`, a request to go back. The session
+/// can have left more than one harness in its sandbox.
 pub(crate) fn kept_after_failover(
     record: Option<&Value>,
     requested: &HarnessType,
     existing: &str,
 ) -> bool {
-    let Some(record) = record else {
-        return false;
-    };
-    record.get("from").and_then(Value::as_str) == Some(requested.as_ref())
-        && record.get("to").and_then(Value::as_str) == Some(existing)
+    record.is_some_and(|record| record.get("to").and_then(Value::as_str) == Some(existing))
+        && left_harnesses(record)
+            .iter()
+            .any(|harness| harness == requested.as_ref())
 }
 
 #[cfg(test)]
@@ -262,16 +339,45 @@ mod tests {
     }
 
     #[test]
-    fn only_codex_and_claude_code_fail_over() {
+    fn codex_claude_code_and_hermes_fail_over() {
+        use HarnessType::{Amp, ClaudeCode, Codex, Hermes, Nanocodex};
+        for (harness, candidates) in [
+            (Codex, &[ClaudeCode][..]),
+            (ClaudeCode, &[Codex][..]),
+            (Hermes, &[Codex, ClaudeCode][..]),
+            (Amp, &[][..]),
+            (Nanocodex, &[][..]),
+        ] {
+            assert_eq!(failover_candidates(&harness), candidates, "{harness}");
+        }
+        for harness in FAILOVER_HARNESSES {
+            assert!(!failover_candidates(&harness).is_empty(), "{harness}");
+        }
+    }
+
+    #[test]
+    fn the_first_candidate_that_is_not_exhausted_is_the_target() {
+        let hermes = failover_candidates(&HarnessType::Hermes);
+        let exhausted = |names: &[&str]| -> HashSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
         assert_eq!(
-            failover_target(&HarnessType::Codex),
-            Some(HarnessType::ClaudeCode)
+            first_available(hermes, &exhausted(&[])),
+            Some(&HarnessType::Codex)
         );
         assert_eq!(
-            failover_target(&HarnessType::ClaudeCode),
-            Some(HarnessType::Codex)
+            first_available(hermes, &exhausted(&["hermes"])),
+            Some(&HarnessType::Codex)
         );
-        assert_eq!(failover_target(&HarnessType::Hermes), None);
+        assert_eq!(
+            first_available(hermes, &exhausted(&["codex"])),
+            Some(&HarnessType::ClaudeCode)
+        );
+        assert_eq!(
+            first_available(hermes, &exhausted(&["codex", "claudecode"])),
+            None
+        );
+        assert_eq!(first_available(&[], &exhausted(&[])), None);
     }
 
     #[test]
@@ -288,6 +394,7 @@ mod tests {
         let directive = FailoverDirective {
             harness: HarnessType::ClaudeCode,
             enabled: true,
+            target: Some(HarnessType::Codex),
             model: Some("gpt-5.5".to_owned()),
             retarget_model: None,
             requested: false,
@@ -300,7 +407,8 @@ mod tests {
         let user: Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(
             user["centaur"],
-            json!({"harness": "claudecode", "failover": {"enabled": true, "model": "gpt-5.5"}})
+            json!({"harness": "claudecode",
+                   "failover": {"enabled": true, "harness": "codex", "model": "gpt-5.5"}})
         );
         assert_eq!(user["model"], "claude-opus-5-5");
         assert!(!lines[1].contains("centaur"));
@@ -312,6 +420,7 @@ mod tests {
         let directive = FailoverDirective {
             harness: HarnessType::ClaudeCode,
             enabled: false,
+            target: None,
             model: None,
             retarget_model: Some(Some("claude-opus-5-5".to_owned())),
             requested: true,
@@ -339,6 +448,11 @@ mod tests {
             notice.provider_exhausted().unwrap()["resetAt"],
             1_790_220_376
         );
+
+        let back = FailoverNotice::parse(&json!({"method": "centaur/providerFailover",
+            "params": {"from": "codex", "to": "hermes", "mode": "requested"}}))
+        .unwrap();
+        assert_eq!(back.to, HarnessType::Hermes);
 
         let unknown = json!({"method": "centaur/providerFailover", "params": {"from": "codex", "to": "gemini"}});
         assert_eq!(FailoverNotice::parse(&unknown), None);
@@ -387,11 +501,82 @@ mod tests {
     }
 
     #[test]
+    fn a_session_remembers_every_harness_that_it_left_in_its_sandbox() {
+        let switch =
+            |from: HarnessType, to: HarnessType, sandbox: &str, previous: Option<&Value>| {
+                with_left(
+                    failover_record(&from, &to, "reactive", None, None, Some(sandbox)),
+                    previous,
+                )
+            };
+        let first = switch(HarnessType::Hermes, HarnessType::Codex, "sbx-1", None);
+        assert_eq!(left_harnesses(Some(&first)), ["hermes"]);
+        let second = switch(
+            HarnessType::Codex,
+            HarnessType::ClaudeCode,
+            "sbx-1",
+            Some(&first),
+        );
+        assert_eq!(left_harnesses(Some(&second)), ["hermes", "codex"]);
+        for requested in [HarnessType::Hermes, HarnessType::Codex] {
+            assert!(
+                kept_after_failover(Some(&second), &requested, "claudecode"),
+                "{requested}"
+            );
+        }
+        assert!(!kept_after_failover(
+            Some(&second),
+            &HarnessType::Hermes,
+            "codex"
+        ));
+
+        // Back on Hermes: the list has the other two, and never the harness
+        // that the session runs on.
+        let back = switch(
+            HarnessType::ClaudeCode,
+            HarnessType::Hermes,
+            "sbx-1",
+            Some(&second),
+        );
+        assert_eq!(left_harnesses(Some(&back)), ["codex", "claudecode"]);
+
+        // A switch in another sandbox starts a new list.
+        let elsewhere = switch(
+            HarnessType::Codex,
+            HarnessType::ClaudeCode,
+            "sbx-2",
+            Some(&second),
+        );
+        assert_eq!(left_harnesses(Some(&elsewhere)), ["codex"]);
+
+        // A record from before the list names only `from`.
+        let old = json!({"from": "codex", "to": "claudecode", "sandbox_id": "sbx-1"});
+        assert_eq!(left_harnesses(Some(&old)), ["codex"]);
+        assert!(kept_after_failover(
+            Some(&old),
+            &HarnessType::Codex,
+            "claudecode"
+        ));
+        assert!(!kept_after_failover(
+            Some(&old),
+            &HarnessType::Hermes,
+            "claudecode"
+        ));
+    }
+
+    #[test]
     fn switch_and_exhausted_failure_metrics_start_at_zero() {
         centaur_telemetry::prometheus_handle().unwrap();
         init_metrics(true);
         let metrics = centaur_telemetry::render_metrics().unwrap();
-        for (from, to) in [("codex", "claudecode"), ("claudecode", "codex")] {
+        for (from, to) in [
+            ("codex", "claudecode"),
+            ("claudecode", "codex"),
+            ("hermes", "codex"),
+            ("codex", "hermes"),
+            ("hermes", "claudecode"),
+            ("claudecode", "hermes"),
+        ] {
             for mode in FAILOVER_MODES {
                 let series = format!(
                     r#"centaur_session_provider_failovers_total{{from="{from}",to="{to}",mode="{mode}"}} "#
@@ -399,7 +584,7 @@ mod tests {
                 assert!(metrics.contains(&series), "{series}");
             }
         }
-        for harness in ["codex", "claudecode"] {
+        for harness in ["codex", "claudecode", "hermes"] {
             let series = format!(
                 r#"centaur_session_failures_total{{failure_class="provider_exhausted",harness="{harness}"}} "#
             );

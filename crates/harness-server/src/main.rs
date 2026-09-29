@@ -8,7 +8,7 @@ use harness_server::{
     run_nanocodex_blocks_server, run_validate_agent_deltas, run_validate_jsonrpc,
 };
 use session_transfer::Tool;
-use session_transfer::discover::{Homes, SessionRef, claude_home, codex_home};
+use session_transfer::discover::{Homes, SessionRef, claude_home, codex_home, hermes_home};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,7 +34,7 @@ enum CliCommand {
     Hermes,
     ValidateJsonrpc,
     ValidateAgentDeltas,
-    /// Work with native Codex and Claude Code session files.
+    /// Work with native Codex, Claude Code and Hermes Agent sessions.
     #[command(subcommand)]
     Transcript(TranscriptCommand),
 }
@@ -47,10 +47,12 @@ enum TranscriptCommand {
 
 #[derive(Debug, Args)]
 struct ConvertArgs {
-    /// Harness that wrote the session: codex or claude
+    /// Harness that wrote the session: codex, claude or hermes
     #[arg(long)]
     from: Tool,
-    /// Harness to convert to [default: the other one]
+    /// Harness to convert to: codex, claude or hermes [default: claude, or
+    /// codex for a Claude Code session]. A Hermes session is imported with
+    /// the Python in $HERMES_PYTHON, or else python3.
     #[arg(long)]
     to: Option<Tool>,
     /// A session file path, a session id or id prefix, or `latest`
@@ -64,6 +66,9 @@ struct ConvertArgs {
     /// Claude Code config directory [default: $CLAUDE_CONFIG_DIR or ~/.claude]
     #[arg(long, value_name = "DIR")]
     claude_home: Option<PathBuf>,
+    /// Hermes Agent home directory, with state.db [default: $HERMES_HOME or ~/.hermes]
+    #[arg(long, value_name = "DIR")]
+    hermes_home: Option<PathBuf>,
     /// Keep only the last N messages (0 = all)
     #[arg(long, value_name = "N")]
     last: Option<usize>,
@@ -116,6 +121,7 @@ fn run() -> Result<()> {
         CliCommand::ClaudeCode(command) => run_mode(HarnessKind::ClaudeCode, command.mode),
         CliCommand::Amp(command) => run_mode(HarnessKind::Amp, command.mode),
         CliCommand::Nanocodex => run_nanocodex_blocks_server(),
+        CliCommand::Hermes if switching_enabled() => run_switchable_blocks_server(Tool::Hermes),
         CliCommand::Hermes => run_hermes_blocks_server(),
         CliCommand::ValidateJsonrpc => run_validate_jsonrpc(),
         CliCommand::ValidateAgentDeltas => run_validate_agent_deltas(),
@@ -125,8 +131,8 @@ fn run() -> Result<()> {
 
 fn run_convert(args: ConvertArgs) -> Result<()> {
     let to = args.to.unwrap_or(match args.from {
-        Tool::Codex => Tool::Claude,
         Tool::Claude => Tool::Codex,
+        Tool::Codex | Tool::Hermes => Tool::Claude,
     });
     let report = convert_session(&ConvertRequest {
         from: args.from,
@@ -136,6 +142,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         homes: Homes {
             codex: codex_home(args.codex_home),
             claude: claude_home(args.claude_home),
+            hermes: hermes_home(args.hermes_home),
         },
         last_messages: args.last.filter(|&n| n > 0),
         max_tool_output: (args.max_output > 0).then_some(args.max_output),
