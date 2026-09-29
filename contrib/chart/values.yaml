@@ -395,8 +395,9 @@ sandbox:
   # Persistent per-sandbox state: one PersistentVolumeClaim per session
   # sandbox (created from the Sandbox's volumeClaimTemplates, kept across an
   # idle pause, deleted with the sandbox) mounted at `mountPath`. The sandbox
-  # entrypoint links ~/.codex, ~/.claude, ~/uploads and ~/branches into it,
-  # so a resumed session keeps its harness history and its working copies.
+  # entrypoint links ~/.codex, ~/.claude, ~/.hermes, ~/uploads and ~/branches
+  # into it, so a resumed session keeps its harness history and its working
+  # copies.
   # The cluster needs a StorageClass that can provision the claims; with no
   # default class set `storageClassName` explicitly. Warm-pool sandboxes are
   # not created while this is on (a warm pod cannot gain a claim later).
