@@ -5,12 +5,15 @@ FROM ubuntu:24.04 AS toolchain
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # ── System packages (cached unless base image changes) ───────────────────────
+# libheif-examples + its HEVC decoder plugin: harness-server converts HEIC
+# attachments (the iPhone camera default) with heif-convert.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
     git curl wget ca-certificates gnupg lsb-release sudo \
     build-essential pkg-config cmake ninja-build \
     ffmpeg ghostscript dvisvgm file \
+    libheif-examples libheif-plugin-libde265 \
     libssl-dev libclang-dev protobuf-compiler \
     libcairo2-dev libpango1.0-dev \
     ripgrep fd-find jq tree tmux unzip xz-utils gettext-base vim \

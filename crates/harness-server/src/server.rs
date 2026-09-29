@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -751,6 +751,30 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
 
 fn local_file_inputs(path: &Path, mime_type: Option<&str>, is_image: bool) -> Vec<UserInput> {
     if is_image || mime_type.is_some_and(|value| value.starts_with("image/")) {
+        // HEIC/HEIF is the iPhone camera default, but the model providers, the
+        // Hermes gateway's image.attach and the image crate all reject it.
+        // Convert it to JPEG first. If the conversion fails, attach the file as
+        // a plain file: a LocalImage the harness rejects fails the whole turn.
+        let path = if is_heif_image(path, mime_type) {
+            match convert_heif_to_jpeg(Path::new(HEIF_CONVERT), path) {
+                Ok(converted) => converted,
+                Err(error) => {
+                    eprintln!(
+                        "harness HEIF conversion failed for {}: {error}",
+                        path.display()
+                    );
+                    return vec![UserInput::Text {
+                        text: format!(
+                            "[Attached HEIC image saved to {}. It could not be converted to a format the model can view.]",
+                            path.display()
+                        ),
+                        text_elements: Vec::new(),
+                    }];
+                }
+            }
+        } else {
+            path.to_path_buf()
+        };
         // Model providers reject images past their per-image caps (Bedrock/mantle
         // and the Anthropic API cap at ~5 MB / 8000 px) and nothing upstream of
         // the model downscales, so a large pasted screenshot or photo fails the
@@ -758,7 +782,7 @@ fn local_file_inputs(path: &Path, mime_type: Option<&str>, is_image: bool) -> Ve
         // point every attachment path funnels through — before handing the model
         // a LocalImage. Best-effort: the original file is used unchanged if the
         // image is already within limits or re-encoding fails for any reason.
-        let path = downscale_oversized_image(path);
+        let path = downscale_oversized_image(&path);
         return vec![
             UserInput::Text {
                 text: format!("[Attached image saved to {}]", path.display()),
@@ -774,6 +798,82 @@ fn local_file_inputs(path: &Path, mime_type: Option<&str>, is_image: bool) -> Ve
         text: format!("[Attached file saved to {}]", path.display()),
         text_elements: Vec::new(),
     }]
+}
+
+/// Decodes HEIF images to JPEG. The sandbox image installs it from
+/// `libheif-examples`, with the HEVC decoder from `libheif-plugin-libde265`.
+const HEIF_CONVERT: &str = "heif-convert";
+
+/// `ftyp` major brands of HEIF still images and image sequences.
+const HEIF_BRANDS: [&[u8; 4]; 9] = [
+    b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevm", b"hevs", b"mif1", b"msf1",
+];
+
+/// True when the MIME type, the extension or the `ftyp` box says HEIF. The box
+/// check finds a HEIC photo that arrives with a generic name or MIME type.
+fn is_heif_image(path: &Path, mime_type: Option<&str>) -> bool {
+    if mime_type.is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "image/heic" | "image/heif" | "image/heic-sequence" | "image/heif-sequence"
+        )
+    }) {
+        return true;
+    }
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("heic") || value.eq_ignore_ascii_case("heif")
+        })
+    {
+        return true;
+    }
+    let mut header = [0_u8; 12];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && &header[4..8] == b"ftyp"
+        && HEIF_BRANDS.iter().any(|brand| header[8..12] == brand[..])
+}
+
+/// Writes the primary image of a HEIF file as a JPEG next to it and returns the
+/// JPEG path. libheif applies the rotation and crop that the file declares.
+fn convert_heif_to_jpeg(program: &Path, path: &Path) -> io::Result<PathBuf> {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let output_stem = format!("{stem}-{}", Uuid::new_v4().simple());
+    let output = path.with_file_name(format!("{output_stem}.jpg"));
+    let result = Command::new(program)
+        .arg(path)
+        .arg(&output)
+        .stdin(Stdio::null())
+        .output()?;
+    if !result.status.success() {
+        return Err(io::Error::other(format!(
+            "{} exited with {}: {}",
+            program.display(),
+            result.status,
+            String::from_utf8_lossy(&result.stderr).trim()
+        )));
+    }
+    // A file with several top-level images (a burst) is written as
+    // <output>-1.jpg, <output>-2.jpg, ...; the first one is the primary image.
+    [
+        output.clone(),
+        path.with_file_name(format!("{output_stem}-1.jpg")),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+    .ok_or_else(|| {
+        io::Error::other(format!(
+            "{} wrote no image to {}",
+            program.display(),
+            output.display()
+        ))
+    })
 }
 
 /// Longest edge (px) oversized images are downscaled to before the model sees
@@ -917,6 +1017,8 @@ fn extension_for_mime_type(mime_type: Option<&str>) -> Option<&'static str> {
         "image/png" => Some(".png"),
         "image/gif" => Some(".gif"),
         "image/webp" => Some(".webp"),
+        "image/heic" => Some(".heic"),
+        "image/heif" => Some(".heif"),
         "video/mp4" => Some(".mp4"),
         "application/pdf" => Some(".pdf"),
         "text/plain" => Some(".txt"),
@@ -1689,6 +1791,101 @@ mod tests {
         let same = downscale_oversized_image(&original);
 
         assert_eq!(same, original, "within-limit image is returned unchanged");
+    }
+
+    /// Copies a HEIF fixture (96x64 px) into `dir` under `name`.
+    fn copy_heif_fixture(fixture: &str, dir: &Path, name: &str) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/images")
+            .join(fixture);
+        let path = dir.join(name);
+        std::fs::copy(source, &path).expect("copy HEIF fixture");
+        path
+    }
+
+    /// CI installs heif-convert; a workstation without libheif skips the
+    /// tests that decode a real HEIF file.
+    fn heif_convert_installed() -> bool {
+        let installed = Command::new(HEIF_CONVERT).arg("--version").output().is_ok();
+        if !installed {
+            eprintln!("skipping: {HEIF_CONVERT} is not installed");
+        }
+        installed
+    }
+
+    #[test]
+    fn detects_heif_by_mime_type_extension_or_brand() {
+        let dir = temp_upload_dir();
+        let png = write_gradient_png(&dir, "photo.png", 4, 4);
+        let heic_as_jpg = copy_heif_fixture("tiny.heic", &dir, "photo.jpg");
+
+        assert!(is_heif_image(&png, Some("image/HEIC")));
+        assert!(is_heif_image(&dir.join("IMG_3215.HEIC"), None));
+        assert!(is_heif_image(&heic_as_jpg, Some("image/jpeg")));
+        assert!(!is_heif_image(&png, Some("image/png")));
+    }
+
+    #[test]
+    fn heic_attachment_becomes_a_jpeg_local_image() {
+        if !heif_convert_installed() {
+            return;
+        }
+        let dir = temp_upload_dir();
+        let heic = copy_heif_fixture("tiny.heic", &dir, "IMG_3215.heic");
+
+        let input = local_file_inputs(&heic, Some("image/heic"), true);
+
+        let UserInput::LocalImage { path, .. } = &input[1] else {
+            panic!("expected the converted image to be a local image");
+        };
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("jpg"));
+        assert_eq!(
+            image::image_dimensions(path).expect("jpeg decodes"),
+            (96, 64)
+        );
+    }
+
+    #[test]
+    fn multi_image_heif_converts_its_primary_image() {
+        if !heif_convert_installed() {
+            return;
+        }
+        let dir = temp_upload_dir();
+        let heif = copy_heif_fixture("two-images.heic", &dir, "burst.heic");
+
+        let converted =
+            convert_heif_to_jpeg(Path::new(HEIF_CONVERT), &heif).expect("burst converts");
+
+        assert_eq!(
+            image::image_dimensions(&converted).expect("jpeg decodes"),
+            (96, 64)
+        );
+    }
+
+    #[test]
+    fn unconvertible_heic_attachment_becomes_a_file_notice() {
+        let dir = temp_upload_dir();
+        let heic = dir.join("broken.heic");
+        std::fs::write(&heic, b"not a heif file").expect("write broken heic");
+
+        let input = local_file_inputs(&heic, Some("image/heic"), true);
+
+        assert_eq!(input.len(), 1, "no LocalImage for an unconvertible HEIC");
+        let UserInput::Text { text, .. } = &input[0] else {
+            panic!("expected a text notice");
+        };
+        assert!(text.contains("could not be converted"), "{text}");
+    }
+
+    #[test]
+    fn missing_heif_converter_is_an_error() {
+        let dir = temp_upload_dir();
+        let heic = copy_heif_fixture("tiny.heic", &dir, "IMG_3215.heic");
+
+        let error = convert_heif_to_jpeg(&dir.join("no-such-heif-convert"), &heic)
+            .expect_err("a missing converter fails the conversion");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
