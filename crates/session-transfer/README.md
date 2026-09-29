@@ -1,16 +1,18 @@
 # session-transfer
 
-Converts Codex CLI sessions and Claude Code sessions into each other, so that
-a session can continue on the other harness with its full history.
+Converts Codex CLI, Claude Code and Hermes Agent sessions into each other, so
+that a session can continue on another harness with its full history.
 
-| Direction | Reads | Writes | Resume with |
+| Tool | Reads | Writes | Resume with |
 |---|---|---|---|
-| Codex to Claude | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` | `$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<id>.jsonl` | `claude --resume <id>` |
-| Claude to Codex | `$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<id>.jsonl` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<local time>-<id>.jsonl` | `codex resume <id>`, or app-server `thread/resume` |
+| Codex | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<local time>-<id>.jsonl` | `codex resume <id>`, or app-server `thread/resume` |
+| Claude Code | `$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<id>.jsonl` | `$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<id>.jsonl` | `claude --resume <id>` |
+| Hermes Agent | `$HERMES_HOME/state.db` | `$HERMES_HOME/state.db`, through the Hermes import | `hermes --resume <id>`, or gateway `session.resume` |
 
-The crate is a Rust port of [sessport](https://github.com/lanternsmith/sessport)
-(MIT, see `NOTICE`). With the same options, the output is the same as
-sessport's output, byte for byte, except for the differences below.
+The Codex and Claude Code parts are a Rust port of
+[sessport](https://github.com/lanternsmith/sessport) (MIT, see `NOTICE`).
+With the same options, their output is the same as sessport's output, byte
+for byte, except for the differences below. sessport has no Hermes support.
 
 ## What a conversion keeps
 
@@ -23,6 +25,31 @@ It does not keep:
 - Reasoning. Codex encrypts it, and Claude thinking blocks are signed for one provider. `keep_thinking` adds reasoning summaries as text.
 - Images. Each image becomes a short text note.
 - Injected context: instructions, `AGENTS.md`, environment context, system reminders.
+
+## Hermes Agent
+
+Hermes keeps its sessions in a SQLite database, not in files.
+
+The reader (`hermes::read_session`) takes the history that Hermes itself
+loads for a session:
+
+- A compaction with `compression.in_place: false` ends the session and
+  continues it in a child session. The reader follows that chain to the newest
+  session, as `session.resume` does. The `id` of the result is the id of the
+  newest session.
+- It reads only rows with `active = 1`. After an in-place compaction, that is
+  the summary and the kept messages, not the copies that the compaction left.
+- A delegated subagent is a child session of its own, not part of the parent.
+
+`discover` lists one entry for each conversation: a session without a
+parent, at the newest session of its compaction chain.
+
+The writer renders the payload of Hermes's `SessionDB.import_sessions`, and
+`Converted::write` runs that import with the Python of the Hermes install
+(`$HERMES_PYTHON`, else `python3`). The import creates or migrates the
+database, and keeps the new id (`YYYYMMDD_HHMMSS_` and 6 hex digits). The new
+session has no title, because Hermes titles are unique, and no model, so
+Hermes uses its configured model.
 
 ## Use
 
@@ -75,6 +102,7 @@ cargo test
 | `tests/claude_format.rs` | The output uses only fields that Claude Code writes, as one linear conversation. |
 | `tests/fixture_privacy.rs` | Fixtures and goldens hold no home directories, email addresses, account ids or time zones. |
 | `tests/local_sessions.rs` | Optional. Compares with sessport on every session on the machine. Nothing is written to the repository. |
+| `tests/hermes.rs` | The Hermes reader on recorded databases, conversions from and into Hermes, and the import. With `HERMES_PYTHON` set, `cargo test --test hermes -- --ignored` imports into a real Hermes. |
 
 To generate the goldens again, or to run the local benchmark, build sessport first:
 
@@ -95,7 +123,13 @@ the differences above, so the goldens contain only documented differences.
 | `codex/synthetic-edge-cases.jsonl`, `claude/C1A0DE00-…jsonl`, `claude/synthetic-broken-chain.jsonl` | Written by hand for edge cases: secrets, UTF-16 lengths, JavaScript number and key order, legacy records, rewinds, sidechains, broken chains. |
 | `codex/recorded-codex-0.154.jsonl`, `claude/19fa6065-…jsonl` | Recorded with Codex CLI 0.154 and Claude Code 2.1.281 on a throwaway repository, then scrubbed. |
 | `*/sessport/` | Copied from sessport. |
+| `hermes/recorded-hermes-0.20.0-*.sql` | Recorded with Hermes Agent 0.20.0 through `harness-server hermes` on a throwaway repository, then scrubbed with `scripts/scrub-hermes-fixture.py`. `delegation`: tools, parallel calls, reasoning, an image, a delegated subagent, 3 in-place compactions, an interrupt and 2 resumes. `rotation`: `compression.in_place: false`. |
+
+A Hermes fixture is a SQL dump of the rows of its sessions. A test loads it
+into a temporary database with foreign keys off, because the dump creates
+`messages` before `sessions`.
 
 > **Warning:** Fixtures are public. Record new sessions on a throwaway
-> repository, run `scripts/scrub-fixture.mjs`, and read the result before you
-> commit it. `tests/fixture_privacy.rs` must pass.
+> repository, run `scripts/scrub-fixture.mjs` (or
+> `scripts/scrub-hermes-fixture.py` for Hermes), and read the result before
+> you commit it. `tests/fixture_privacy.rs` must pass.

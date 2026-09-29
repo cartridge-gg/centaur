@@ -35,3 +35,6 @@ thiserror = "2.0"
 tokio = { version = "1.49", features = ["rt-multi-thread", "signal", "sync"] }
 url = "2.5"
 uuid = { version = "1.19", features = ["v4"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }

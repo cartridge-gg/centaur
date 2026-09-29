@@ -23,10 +23,23 @@ pub enum Error {
     #[error("{0} already exists; not overwriting it")]
     AlreadyExists(PathBuf),
 
+    #[error("cannot open the Hermes database {path}")]
+    OpenDatabase {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("cannot read the Hermes database")]
+    Database(#[from] rusqlite::Error),
+
+    #[error("cannot import the session {id} into Hermes: {reason}")]
+    HermesImport { id: String, reason: String },
+
     #[error("{0} is a compressed rollout; .jsonl.zst files are not supported yet")]
     Compressed(PathBuf),
 
-    #[error("unknown tool \"{0}\"; use codex or claude")]
+    #[error("unknown tool \"{0}\"; use codex, claude or hermes")]
     UnknownTool(String),
 
     #[error("no {tool} session found for \"{reference}\" in {dir}")]

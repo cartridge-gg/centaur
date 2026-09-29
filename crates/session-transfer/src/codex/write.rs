@@ -92,7 +92,7 @@ pub fn render_session(
     contents.push('\n');
     Converted {
         tool: Tool::Codex,
-        id: target.id,
+        id: target.id.to_string(),
         path: target
             .home
             .join("sessions")
