@@ -536,7 +536,8 @@ apiRs:
   # Continue a session on another harness when the model provider of its
   # harness has no capacity left: Codex moves to Claude Code, Claude Code
   # moves to Codex, and Hermes moves to Codex, or to Claude Code when the Codex
-  # provider is known to be exhausted. The sandbox converts the session and
+  # provider is known to be exhausted or providerHealth reports more usage
+  # left for Claude Code. The sandbox converts the session and
   # resumes it on the other harness, in the same turn, and the client gets a
   # `session.provider_failover` event. Only sandboxes created after the
   # change can switch.
@@ -552,8 +553,11 @@ apiRs:
   # only from failed turns. urls: comma-separated `harness=url` pairs; each URL
   # answers GET with {"exhausted": bool, "reset_at": <Unix seconds>|null}.
   # api-rs marks an exhausted provider until reset_at, and clears the mark as
-  # soon as the provider has capacity again. Put a bearer token for the URLs
-  # in the infra secret as SESSION_PROVIDER_HEALTH_TOKEN.
+  # soon as the provider has capacity again. An optional "remaining_percent"
+  # (0-100) ranks the failover candidates that are not exhausted. A harness
+  # with a model in providerFailover.models gets model=<model> added to its
+  # URL. Put a bearer token for the URLs in the infra secret as
+  # SESSION_PROVIDER_HEALTH_TOKEN.
   providerHealth:
     urls: ""
     intervalSecs: 60

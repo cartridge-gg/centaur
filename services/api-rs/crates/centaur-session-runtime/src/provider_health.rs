@@ -3,10 +3,12 @@
 //! that call a provider themselves, and new sessions.
 //!
 //! A health URL answers `GET` with `{"exhausted": bool, "reset_at": <Unix
-//! seconds, optional>}`. An exhausted provider is marked until `reset_at`
-//! (15 minutes when it is unknown, refreshed on each check); a provider with
-//! capacity again is cleared at once, before its recorded reset. Errors
-//! change nothing.
+//! seconds, optional>, "remaining_percent": <0-100, optional>}`. An exhausted
+//! provider is marked until `reset_at` (15 minutes when it is unknown,
+//! refreshed on each check); a provider with capacity again is cleared at
+//! once, before its recorded reset. `remaining_percent` is recorded with each
+//! check, and the runtime uses it to rank failover candidates while it is
+//! recent ([`REMAINING_MAX_AGE_CHECKS`]). Errors change nothing.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -15,13 +17,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use centaur_session_core::HarnessType;
 use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::{init_provider_health_probe, record_provider_health_probe};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
 
 use crate::PROVIDER_EXHAUSTED_DEFAULT_COOLDOWN;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// A recorded `remaining_percent` counts for this many check intervals, so
+/// one or two failed checks do not drop it.
+pub(crate) const REMAINING_MAX_AGE_CHECKS: u32 = 3;
 /// The `result` label of each check.
 const HEALTHY: &str = "healthy";
 const EXHAUSTED: &str = "exhausted";
@@ -37,11 +42,29 @@ pub struct ProviderHealthProbeConfig {
 }
 
 /// One answer of a health URL.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq)]
 pub(crate) struct HealthReport {
     pub exhausted: bool,
     #[serde(default)]
     pub reset_at: Option<i64>,
+    /// The remaining usage of the provider, in percent.
+    #[serde(default, deserialize_with = "number_or_none")]
+    pub remaining_percent: Option<f64>,
+}
+
+/// A number, or `None` for any other value: a malformed optional field does
+/// not make the exhausted flag unreadable.
+fn number_or_none<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
+    Ok(serde_json::Value::deserialize(deserializer)?.as_f64())
+}
+
+impl HealthReport {
+    /// `remaining_percent` in 0 to 100, or `None` when it is not a number.
+    fn remaining(&self) -> Option<f64> {
+        self.remaining_percent
+            .filter(|remaining| remaining.is_finite())
+            .map(|remaining| remaining.clamp(0.0, 100.0))
+    }
 }
 
 /// Creates the check metric of each checked harness at 0 for every result, so
@@ -141,6 +164,10 @@ impl ProviderHealthProbe {
 
     /// Records the report. Returns whether the provider is exhausted.
     async fn apply(&self, harness: &HarnessType, report: &HealthReport) -> Result<bool, String> {
+        self.store
+            .record_provider_remaining(harness, report.remaining())
+            .await
+            .map_err(|error| error.to_string())?;
         if report.exhausted {
             let until = report_until(report.reset_at, SystemTime::now());
             self.store
@@ -189,13 +216,45 @@ mod tests {
             report,
             HealthReport {
                 exhausted: true,
-                reset_at: Some(1_790_220_376)
+                reset_at: Some(1_790_220_376),
+                remaining_percent: None,
             }
         );
         let report: HealthReport =
             serde_json::from_str(r#"{"exhausted": false, "reset_at": null}"#).unwrap();
         assert!(!report.exhausted);
         assert!(serde_json::from_str::<HealthReport>(r#"{"reset_at": 1}"#).is_err());
+    }
+
+    #[test]
+    fn the_remaining_usage_is_a_percent() {
+        let remaining = |json: &str| {
+            serde_json::from_str::<HealthReport>(json)
+                .unwrap()
+                .remaining()
+        };
+        assert_eq!(
+            remaining(r#"{"exhausted": false, "remaining_percent": 42.5}"#),
+            Some(42.5)
+        );
+        assert_eq!(
+            remaining(r#"{"exhausted": false, "remaining_percent": null}"#),
+            None
+        );
+        assert_eq!(remaining(r#"{"exhausted": false}"#), None);
+        assert_eq!(
+            remaining(r#"{"exhausted": false, "remaining_percent": 130}"#),
+            Some(100.0)
+        );
+        assert_eq!(
+            remaining(r#"{"exhausted": true, "remaining_percent": -3}"#),
+            Some(0.0)
+        );
+        // Not a number: the report is still valid without it.
+        assert_eq!(
+            remaining(r#"{"exhausted": false, "remaining_percent": "x"}"#),
+            None
+        );
     }
 
     #[test]
