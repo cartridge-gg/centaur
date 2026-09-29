@@ -41,6 +41,7 @@ fn session_files(tool: Tool, homes: &Homes) -> Vec<PathBuf> {
                 .into_iter()
                 .map(|s| s.path),
         ),
+        Tool::Hermes => unreachable!("sessport does not read Hermes sessions"),
     }
     files.sort();
     files
@@ -70,6 +71,7 @@ fn benchmark(from: Tool) {
     let to = match from {
         Tool::Codex => Tool::Claude,
         Tool::Claude => Tool::Codex,
+        Tool::Hermes => unreachable!("sessport does not read Hermes sessions"),
     };
     let mut differ = Vec::new();
     for (index, file) in files.iter().enumerate() {

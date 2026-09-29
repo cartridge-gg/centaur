@@ -1,10 +1,11 @@
-//! Converts Codex CLI and Claude Code sessions into each other, so that a
-//! session can continue on the other harness with its full history.
+//! Converts Codex CLI, Claude Code and Hermes Agent sessions into each other,
+//! so that a session can continue on another harness with its full history.
 //!
-//! The conversion is a Rust port of sessport
+//! The Codex and Claude Code parts are a Rust port of sessport
 //! (<https://github.com/lanternsmith/sessport>, MIT). With the same options,
-//! the output matches sessport byte for byte, except for the differences
-//! listed in the README (see `tests/parity.rs`).
+//! their output matches sessport byte for byte, except for the differences
+//! listed in the README (see `tests/parity.rs`). [`hermes`] reads the Hermes
+//! database and writes through the Hermes import.
 //!
 //! Tool calls and their results become tagged text. Each harness has its own
 //! tool set, and a foreign tool call replayed as a native one can make the
@@ -40,6 +41,7 @@ pub mod codex;
 pub mod convert;
 pub mod discover;
 mod error;
+pub mod hermes;
 mod js;
 mod lenient;
 pub mod model;

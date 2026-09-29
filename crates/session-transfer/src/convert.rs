@@ -1,4 +1,4 @@
-//! One-call conversion between the two tools.
+//! One-call conversion between the tools.
 
 use uuid::Uuid;
 
@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::model::{Part, Role, Session, Tool};
 use crate::output::{Converted, Target};
 use crate::prepare::PrepareOptions;
-use crate::{claude, codex};
+use crate::{claude, codex, hermes};
 
 /// What to do with a user prompt at the end of the session that has no answer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -77,5 +77,6 @@ pub fn convert(
             &options.prepare,
             &options.codex_model_provider,
         ),
+        Tool::Hermes => hermes::render_session(&session, target, &options.prepare),
     })
 }
