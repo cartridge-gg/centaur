@@ -1,6 +1,7 @@
 <%
   heading, accent =
     case @kind
+    when :connected then [ "Connected", "text-emerald-300" ]
     when :denied then [ "Not connected", "text-amber-300" ]
     else              [ "Something went wrong", "text-red-300" ]
     end
@@ -14,7 +15,7 @@
   <h1 class="text-lg font-bold <%= accent %>"><%= heading %></h1>
 
   <p class="mt-3 text-sm text-zinc-400"><%= @message %></p>
-  <% if @app&.enabled? %>
+  <% if @app&.enabled? && !@chat_flow %>
     <a href="<%= oauth_start_path(slug: @app.slug) %>" class="mt-4 inline-block text-sm console-link">Try again</a>
   <% end %>
 </div>

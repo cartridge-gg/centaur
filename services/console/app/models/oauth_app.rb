@@ -38,7 +38,9 @@ class OauthApp < ApplicationRecord
   validate :slug_does_not_shadow_oid
   validates :provider, inclusion: { in: ->(_) { Oauth::Providers.keys }, message: "is not a supported provider" }
   validates :client_id, presence: true
-  validates :client_secret, presence: true
+  # A provider whose authorization server registers public clients (PKCE, no
+  # secret) has nothing to store here.
+  validates :client_secret, presence: true, unless: :public_client?
   validate :labels_is_a_hash
   validate :allowed_scopes_valid
   validate :shared_configuration_valid
@@ -51,6 +53,11 @@ class OauthApp < ApplicationRecord
     return Oauth::Providers::Custom.new(self) if provider == Oauth::Providers::Custom::KEY
 
     Oauth::Providers.fetch(provider)
+  end
+
+  def public_client?
+    strategy = provider_strategy
+    strategy.respond_to?(:public_client?) && strategy.public_client?
   end
 
   # True when every requested scope is within the allowlist.
