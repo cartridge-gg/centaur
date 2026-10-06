@@ -274,6 +274,7 @@ Rails.application.routes.draw do
       namespace :sandbox do
         resource :permissions, only: :show
         resources :oauth_apps, only: :index
+        post "oauth_apps/:slug/connect_link", to: "oauth_connect_links#create", as: :oauth_app_connect_link
         resources :scheduled_tasks, only: %i[index show create update destroy] do
           post :run, on: :member
         end
@@ -295,6 +296,8 @@ Rails.application.routes.draw do
   # Requires an active console session; the provider is derived from the app.
   get "oauth/:slug/start", to: "oauth/flows#start", as: :oauth_start
   get "oauth/:slug/callback", to: "oauth/flows#callback", as: :oauth_callback
+  # A chat principal's own connect link (Oauth::ConnectToken); no console login.
+  get "oauth/:slug/connect", to: "oauth/flows#connect", as: :oauth_connect
 
   # Render a JSON 404 for any unmatched route instead of the static error page.
   match "*path", to: "errors#not_found", via: :all

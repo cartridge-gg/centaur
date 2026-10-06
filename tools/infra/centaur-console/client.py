@@ -95,6 +95,24 @@ class ConsoleClient:
         """Alias for tool bridge calls."""
         return self.sandbox_oauth_apps()
 
+    def oauth_connect_link(self, slug: str) -> dict[str, Any]:
+        """Mint a ten-minute link that connects THIS sandbox's person to an app.
+
+        The console reads the principal from this sandbox's entitlement token;
+        the caller cannot name anyone else. It refuses a shared conversation.
+        """
+        response = self.client.post(f"{SANDBOX_OAUTH_APPS_PATH}/{quote(slug, safe='')}/connect_link")
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _response_error_detail(exc.response)
+            raise RuntimeError(f"centaur-console connect link request failed: {detail}") from exc
+
+        data = response.json().get("data")
+        if not isinstance(data, dict) or not data.get("url"):
+            raise RuntimeError("centaur-console connect link response did not include a url")
+        return data
+
     def scheduled_tasks(self) -> list[dict[str, Any]]:
         """List scheduled tasks owned by the current Console user."""
         result = self._scheduled_task_request(SANDBOX_SCHEDULED_TASKS_PATH)
