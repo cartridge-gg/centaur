@@ -15,7 +15,7 @@ module Api
           created_by: users(:acme_admin)
         )
         @proxy = Proxy.create!(name: "person-a-sandbox", principal: @person,
-                               bearer_token_hash: Digest::SHA256.hexdigest("iprx_#{'c' * 64}"))
+                               bearer_token_hash: Digest::SHA256.hexdigest("iprx_#{SecureRandom.hex(32)}"))
       end
 
       test "mints a link for the sandbox's own person" do
