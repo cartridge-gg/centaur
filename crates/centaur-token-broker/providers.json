@@ -5,6 +5,7 @@
   "granola": { "refresh_scopes": true, "token_endpoint_auth_method": "client_secret_post" },
   "linear": { "refresh_scopes": true, "token_endpoint_auth_method": "client_secret_post" },
   "mercator": { "refresh_scopes": true, "token_endpoint_auth_method": "client_secret_post" },
+  "merchmaker": { "refresh_scopes": true, "token_endpoint_auth_method": "client_secret_post" },
   "microsoft": { "refresh_scopes": true, "token_endpoint_auth_method": "client_secret_post" },
   "slack": { "refresh_scopes": false, "token_endpoint_auth_method": "client_secret_post" },
   "zoom": { "refresh_scopes": false, "token_endpoint_auth_method": "client_secret_basic" }

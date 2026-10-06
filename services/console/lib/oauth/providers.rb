@@ -18,6 +18,7 @@ module Oauth
         Granola::KEY => Granola.new,
         Linear::KEY => Linear.new,
         Mercator::KEY => Mercator.new,
+        Merchmaker::KEY => Merchmaker.new,
         Microsoft::KEY => Microsoft.new,
         Slack::KEY => Slack.new,
         Zoom::KEY => Zoom.new

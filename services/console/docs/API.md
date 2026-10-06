@@ -1065,6 +1065,18 @@ Returns `201`. The `client_secret` is never echoed back:
 
 Returns enabled non-shared OAuth apps and the console URLs a sandbox user can open to start consent. Authenticate with the same sandbox entitlement JWT as `GET /api/v1/sandbox/permissions`. The token signature, issuer, audience, and expiry are verified. Proxy and principal claims are not checked because these URLs are not sensitive.
 
+### Sandbox Connect Links
+
+`POST /api/v1/sandbox/oauth_apps/:slug/connect_link`
+
+Mints a ten-minute consent link for the principal this sandbox serves, so the agent can ask the person in its direct conversation to connect their own account. Authenticate with the sandbox entitlement JWT; the proxy and principal claims are checked as for `GET /api/v1/sandbox/permissions`, and the principal is never taken from the request. Only a one-person principal (`teams_user`) gets a link; others answer `403`. An unknown, disabled, or shared app answers `404`.
+
+```json
+{ "data": { "url": "https://console.example.test/oauth/merchmaker/connect?t=...", "expires_at": "2026-01-01T00:10:00Z", "connected": false } }
+```
+
+`connected` is true when the principal already holds a live grant for the app.
+
 ```json
 {
   "data": [
