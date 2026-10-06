@@ -33,13 +33,38 @@ module Oauth
     class_attribute :exchange_client_factory, default: -> { Broker::AuthorizationCodeClient.new }
     class_attribute :identity_http_client_factory, default: -> { HttpClient.new }
 
+    # /connect is opened by a chat principal's person, who has no console
+    # account; /callback serves both flows and enforces the console login itself
+    # unless the signed state names a chat principal.
+    skip_before_action :require_login, :require_active_account, only: %i[connect callback]
     before_action :set_app
 
     # GET /oauth/:slug/start?scopes=
     def start
+      begin_flow(params[:scopes])
+    end
+
+    # GET /oauth/:slug/connect?t=  (an Oauth::ConnectToken)
+    #
+    # Starts the same consent flow for the chat principal the signed link names.
+    # The resulting credential is granted to that principal alone.
+    def connect
+      @chat_flow = true
+      claims = Oauth::ConnectToken.decode(params[:t].to_s, app: @app)
+      principal = Principal.find_by_oid(claims["principal"])
+      unless Oauth::ConnectToken.connectable?(principal)
+        return render_result(:error, status: :bad_request, message: "This connect link is not valid. Ask again for a new one.")
+      end
+
+      begin_flow(nil, principal: principal)
+    rescue Oauth::ConnectToken::InvalidToken
+      render_result(:error, status: :bad_request, message: "This connect link has expired or is not valid. Ask again for a new one.")
+    end
+
+    def begin_flow(raw_scopes, principal: nil)
       return render_result(:error, status: :unprocessable_entity, message: "This integration is disabled.") unless @app.enabled?
 
-      requested_scopes = parse_scopes(params[:scopes]) || Array(@app.allowed_scopes)
+      requested_scopes = parse_scopes(raw_scopes) || Array(@app.allowed_scopes)
       unless @app.scopes_allowed?(requested_scopes)
         return render_result(:error, status: :unprocessable_entity, message: "One or more requested scopes are not allowed for this integration.")
       end
@@ -48,9 +73,10 @@ module Oauth
       nonce = SecureRandom.urlsafe_base64(32)
       code_verifier = SecureRandom.urlsafe_base64(64)
 
+      flow_state = { "app" => @app.oid, "scopes" => consent_scopes, "nonce" => nonce }
+      flow_state["principal"] = principal.oid if principal
       state = Rails.application.message_verifier(STATE_PURPOSE).generate(
-        { "app" => @app.oid, "scopes" => consent_scopes, "nonce" => nonce },
-        purpose: STATE_PURPOSE, expires_in: FLOW_TTL
+        flow_state, purpose: STATE_PURPOSE, expires_in: FLOW_TTL
       )
 
       # :lax is required -- the callback arrives via a top-level cross-site
@@ -62,11 +88,30 @@ module Oauth
 
       redirect_to authorization_url(consent_scopes, state, code_verifier), allow_other_host: true
     end
+    private :begin_flow
 
     # GET /oauth/:slug/callback?code=&state=  (or ?error=)
     def callback
       state = Rails.application.message_verifier(STATE_PURPOSE).verified(params[:state], purpose: STATE_PURPOSE)
-      return render_result(:error, status: :bad_request, message: "This consent link is invalid or has expired. Start again.") if state.nil?
+      if state.nil?
+        require_login
+        return if performed?
+
+        return render_result(:error, status: :bad_request, message: "This consent link is invalid or has expired. Start again.")
+      end
+
+      @chat_principal = Principal.find_by_oid(state["principal"]) if state["principal"].present?
+      @chat_flow = state["principal"].present?
+      if @chat_flow
+        unless Oauth::ConnectToken.connectable?(@chat_principal)
+          return render_result(:error, status: :bad_request, message: "This connect link is no longer valid. Ask again for a new one.")
+        end
+      else
+        require_login
+        return if performed?
+        require_active_account
+        return if performed?
+      end
 
       # The signed state must belong to this slug's app and the app must still be
       # active.
@@ -93,10 +138,18 @@ module Oauth
       )
       @credential = upsert_credential(state, result, identity)
       enqueue_post_connect_enrichment(@credential)
+      connected_as = " as #{identity[:email]}" if identity[:email].present?
+
+      if @chat_flow
+        grant_to_chat_principal(@credential)
+        return render_result(
+          :connected, status: :ok,
+          message: "#{@provider.display_name} is connected#{connected_as}. Go back to your conversation and ask again."
+        )
+      end
 
       # Back to the Integrations page the user started from; failures below
       # still render the standalone result page, which offers a retry link.
-      connected_as = " as #{identity[:email]}" if identity[:email].present?
       redirect_to console_integrations_path, notice: "#{@app.slug} connected#{connected_as}."
     rescue Broker::ExchangeError => e
       render_result(:error, message: "Connecting the integration failed (#{e.reason}).")
@@ -183,7 +236,9 @@ module Oauth
         # matches on it, so the card flips to "Connected" even when the provider
         # account's email differs from the console login email. Never
         # overwritten: the first linked user keeps the credential.
-        credential.created_by ||= current_user
+        # A chat principal's person has no console user; the app's owner stands
+        # in as the record's creator, as for any operator-made grant.
+        credential.created_by ||= current_user || @app.created_by
         if credential.new_record?
           credential.foreign_id = "#{@app.provider}-#{@app.slug}-#{foreign_id_subject(identity[:subject])}"
           credential.name = "#{@provider.display_name} – #{identity_display_name(identity)}"
@@ -295,6 +350,23 @@ module Oauth
       secret.rules = secret.apply_kind_defaults(rules: rules)
       secret.save!
       secret
+    end
+
+    # Grants the credential's wrapper secret to the chat principal that started
+    # the flow, and withdraws that principal's grants of any OTHER credential of
+    # this app: two credentials for one app would both inject an Authorization
+    # header for the same host, and the person just chose this account.
+    def grant_to_chat_principal(credential)
+      secret = StaticSecret.find_by!(broker_credential: credential)
+      Grant.transaction do
+        @chat_principal.grants.joins(static_secret: :broker_credential)
+          .where(broker_credentials: { oauth_app_id: @app.id })
+          .where.not(static_secret_id: secret.id)
+          .destroy_all
+        @chat_principal.grants.find_or_create_by!(static_secret: secret) do |grant|
+          grant.created_by = @app.created_by
+        end
+      end
     end
 
     def wrapping_secret_kind

@@ -58,6 +58,23 @@ def oauth_apps(
     console.print_json(json.dumps({"data": result}, default=str))
 
 
+@app.command("connect-link")
+def connect_link(
+    slug: str = typer.Argument(..., help="OAuth app slug, for example merchmaker"),
+    url: str | None = typer.Option(None, "--url", help="centaur-console base URL"),
+    bearer_token: str | None = typer.Option(
+        None,
+        "--bearer-token",
+        help="Local/debug bearer token override",
+        envvar="CENTAUR_CONSOLE_BEARER_TOKEN",
+    ),
+):
+    """Print a ten-minute link that connects the person in this conversation to an app."""
+    with get_client(url=url, bearer_token=bearer_token) as client:
+        result = client.oauth_connect_link(slug)
+    console.print_json(json.dumps({"data": result}, default=str))
+
+
 @app.command("tasks")
 def scheduled_tasks(
     url: str | None = typer.Option(None, "--url", help="centaur-console base URL"),

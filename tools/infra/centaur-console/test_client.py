@@ -96,6 +96,37 @@ def test_sandbox_oauth_apps_wraps_http_errors():
         make_client(handler).sandbox_oauth_apps()
 
 
+def test_oauth_connect_link_posts_for_the_app_and_returns_the_url():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == f"{SANDBOX_OAUTH_APPS_PATH}/merchmaker/connect_link"
+        return json_response(
+            {
+                "data": {
+                    "url": "https://console.example/oauth/merchmaker/connect?t=signed",
+                    "expires_at": "2026-10-06T12:10:00Z",
+                    "connected": False,
+                }
+            }
+        )
+
+    result = make_client(handler).oauth_connect_link("merchmaker")
+
+    assert result["url"] == "https://console.example/oauth/merchmaker/connect?t=signed"
+    assert result["connected"] is False
+
+
+def test_oauth_connect_link_reports_a_refusal():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return json_response(
+            {"error": {"message": "connect links are only issued in a person's own direct conversation"}},
+            status_code=403,
+        )
+
+    with pytest.raises(RuntimeError, match="HTTP 403"):
+        make_client(handler).oauth_connect_link("merchmaker")
+
+
 def test_scheduled_tasks_list_and_read_owned_tasks():
     requests = []
 
