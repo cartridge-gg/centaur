@@ -10,11 +10,16 @@
 //! per turn with events pumped into the shared `CodexTurnNormalizer`:
 //!
 //! - `message.delta`                       → AgentTextDelta
+//! - `message.interim`                     → AssistantMessage(commentary)
 //! - `reasoning.delta` / `thinking.delta`  → ReasoningTextDelta
 //! - `tool.start`                          → AssistantMessage(ToolUse)
 //! - `tool.complete`                       → ToolResults
 //! - `turn.usage`                          → TokenUsage
 //! - `message.complete`                    → AssistantMessage(final) + Result
+//!
+//! A `message.delta` can be the reply or a note that the model writes next to
+//! a tool call. [`ReplyText`] holds the deltas until a later frame shows which
+//! one they are, so that notes become commentary and not part of the reply.
 //!
 //! Tools that wait for a person (`clarify`, `sudo`, `secret` and the desktop
 //! read tools) get an answer at once: nobody can answer them in a Centaur
@@ -541,6 +546,19 @@ fn normalize_hermes_frame(turn: &str, frame: &Value) -> Vec<NormalizedEvent> {
             item_id: format!("hermes-msg-{turn}"),
             delta: text_of("text").to_string(),
         }],
+        // Text that is not the reply: a note next to a tool call, or a reply
+        // that Hermes sent back to the model for a check. `tool_use` makes it
+        // commentary.
+        "message.interim" if !text_of("text").trim().is_empty() => {
+            vec![NormalizedEvent::AssistantMessage {
+                partial: false,
+                stop_reason: Some("tool_use".to_string()),
+                content: vec![NormalizedContent::AgentText {
+                    item_id: format!("hermes-msg-{turn}"),
+                    text: text_of("text").to_string(),
+                }],
+            }]
+        }
         "reasoning.delta" | "thinking.delta" if !text_of("text").is_empty() => {
             vec![NormalizedEvent::ReasoningTextDelta {
                 item_id: format!("hermes-reasoning-{turn}"),
@@ -604,8 +622,8 @@ fn normalize_hermes_frame(turn: &str, frame: &Value) -> Vec<NormalizedEvent> {
             }
             let mut events = Vec::new();
             if !text.is_empty() {
-                // The final text repeats the streamed deltas; the normalizer's
-                // suffix-delta reconciliation prevents double emission.
+                // The final text repeats the streamed deltas. ReplyText
+                // drops the held deltas and sends this text once.
                 events.push(NormalizedEvent::AssistantMessage {
                     partial: false,
                     stop_reason: Some("end_turn".to_string()),
@@ -619,6 +637,118 @@ fn normalize_hermes_frame(turn: &str, frame: &Value) -> Vec<NormalizedEvent> {
             events
         }
         _ => Vec::new(),
+    }
+}
+
+/// Holds the model text of a Hermes turn until a later frame shows what the
+/// text is.
+///
+/// Hermes streams all model text as `message.delta`: the reply, and also the
+/// short notes that the model writes next to a tool call ("Checking the config
+/// now."). A delta does not show which one it is. A later frame does:
+/// `message.interim` or `tool.start` means that the held text was a note, and
+/// `message.complete` gives the reply. A chat cannot take back text that it
+/// already shows, so the deltas are held. Each note becomes its own
+/// `commentary` item, which chat renderers do not show. The reply becomes one
+/// `final_answer` item at the end of the turn.
+struct ReplyText {
+    turn: String,
+    /// Each note and the reply get their own item.
+    item: u32,
+    held: String,
+}
+
+impl ReplyText {
+    fn new(turn: &str) -> Self {
+        Self {
+            turn: turn.to_string(),
+            item: 0,
+            held: String::new(),
+        }
+    }
+
+    fn route(&mut self, event: NormalizedEvent) -> Vec<NormalizedEvent> {
+        match event {
+            NormalizedEvent::AgentTextDelta { delta, .. } => {
+                self.held.push_str(&delta);
+                Vec::new()
+            }
+            NormalizedEvent::AssistantMessage {
+                partial,
+                stop_reason,
+                content,
+            } => {
+                if let [NormalizedContent::AgentText { text, .. }] = content.as_slice() {
+                    if stop_reason.as_deref() == Some("tool_use") {
+                        // `message.interim` gives the note without the
+                        // streamed whitespace, so the held deltas are dropped.
+                        self.held.clear();
+                        return self.commentary(text);
+                    }
+                    return self.reply(text);
+                }
+                // A tool call. Hermes sends no `message.interim` for a note
+                // that repeats an earlier one, so the held text is a note.
+                let held = std::mem::take(&mut self.held);
+                let mut events = self.commentary(&held);
+                events.push(NormalizedEvent::AssistantMessage {
+                    partial,
+                    stop_reason,
+                    content,
+                });
+                events
+            }
+            NormalizedEvent::Result { error } => {
+                // `message.complete` had no text: the held text is the reply.
+                // A failed turn keeps it out of the reply.
+                let held = std::mem::take(&mut self.held);
+                let mut events = if error.is_none() && !held.trim().is_empty() {
+                    vec![self.text_event(held.trim(), "end_turn")]
+                } else {
+                    self.commentary(&held)
+                };
+                events.push(NormalizedEvent::Result { error });
+                events
+            }
+            event => vec![event],
+        }
+    }
+
+    /// An interrupted turn has no reply, so the held text is a note.
+    fn interrupted(&mut self) -> Vec<NormalizedEvent> {
+        let held = std::mem::take(&mut self.held);
+        self.commentary(&held)
+    }
+
+    /// The reply ends the turn. Held text that the reply does not repeat (an
+    /// earlier response with no tool call) becomes a note first.
+    fn reply(&mut self, text: &str) -> Vec<NormalizedEvent> {
+        let held = std::mem::take(&mut self.held);
+        let held = held.trim();
+        let mut events = self.commentary(held.strip_suffix(text.trim()).unwrap_or(held));
+        events.push(self.text_event(text, "end_turn"));
+        events
+    }
+
+    fn commentary(&mut self, text: &str) -> Vec<NormalizedEvent> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let event = self.text_event(text, "tool_use");
+        self.item += 1;
+        vec![event]
+    }
+
+    fn text_event(&self, text: &str, stop_reason: &str) -> NormalizedEvent {
+        NormalizedEvent::AssistantMessage {
+            partial: false,
+            stop_reason: Some(stop_reason.to_string()),
+            content: vec![NormalizedContent::AgentText {
+                item_id: format!("hermes-msg-{}-{}", self.turn, self.item),
+                text: text.to_string(),
+            }],
+        }
     }
 }
 
@@ -684,6 +814,7 @@ fn run_hermes_turn<W: Write>(
     config.cli_version = "hermes".to_string();
     config.model_provider = "hermes".to_string();
     let mut normalizer = CodexTurnNormalizer::new(config);
+    let mut reply = ReplyText::new(&turn_id);
 
     for notification in normalizer.start_notifications(turn == 1)? {
         write_value(stdout, &notification_to_wire_value(&notification)?)?;
@@ -739,6 +870,11 @@ fn run_hermes_turn<W: Write>(
                 let _ = child.child.kill();
                 let _ = child.child.wait();
             }
+            for event in reply.interrupted() {
+                for notification in normalizer.process_event(&event)? {
+                    write_value(stdout, &notification_to_wire_value(&notification)?)?;
+                }
+            }
             if let Some(notification) = normalizer.finish_turn_interrupted()? {
                 write_value(stdout, &notification_to_wire_value(&notification)?)?;
             }
@@ -786,8 +922,10 @@ fn run_hermes_turn<W: Write>(
                 let mut terminal = false;
                 for event in normalize_hermes_frame(&turn_id, &frame) {
                     terminal |= event.is_terminal();
-                    for notification in normalizer.process_event(&event)? {
-                        write_value(stdout, &notification_to_wire_value(&notification)?)?;
+                    for event in reply.route(event) {
+                        for notification in normalizer.process_event(&event)? {
+                            write_value(stdout, &notification_to_wire_value(&notification)?)?;
+                        }
                     }
                 }
                 if terminal {
@@ -1043,6 +1181,13 @@ for line in sys.stdin:
             continue
         send({'id':req['id'],'result':{'accepted':True}})
         if text=='wait': continue
+        if text=='notes':
+            event('message.delta', {'text':'Checking now.'})
+            event('tool.start', {'tool_id':'t1','name':'terminal','args':{'command':'ls'}})
+            event('tool.complete', {'tool_id':'t1','result':{'output':'ok','exit_code':0}})
+            event('message.delta', {'text':'\n\nDone.'})
+            event('message.complete', {'text':'Done.'})
+            continue
         event('message.complete', {'text':'WRONG CHILD'}, 'subagent')
         event('message.complete', {'text':'PARENT DONE'})
     elif method=='session.interrupt':
@@ -1095,39 +1240,216 @@ for line in sys.stdin:
             .unwrap_or_default()
     }
 
+    /// One agent message as the turn path sends it: its phase, its completed
+    /// text, and its deltas joined.
+    #[derive(Debug, PartialEq)]
+    struct AgentMessage {
+        phase: String,
+        text: String,
+        deltas: String,
+    }
+
+    fn message(phase: &str, text: &str) -> AgentMessage {
+        AgentMessage {
+            phase: phase.into(),
+            text: text.into(),
+            deltas: text.into(),
+        }
+    }
+
+    /// Sends Hermes frames through the turn path of [`super::run_hermes_turn`]
+    /// and returns the agent messages in the order they complete.
+    fn agent_messages(frames: &[serde_json::Value]) -> Vec<AgentMessage> {
+        let mut normalizer = crate::turn::CodexTurnNormalizer::new(crate::turn::BridgeConfig::new(
+            "T-local", "turn-1",
+        ));
+        let mut reply = super::ReplyText::new("turn-1");
+        let mut deltas = std::collections::HashMap::<String, String>::new();
+        let mut messages = Vec::new();
+        for frame in frames {
+            for event in normalize_hermes_frame("turn-1", frame) {
+                for event in reply.route(event) {
+                    for notification in normalizer.process_event(&event).unwrap() {
+                        let rpc = crate::wire::notification_to_jsonrpc(&notification).unwrap();
+                        let params = rpc.params.unwrap_or_default();
+                        match rpc.method.as_str() {
+                            "item/agentMessage/delta" => deltas
+                                .entry(params["itemId"].as_str().unwrap().to_owned())
+                                .or_default()
+                                .push_str(params["delta"].as_str().unwrap()),
+                            "item/completed" if params["item"]["type"] == "agentMessage" => {
+                                let item = &params["item"];
+                                messages.push(AgentMessage {
+                                    phase: item["phase"].as_str().unwrap_or_default().into(),
+                                    text: item["text"].as_str().unwrap().into(),
+                                    deltas: deltas
+                                        .remove(item["id"].as_str().unwrap())
+                                        .unwrap_or_default(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            deltas.is_empty(),
+            "deltas of items that never completed: {deltas:?}"
+        );
+        messages
+    }
+
+    fn tool_frames(id: &str) -> [serde_json::Value; 2] {
+        [
+            frame(
+                "tool.start",
+                json!({"tool_id": id, "name": "terminal", "args": {"command": "ls"}}),
+            ),
+            frame(
+                "tool.complete",
+                json!({"tool_id": id, "result": {"output": "ok", "exit_code": 0}}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn message_interim_becomes_commentary() {
+        let events = normalize_hermes_frame(
+            "1",
+            &frame(
+                "message.interim",
+                json!({"text": "Checking now.", "already_streamed": true}),
+            ),
+        );
+        assert!(!is_terminal(&events));
+        assert!(matches!(
+            &events[..],
+            [NormalizedEvent::AssistantMessage { partial: false, stop_reason: Some(reason), content }]
+                if reason == "tool_use"
+                    && matches!(&content[..], [NormalizedContent::AgentText { text, .. }] if text == "Checking now.")
+        ));
+        assert!(
+            normalize_hermes_frame("1", &frame("message.interim", json!({"text": " "}))).is_empty()
+        );
+    }
+
     #[test]
     fn a_trimmed_final_text_is_not_sent_again() {
         // Hermes streams the reply with leading newlines and completes it
         // with the trimmed text.
-        let mut normalizer = crate::turn::CodexTurnNormalizer::new(crate::turn::BridgeConfig::new(
-            "T-local", "turn-1",
-        ));
-        let mut deltas = Vec::new();
-        let mut completed = Vec::new();
-        for frame in [
+        let messages = agent_messages(&[
             frame("message.delta", json!({"text": "\n\nwhich pr"})),
             frame("message.delta", json!({"text": " did you mean?"})),
             frame(
                 "message.complete",
                 json!({"text": "which pr did you mean?"}),
             ),
-        ] {
-            for event in normalize_hermes_frame("1", &frame) {
-                for notification in normalizer.process_event(&event).unwrap() {
-                    let rpc = crate::wire::notification_to_jsonrpc(&notification).unwrap();
-                    let params = rpc.params.unwrap_or_default();
-                    match rpc.method.as_str() {
-                        "item/agentMessage/delta" => deltas.push(params["delta"].clone()),
-                        "item/completed" if params["item"]["type"] == "agentMessage" => {
-                            completed.push(params["item"]["text"].clone())
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        assert_eq!(deltas, [json!("\n\nwhich pr"), json!(" did you mean?")]);
-        assert_eq!(completed, [json!("which pr did you mean?")]);
+        ]);
+        assert_eq!(
+            messages,
+            [message("final_answer", "which pr did you mean?")]
+        );
+    }
+
+    #[test]
+    fn notes_next_to_tool_calls_are_commentary_and_not_the_reply() {
+        let [start_1, complete_1] = tool_frames("t1");
+        let [start_2, complete_2] = tool_frames("t2");
+        let [start_3, complete_3] = tool_frames("t3");
+        let messages = agent_messages(&[
+            // A note with a `message.interim`.
+            frame("message.delta", json!({"text": "Checking the"})),
+            frame("message.delta", json!({"text": " config now."})),
+            frame(
+                "message.interim",
+                json!({"text": "Checking the config now.", "already_streamed": true}),
+            ),
+            start_1,
+            complete_1,
+            // A note that Hermes does not send again as `message.interim`
+            // because it repeats an earlier note.
+            frame("message.delta", json!({"text": "\n\nOn it."})),
+            frame(
+                "message.interim",
+                json!({"text": "On it.", "already_streamed": true}),
+            ),
+            start_2,
+            complete_2,
+            frame("message.delta", json!({"text": "\n\nOn it."})),
+            start_3,
+            complete_3,
+            frame("message.delta", json!({"text": "\n\nDone: PR #5 is open."})),
+            frame("message.complete", json!({"text": "Done: PR #5 is open."})),
+        ]);
+        assert_eq!(
+            messages,
+            [
+                message("commentary", "Checking the config now."),
+                message("commentary", "On it."),
+                message("commentary", "On it."),
+                message("final_answer", "Done: PR #5 is open."),
+            ]
+        );
+    }
+
+    #[test]
+    fn held_text_that_the_reply_does_not_repeat_is_commentary() {
+        // A response with no tool call that Hermes did not send as
+        // `message.interim`, then the reply.
+        let messages = agent_messages(&[
+            frame("message.delta", json!({"text": "Let me check."})),
+            frame("message.delta", json!({"text": "\n\nAll good."})),
+            frame("message.complete", json!({"text": "All good."})),
+        ]);
+        assert_eq!(
+            messages,
+            [
+                message("commentary", "Let me check."),
+                message("final_answer", "All good."),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reply_without_final_text_is_the_held_text() {
+        let messages = agent_messages(&[
+            frame("message.delta", json!({"text": "\n\nhello"})),
+            frame("message.complete", json!({"text": ""})),
+        ]);
+        assert_eq!(messages, [message("final_answer", "hello")]);
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_held_text_out_of_the_reply() {
+        let messages = agent_messages(&[
+            frame("message.delta", json!({"text": "Checking."})),
+            frame(
+                "message.complete",
+                json!({"text": "", "status": "error", "error": "provider 500"}),
+            ),
+        ]);
+        assert_eq!(messages, [message("commentary", "Checking.")]);
+    }
+
+    #[test]
+    fn an_interrupted_turn_makes_held_text_a_note() {
+        let mut reply = super::ReplyText::new("turn-1");
+        assert!(
+            reply
+                .route(NormalizedEvent::AgentTextDelta {
+                    item_id: "x".into(),
+                    delta: "Checking.".into(),
+                })
+                .is_empty()
+        );
+        assert!(matches!(
+            &reply.interrupted()[..],
+            [NormalizedEvent::AssistantMessage { stop_reason: Some(reason), content, .. }]
+                if reason == "tool_use"
+                    && matches!(&content[..], [NormalizedContent::AgentText { text, .. }] if text == "Checking.")
+        ));
+        assert!(reply.interrupted().is_empty());
     }
 
     #[test]
@@ -1300,6 +1622,55 @@ for line in sys.stdin:
         .unwrap_err();
         assert!(error.to_string().contains("prompt rejected"));
         assert!(!child.is_alive());
+    }
+
+    #[test]
+    fn a_turn_sends_notes_as_commentary_and_the_reply_once() {
+        let mut child = fake_gateway(GATEWAY);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        super::run_hermes_turn(
+            &mut child,
+            &mut output,
+            text_input("notes"),
+            None,
+            None,
+            1,
+            &rx,
+        )
+        .unwrap();
+        let lines: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let completed: Vec<(String, String)> = lines
+            .iter()
+            .filter(|value| {
+                value["method"] == "item/completed"
+                    && value["params"]["item"]["type"] == "agentMessage"
+            })
+            .map(|value| {
+                let item = &value["params"]["item"];
+                (
+                    item["phase"].as_str().unwrap().to_owned(),
+                    item["text"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            [
+                ("commentary".to_owned(), "Checking now.".to_owned()),
+                ("final_answer".to_owned(), "Done.".to_owned()),
+            ]
+        );
+        let deltas: Vec<&str> = lines
+            .iter()
+            .filter(|value| value["method"] == "item/agentMessage/delta")
+            .map(|value| value["params"]["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(deltas, ["Checking now.", "Done."]);
     }
 
     #[test]
