@@ -8,6 +8,9 @@ from pathlib import Path
 
 SEPARATOR = "\n\n---\n\n"
 OVERLAY_PROMPT = Path("services/sandbox/SYSTEM_PROMPT.md")
+# A mounted repo with this file is a Centaur checkout, not an overlay. Its
+# SYSTEM_PROMPT.md is the root prompt that the image already bakes in.
+CENTAUR_CHECKOUT_MARKER = Path("services/api-rs/Cargo.toml")
 PERSONA_PROMPT = Path("AGENTS_PERSONA.md")
 OBSERVABILITY_DISABLED_PROMPT = """[Observability access]
 This sandbox does not have Centaur observability access. Do not use vlogs, vmetrics, Grafana, or related internal logs/metrics tools.
@@ -21,10 +24,22 @@ def _append_file_fragment(fragments: list[str], source: Path) -> bool:
     return True
 
 
+def _is_centaur_checkout(prompt: Path) -> bool:
+    repo = prompt.parents[len(OVERLAY_PROMPT.parts) - 1]
+    return (repo / CENTAUR_CHECKOUT_MARKER).is_file()
+
+
 def _mounted_overlay_prompts(repo_mount: Path, baked_prompt: Path) -> list[Path]:
     if not repo_mount.is_dir():
         return []
-    prompts = sorted(repo_mount.glob(f"*/*/{OVERLAY_PROMPT}"))
+    # A Centaur checkout at another ref than the image has a different root
+    # prompt, so the text check below does not catch it. Appending it would
+    # give the agent two versions of the root prompt.
+    prompts = sorted(
+        prompt
+        for prompt in repo_mount.glob(f"*/*/{OVERLAY_PROMPT}")
+        if not _is_centaur_checkout(prompt)
+    )
     if not baked_prompt.is_file():
         return prompts
 
