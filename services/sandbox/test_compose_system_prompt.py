@@ -147,6 +147,59 @@ class ComposeSystemPromptTest(unittest.TestCase):
                 "base\n\n\n---\n\noverlay\n",
             )
 
+    def test_skips_mounted_centaur_checkout_at_another_ref(self) -> None:
+        for marker_path in compose_system_prompt.CENTAUR_CHECKOUT_MARKERS:
+            with self.subTest(marker=str(marker_path)):
+                self._assert_skips_mounted_centaur_checkout(marker_path)
+
+    def _assert_skips_mounted_centaur_checkout(self, marker_path: Path) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            (home / "AGENTS.md").write_text("base from the image\n")
+
+            repo_mount = home / "github"
+            centaur = repo_mount / "acme" / "centaur"
+            root_prompt = centaur / "services" / "sandbox" / "SYSTEM_PROMPT.md"
+            root_prompt.parent.mkdir(parents=True)
+            root_prompt.write_text("base from an older checkout\n")
+            marker = centaur / marker_path
+            marker.parent.mkdir(parents=True)
+            marker.write_text("")
+            overlay_prompt = (
+                repo_mount
+                / "acme"
+                / "overlay"
+                / "services"
+                / "sandbox"
+                / "SYSTEM_PROMPT.md"
+            )
+            overlay_prompt.parent.mkdir(parents=True)
+            overlay_prompt.write_text("overlay\n")
+
+            target = workspace / "AGENTS.md"
+            compose_system_prompt.compose_system_prompt(
+                home_dir=home,
+                target_prompt=target,
+                repo_mount=repo_mount,
+            )
+
+            self.assertEqual(
+                target.read_text(),
+                "base from the image\n\n\n---\n\noverlay\n",
+            )
+
+    def test_this_repository_has_the_centaur_checkout_marker(self) -> None:
+        # A mounted checkout of this repository is found by the first marker. If
+        # it moves, the root prompt of every such checkout is appended again.
+        repository = Path(__file__).resolve().parents[2]
+        self.assertTrue(
+            (repository / compose_system_prompt.CENTAUR_CHECKOUT_MARKERS[0]).is_file()
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
