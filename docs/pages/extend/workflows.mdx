@@ -215,6 +215,9 @@ SANDBOX_STARTABLE = True
 Then a principal token without `workflows_write` can create a run of this
 workflow with `POST /api/workflows/runs`, and of no other workflow. Only a
 literal `True` opts in, and `WORKFLOW_ENABLE_MODE=allowlist` still applies.
+The same token can read the runs it started with
+`GET /api/workflows/runs/{run_id}`, so a tool can wait for the result. It
+cannot read other runs, or list runs, without `workflows_read`.
 
 The run sees who started it in `ctx.caller`. The API sets it from the
 authenticated token, never from the request body:
