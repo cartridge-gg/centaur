@@ -428,6 +428,10 @@ pub struct WorkflowRun {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// Who started the run, when api-rs authenticated the request
+    /// (`create_run_as`). A principal may read the runs it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<WorkflowCaller>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4872,7 +4876,17 @@ fn workflow_run_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRun, Work
         attempts: row.try_get("attempts")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        caller: caller_from_task_params(&params),
     })
+}
+
+/// The `caller` a run's stored task params carry (`WorkflowTaskInput`), or
+/// None for runs without one (schedules, child runs, runs queued before it).
+fn caller_from_task_params(params: &Value) -> Option<WorkflowCaller> {
+    params
+        .get("caller")
+        .cloned()
+        .and_then(|caller| serde_json::from_value(caller).ok())
 }
 
 fn absurd_error(error: WorkflowRuntimeError) -> absurd::Error {
@@ -5661,6 +5675,29 @@ mod tests {
     }
 
     #[test]
+    fn a_run_reports_the_caller_its_task_params_carry() {
+        let params = json!({
+            "workflow_name": "follow_up_record",
+            "input": {},
+            "harness_type": "codex",
+            "caller": {"class": "principal", "identity": "prn_sandbox", "principal": "prn_sandbox"},
+        });
+        assert_eq!(
+            caller_from_task_params(&params),
+            Some(WorkflowCaller {
+                class: "principal".to_owned(),
+                identity: "prn_sandbox".to_owned(),
+                principal: Some("prn_sandbox".to_owned()),
+            })
+        );
+        assert_eq!(caller_from_task_params(&json!({"input": {}})), None);
+        assert_eq!(
+            caller_from_task_params(&json!({"caller": "not an object"})),
+            None
+        );
+    }
+
+    #[test]
     fn workflow_run_timestamps_serialize_as_rfc3339() {
         let at = OffsetDateTime::from_unix_timestamp(1_781_012_105).unwrap()
             + time::Duration::nanoseconds(44_019_000);
@@ -5676,6 +5713,7 @@ mod tests {
             attempts: 1,
             created_at: at,
             updated_at: at,
+            caller: None,
         };
         let value = serde_json::to_value(run).unwrap();
         assert_eq!(value["initial_run_id"], json!("initial-run"));

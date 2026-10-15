@@ -403,6 +403,11 @@ enum RouteAccess {
     /// `workflows_write` only for a workflow that declares
     /// `SANDBOX_STARTABLE = True` (`authorize_workflow_run`).
     WorkflowRunCreate,
+    /// `GET /api/workflows/runs/{run_id}`: a caller with `workflows_read`, or
+    /// a principal token. The handler admits a principal without
+    /// `workflows_read` only for a run that it started
+    /// (`authorize_workflow_run_read`).
+    WorkflowRunRead,
 }
 
 async fn authorize_api_request(
@@ -442,6 +447,10 @@ async fn authorize_api_request(
         RouteAccess::AnyCaller => true,
         RouteAccess::WorkflowRunCreate => {
             caller.has_capability(Capability::WorkflowsWrite)
+                || caller.class() == CallerClass::Principal
+        }
+        RouteAccess::WorkflowRunRead => {
+            caller.has_capability(Capability::WorkflowsRead)
                 || caller.class() == CallerClass::Principal
         }
     };
@@ -507,9 +516,10 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         // Harness names and reset times only. Sandboxes read it to avoid an
         // exhausted provider before they start a request.
         (&Method::GET, "/api/provider-health") => Some(RouteAccess::AnyCaller),
-        (&Method::GET, "/api/workflows/schedules")
-        | (&Method::GET, "/api/workflows/runs")
-        | (&Method::GET, "/api/workflows/runs/{run_id}") => capability(Capability::WorkflowsRead),
+        (&Method::GET, "/api/workflows/schedules") | (&Method::GET, "/api/workflows/runs") => {
+            capability(Capability::WorkflowsRead)
+        }
+        (&Method::GET, "/api/workflows/runs/{run_id}") => Some(RouteAccess::WorkflowRunRead),
         (&Method::POST, "/api/workflows/runs") => Some(RouteAccess::WorkflowRunCreate),
         (&Method::POST, "/api/workflows/runs/{run_id}/cancel") => {
             capability(Capability::WorkflowsWrite)
@@ -2544,11 +2554,45 @@ async fn list_workflow_schedules(
 
 async fn get_workflow_run(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(run_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
     let run = workflows.get_run(&run_id).await?;
+    authorize_workflow_run_read(&caller, &run)?;
     Ok(Json(json!({ "ok": true, "run": run })))
+}
+
+/// A caller with `workflows_read` may read any run. A principal token without
+/// it may read only a run that it started (`WorkflowRun::caller`), so a
+/// sandbox can wait for the result of a sandbox-startable workflow it ran
+/// without seeing any other run's input or result.
+fn authorize_workflow_run_read(
+    caller: &AuthenticatedCaller,
+    run: &centaur_workflows::WorkflowRun,
+) -> Result<(), ApiError> {
+    if caller.has_capability(Capability::WorkflowsRead) {
+        return Ok(());
+    }
+    let started_it = caller.class() == CallerClass::Principal
+        && caller.principal_subject().is_some()
+        && run
+            .caller
+            .as_ref()
+            .and_then(|run_caller| run_caller.principal.as_deref())
+            == caller.principal_subject();
+    if started_it {
+        return Ok(());
+    }
+    record_api_authentication(caller.class().as_str(), "forbidden");
+    tracing::warn!(
+        caller_class = caller.class().as_str(),
+        workflow_name = run.workflow_name,
+        "caller may not read this workflow run: it lacks workflows_read and did not start the run"
+    );
+    Err(ApiError::Forbidden(
+        "caller is not authorized for this route".to_owned(),
+    ))
 }
 
 async fn cancel_workflow_run(
@@ -4030,6 +4074,57 @@ mod workflow_run_access_tests {
         assert!(authorize_workflow_run(&principal_caller(true), "ad_launch", startable).is_ok());
     }
 
+    fn run_started_by(principal: Option<&str>) -> centaur_workflows::WorkflowRun {
+        centaur_workflows::WorkflowRun {
+            run_id: "run".to_owned(),
+            initial_run_id: "run".to_owned(),
+            task_id: "task".to_owned(),
+            workflow_name: "follow_up_record".to_owned(),
+            status: "completed".to_owned(),
+            input: json!({}),
+            result: Some(json!({"recorded": true})),
+            failure: None,
+            attempts: 1,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            caller: principal.map(|principal| WorkflowCaller {
+                class: "principal".to_owned(),
+                identity: principal.to_owned(),
+                principal: Some(principal.to_owned()),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_principal_without_workflows_read_reads_only_runs_it_started() {
+        let caller = principal_caller(false);
+        assert!(authorize_workflow_run_read(&caller, &run_started_by(Some("prn_sandbox"))).is_ok());
+        for run in [run_started_by(Some("prn_other")), run_started_by(None)] {
+            assert!(matches!(
+                authorize_workflow_run_read(&caller, &run),
+                Err(ApiError::Forbidden(_))
+            ));
+        }
+        // workflows_read still reads every run.
+        let auth = ApiAuthConfig::testing_with_slack_ingress("slack-key", JWT_SECRET);
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "iss": "centaur-console",
+                "sub": "prn_reader",
+                "aud": "centaur-api",
+                "iat": 1_700_000_000i64,
+                "exp": 4_102_444_800i64,
+                "capabilities": {"sessions_read": false, "workflows_read": true, "workflows_write": false},
+            }),
+            &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        )
+        .unwrap();
+        let reader = authenticate(&auth, &token);
+        assert!(authorize_workflow_run_read(&reader, &run_started_by(Some("prn_other"))).is_ok());
+        assert!(authorize_workflow_run_read(&reader, &run_started_by(None)).is_ok());
+    }
+
     #[test]
     fn the_run_route_admits_principals_and_cancel_still_needs_workflows_write() {
         assert!(matches!(
@@ -4040,5 +4135,16 @@ mod workflow_run_access_tests {
             route_access(&Method::POST, "/api/workflows/runs/{run_id}/cancel"),
             Some(RouteAccess::Capability(Capability::WorkflowsWrite))
         ));
+        assert!(matches!(
+            route_access(&Method::GET, "/api/workflows/runs/{run_id}"),
+            Some(RouteAccess::WorkflowRunRead)
+        ));
+        // Listing runs and schedules still needs workflows_read.
+        for route in ["/api/workflows/runs", "/api/workflows/schedules"] {
+            assert!(matches!(
+                route_access(&Method::GET, route),
+                Some(RouteAccess::Capability(Capability::WorkflowsRead))
+            ));
+        }
     }
 }
