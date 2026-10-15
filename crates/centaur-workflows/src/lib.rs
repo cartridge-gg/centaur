@@ -123,6 +123,7 @@ struct WorkflowRuntimeInner {
     webhook_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
     schedule_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
     starter_registry: Arc<RwLock<WorkflowStarters>>,
+    sandbox_startable: Arc<RwLock<BTreeSet<String>>>,
 }
 
 /// API caller classes each workflow allows to start it, from
@@ -210,6 +211,9 @@ impl WorkflowEnablement {
         metadata
             .starters
             .retain(|workflow_name, _| self.is_enabled(workflow_name));
+        metadata
+            .sandbox_startable
+            .retain(|workflow_name| self.is_enabled(workflow_name));
     }
 }
 
@@ -372,6 +376,20 @@ fn workflow_principal_labels(workflow_name: &str) -> BTreeMap<String, String> {
     ])
 }
 
+/// Who started a run, as `api-rs` authenticated the request. The Python host
+/// exposes it as `ctx.caller`. It never comes from the request body, so a
+/// workflow can trust it, for example to check that a sandbox acts only on its
+/// own sessions.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkflowCaller {
+    /// The caller class: `admin`, `ingress`, `console`, or `principal`.
+    pub class: String,
+    pub identity: String,
+    /// The principal OID when the caller is a principal token (a sandbox).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CreateWorkflowRunRequest {
     pub workflow_name: String,
@@ -503,6 +521,8 @@ struct WorkflowTaskInput {
     harness_type: HarnessType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slack_button_feedback: Option<slack_button_feedback::ButtonFeedback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caller: Option<WorkflowCaller>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -657,6 +677,10 @@ impl WorkflowRuntime {
             &enablement,
         )?));
         let starter_registry = Arc::new(RwLock::new(discovery.starters.clone()));
+        let sandbox_startable = Arc::new(RwLock::new(build_sandbox_startable(
+            &discovery,
+            &enablement,
+        )));
 
         let task_session_runtime = session_runtime.clone();
         let task_workflow_host_sandbox = workflow_host_sandbox.clone();
@@ -841,9 +865,12 @@ impl WorkflowRuntime {
             spawn_workflow_metadata_reconciler(
                 schedule_client.clone(),
                 workflow_clients,
-                webhook_registry.clone(),
-                schedule_registry.clone(),
-                starter_registry.clone(),
+                WorkflowMetadataRegistries {
+                    webhooks: webhook_registry.clone(),
+                    schedules: schedule_registry.clone(),
+                    starters: starter_registry.clone(),
+                    sandbox_startable: sandbox_startable.clone(),
+                },
                 workflow_host_sandbox.clone(),
                 workflow_principal_registrar,
                 interval,
@@ -864,6 +891,7 @@ impl WorkflowRuntime {
                 webhook_registry,
                 schedule_registry,
                 starter_registry,
+                sandbox_startable,
             }),
         })
     }
@@ -872,13 +900,43 @@ impl WorkflowRuntime {
         &self,
         request: CreateWorkflowRunRequest,
     ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
-        self.create_button_run(request, None).await
+        self.spawn_run(request, None, None).await
+    }
+
+    /// `create_run` for an authenticated API caller: the run's Python context
+    /// gets `caller` as `ctx.caller`.
+    pub async fn create_run_as(
+        &self,
+        request: CreateWorkflowRunRequest,
+        caller: WorkflowCaller,
+    ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
+        self.spawn_run(request, None, Some(caller)).await
     }
 
     pub async fn create_button_run(
         &self,
         request: CreateWorkflowRunRequest,
         feedback: Option<slack_button_feedback::ButtonFeedback>,
+    ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
+        self.spawn_run(request, feedback, None).await
+    }
+
+    /// Whether a workflow declares `SANDBOX_STARTABLE = True`, so a principal
+    /// token without `workflows_write` may start it. Refreshed with the rest
+    /// of the discovery metadata.
+    pub fn is_sandbox_startable(&self, workflow_name: &str) -> bool {
+        self.inner
+            .sandbox_startable
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(workflow_name.trim())
+    }
+
+    async fn spawn_run(
+        &self,
+        request: CreateWorkflowRunRequest,
+        feedback: Option<slack_button_feedback::ButtonFeedback>,
+        caller: Option<WorkflowCaller>,
     ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
         let workflow_name = request.workflow_name.trim();
         if workflow_name.is_empty() {
@@ -896,6 +954,7 @@ impl WorkflowRuntime {
                     input: request.input,
                     harness_type: request.harness_type.unwrap_or(HarnessType::Codex),
                     slack_button_feedback: feedback,
+                    caller,
                 },
                 SpawnOptions {
                     max_attempts: request.max_attempts,
@@ -1213,6 +1272,19 @@ fn absurd_queue_tables(
             "unknown workflow queue {other:?}"
         ))),
     }
+}
+
+/// The enabled workflows that declare `SANDBOX_STARTABLE = True`.
+fn build_sandbox_startable(
+    discovery: &PythonWorkflowMetadata,
+    enablement: &WorkflowEnablement,
+) -> BTreeSet<String> {
+    discovery
+        .sandbox_startable
+        .iter()
+        .filter(|workflow_name| enablement.is_enabled(workflow_name))
+        .cloned()
+        .collect()
 }
 
 fn build_webhook_registry(
@@ -1777,6 +1849,8 @@ struct PythonWorkflowDiscovery {
     principal: Option<PythonWorkflowPrincipal>,
     #[serde(default)]
     starters: Option<BTreeSet<String>>,
+    #[serde(default)]
+    sandbox_startable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1798,6 +1872,7 @@ struct PythonWorkflowMetadata {
     workflow_names: BTreeSet<String>,
     principals: BTreeMap<String, WorkflowPrincipalDeclaration>,
     starters: WorkflowStarters,
+    sandbox_startable: BTreeSet<String>,
 }
 
 fn metadata_from_discovery_payload(
@@ -1808,6 +1883,11 @@ fn metadata_from_discovery_payload(
         metadata
             .workflow_names
             .insert(workflow.workflow_name.clone());
+        if workflow.sandbox_startable {
+            metadata
+                .sandbox_startable
+                .insert(workflow.workflow_name.clone());
+        }
         metadata.webhooks.extend(workflow.webhooks);
         if let Some(starters) = workflow.starters {
             metadata
@@ -2010,13 +2090,20 @@ fn parse_worker_concurrency(raw: Option<&str>, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The discovery-derived registries that the metadata reconciler refreshes
+/// together on every pass.
+#[derive(Clone)]
+struct WorkflowMetadataRegistries {
+    webhooks: Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
+    schedules: Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
+    starters: Arc<RwLock<WorkflowStarters>>,
+    sandbox_startable: Arc<RwLock<BTreeSet<String>>>,
+}
+
 fn spawn_workflow_metadata_reconciler(
     schedule_client: Client,
     workflow_clients: WorkflowQueueClients,
-    webhook_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
-    schedule_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
-    starter_registry: Arc<RwLock<WorkflowStarters>>,
+    registries: WorkflowMetadataRegistries,
     workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
     workflow_principal_registrar: WorkflowPrincipalRegistrar,
     interval: Duration,
@@ -2031,9 +2118,7 @@ fn spawn_workflow_metadata_reconciler(
             ticker.tick().await;
             match reconcile_workflow_metadata_once(
                 &schedule_client,
-                &webhook_registry,
-                &schedule_registry,
-                &starter_registry,
+                &registries,
                 workflow_host_sandbox.as_ref(),
                 &workflow_principal_registrar,
             )
@@ -2069,9 +2154,7 @@ fn spawn_workflow_metadata_reconciler(
 
 async fn reconcile_workflow_metadata_once(
     schedule_client: &Client,
-    webhook_registry: &Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
-    schedule_registry: &Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
-    starter_registry: &Arc<RwLock<WorkflowStarters>>,
+    registries: &WorkflowMetadataRegistries,
     workflow_host_sandbox: Option<&WorkflowHostSandboxRuntime>,
     workflow_principal_registrar: &WorkflowPrincipalRegistrar,
 ) -> Result<
@@ -2095,22 +2178,32 @@ async fn reconcile_workflow_metadata_once(
         .await;
     }
     {
-        let mut webhooks = webhook_registry
+        let mut webhooks = registries
+            .webhooks
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *webhooks = next_webhooks;
     }
     {
-        let mut schedules = schedule_registry
+        let mut schedules = registries
+            .schedules
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *schedules = next_schedules.clone();
     }
     {
-        let mut starters = starter_registry
+        let mut starters = registries
+            .starters
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *starters = discovery.starters.clone();
+    }
+    {
+        let mut startable = registries
+            .sandbox_startable
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *startable = build_sandbox_startable(&discovery, &enablement);
     }
     reconcile_schedules(schedule_client, &next_schedules).await?;
     info!(
@@ -2517,6 +2610,7 @@ async fn run_schedule_tick(
                 input: schedule.input.clone(),
                 harness_type: HarnessType::Codex,
                 slack_button_feedback: None,
+                caller: None,
             },
             SpawnOptions {
                 idempotency_key: Some(fire_key.clone()),
@@ -3106,6 +3200,7 @@ async fn run_python_workflow_host_local(
             "task_id": ctx.task_id(),
             "workflow_name": input.workflow_name,
             "input": input.input,
+            "caller": input.caller,
         }),
     )
     .await?;
@@ -3258,6 +3353,7 @@ where
             "task_id": ctx.task_id(),
             "workflow_name": input.workflow_name,
             "input": input.input,
+            "caller": input.caller,
         }),
     )
     .await?;
@@ -3697,6 +3793,7 @@ async fn start_python_child_workflow(
                 input: child_input,
                 harness_type: parent.harness_type.clone(),
                 slack_button_feedback: None,
+                caller: None,
             },
             SpawnOptions {
                 idempotency_key,
@@ -5584,6 +5681,89 @@ mod tests {
         assert_eq!(value["initial_run_id"], json!("initial-run"));
         assert_eq!(value["created_at"], json!("2026-06-09T13:35:05.044019Z"));
         assert_eq!(value["updated_at"], json!("2026-06-09T13:35:05.044019Z"));
+    }
+
+    #[test]
+    fn discovery_metadata_collects_sandbox_startable_workflows() {
+        let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
+            "workflows": [
+                {
+                    "workflow_name": "follow_up_record",
+                    "source_path": "workflows/follow_up_record.py",
+                    "sandbox_startable": true,
+                },
+                {
+                    "workflow_name": "nightly_report",
+                    "source_path": "workflows/nightly_report.py",
+                },
+            ],
+        }))
+        .unwrap();
+
+        let metadata = metadata_from_discovery_payload(payload);
+
+        assert_eq!(
+            metadata.sandbox_startable,
+            BTreeSet::from(["follow_up_record".to_owned()])
+        );
+        assert!(metadata.workflow_names.contains("nightly_report"));
+    }
+
+    #[test]
+    fn sandbox_startable_workflows_respect_the_enable_allowlist() {
+        let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
+            "workflows": [
+                {"workflow_name": "follow_up_record", "source_path": "a.py", "sandbox_startable": true},
+                {"workflow_name": "memory_note", "source_path": "b.py", "sandbox_startable": true},
+            ],
+        }))
+        .unwrap();
+        let metadata = metadata_from_discovery_payload(payload);
+
+        assert_eq!(
+            build_sandbox_startable(&metadata, &WorkflowEnablement::allowlist("memory_note")),
+            BTreeSet::from(["memory_note".to_owned()])
+        );
+        assert_eq!(
+            build_sandbox_startable(&metadata, &WorkflowEnablement::all()).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn task_input_carries_the_caller_and_reads_rows_queued_without_one() {
+        let caller = WorkflowCaller {
+            class: "principal".to_owned(),
+            identity: "prn_sandbox".to_owned(),
+            principal: Some("prn_sandbox".to_owned()),
+        };
+        let input = WorkflowTaskInput {
+            workflow_name: "follow_up_record".to_owned(),
+            input: json!({"thread_key": "slack:C1:1.1"}),
+            harness_type: HarnessType::Codex,
+            slack_button_feedback: None,
+            caller: Some(caller.clone()),
+        };
+        let mut stored = serde_json::to_value(&input).unwrap();
+        assert_eq!(stored["caller"]["principal"], json!("prn_sandbox"));
+        let round_trip: WorkflowTaskInput = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(round_trip.caller, Some(caller));
+
+        // A run queued before the caller existed still deserializes.
+        stored.as_object_mut().unwrap().remove("caller");
+        let older: WorkflowTaskInput = serde_json::from_value(stored).unwrap();
+        assert_eq!(older.caller, None);
+        // And a run without a caller does not store the key at all.
+        let anonymous = WorkflowTaskInput {
+            caller: None,
+            ..older
+        };
+        assert!(
+            serde_json::to_value(&anonymous)
+                .unwrap()
+                .get("caller")
+                .is_none()
+        );
     }
 
     #[test]
