@@ -69,6 +69,11 @@ pub(crate) enum Capability {
     /// Required by routes every authenticated caller may read (provider
     /// health). Every credential satisfies it; no token grants it.
     AnyCaller,
+    /// Required by `POST /api/workflows/runs`. `workflows_write` and every
+    /// sandbox principal satisfy it; no token grants it. The handler admits a
+    /// principal without `workflows_write` only for a workflow that declares
+    /// `SANDBOX_STARTABLE = True` (`authorize_workflow_run`).
+    WorkflowRunStart,
 }
 
 impl Capability {
@@ -121,6 +126,7 @@ impl Capability {
             Self::SandboxOauthApps => "sandbox.oauth_apps",
             Self::ConsoleDelegate => "console.delegate",
             Self::AnyCaller => "any_caller",
+            Self::WorkflowRunStart => "workflow_run_start",
         }
     }
 
@@ -168,6 +174,7 @@ impl Capability {
                 | (Self::ConsoleUser, Self::ConsolePending)
                 | (Self::ConsoleUser, Self::ConsoleRead)
                 | (Self::ConsolePending, Self::ConsoleRead)
+                | (Self::WorkflowsWrite, Self::WorkflowRunStart)
         )
     }
 
@@ -203,7 +210,8 @@ impl Capability {
             | Self::SlackProxy
             | Self::SlackExternalTeamsRead
             | Self::SlackExternalTeamsWrite
-            | Self::AnyCaller => Surface::ApiRs,
+            | Self::AnyCaller
+            | Self::WorkflowRunStart => Surface::ApiRs,
         }
     }
 }
@@ -303,6 +311,8 @@ impl AuthenticatedCaller {
 
     pub(crate) fn has_capability(&self, capability: Capability) -> bool {
         capability == Capability::AnyCaller
+            || (capability == Capability::WorkflowRunStart
+                && self.class() == CallerClass::Principal)
             || self
                 .capabilities
                 .iter()

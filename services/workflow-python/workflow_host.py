@@ -102,6 +102,7 @@ class RegisteredWorkflow:
     principal: Any = None
     starters: Any = None
     agent_defaults: dict[str, Any] | None = None
+    sandbox_startable: Any = None
 
 
 def workflow_dirs(raw: str | None = None) -> list[Path]:
@@ -174,6 +175,7 @@ def load_workflow_file(path: Path) -> RegisteredWorkflow | None:
         principal=getattr(module, "WORKFLOW_PRINCIPAL", None),
         starters=getattr(module, "WORKFLOW_STARTERS", None),
         agent_defaults=agent_defaults,
+        sandbox_startable=getattr(module, "SANDBOX_STARTABLE", None),
     )
 
 
@@ -374,6 +376,13 @@ def normalize_schedule(workflow: RegisteredWorkflow) -> dict[str, Any] | None:
     return schedule
 
 
+def normalize_sandbox_startable(workflow: RegisteredWorkflow) -> bool:
+    """``SANDBOX_STARTABLE = True`` lets a sandbox principal token start the
+    workflow without the ``workflows_write`` capability. Only a literal
+    ``True`` opts in."""
+    return workflow.sandbox_startable is True
+
+
 def normalize_principal(workflow: RegisteredWorkflow) -> bool | str | None:
     raw = workflow.principal
     if isinstance(raw, bool):
@@ -417,6 +426,7 @@ async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any
         workflow_name=workflow_name,
         pool=pool,
         agent_defaults=registered.agent_defaults,
+        caller=message.get("caller") if isinstance(message.get("caller"), dict) else None,
     )
     previous_metric_rpc = metrics.get_metric_rpc()
     metrics.set_metric_rpc(rpc)
@@ -453,6 +463,7 @@ def discovery_payload(raw_dirs: str) -> dict[str, Any]:
                 "schedule": normalize_schedule(workflow),
                 "principal": normalize_principal(workflow),
                 "starters": normalize_starters(workflow),
+                "sandbox_startable": normalize_sandbox_startable(workflow),
             }
             for workflow in workflows.values()
         ],

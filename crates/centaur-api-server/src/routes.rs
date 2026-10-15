@@ -30,7 +30,7 @@ use centaur_telemetry::{
     record_http_request_started,
 };
 use centaur_workflows::{
-    CreateWorkflowRunRequest, WebhookFilter, WorkflowRuntime, WorkflowWebhookAuth,
+    CreateWorkflowRunRequest, WebhookFilter, WorkflowCaller, WorkflowRuntime, WorkflowWebhookAuth,
     WorkflowWebhookSpec, WorkflowWebhookTriggerKey,
 };
 use futures_util::{Stream, StreamExt};
@@ -345,7 +345,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(create_workflow_run).get(list_workflow_runs),
             [
                 (Method::GET, Capability::WorkflowsRead),
-                (Method::POST, Capability::WorkflowsWrite),
+                (Method::POST, Capability::WorkflowRunStart),
             ],
         )
         .methods(
@@ -1133,6 +1133,9 @@ async fn create_workflow_run(
     Json(request): Json<CreateWorkflowRunRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
+    let run_caller = authorize_workflow_run(&caller, &request.workflow_name, |workflow_name| {
+        workflows.is_sandbox_startable(workflow_name)
+    })?;
     let starters = workflows.workflow_starters(&request.workflow_name);
     if !caller_may_start_workflow(starters.as_ref(), caller.class()) {
         return Err(ApiError::Forbidden(format!(
@@ -1140,8 +1143,37 @@ async fn create_workflow_run(
             request.workflow_name.trim()
         )));
     }
-    let run = workflows.create_run(request).await?;
+    let run = workflows.create_run_as(request, run_caller).await?;
     Ok(Json(serde_json::to_value(run)?))
+}
+
+/// Decide whether `caller` may start `workflow_name`, and describe the caller
+/// to the run (`ctx.caller`). A caller with `workflows_write` may start any
+/// workflow. A principal token without it (a sandbox) may start only a
+/// workflow that declares `SANDBOX_STARTABLE = True`; the workflow then sees
+/// the principal and can check that it acts only on that principal's work.
+fn authorize_workflow_run(
+    caller: &AuthenticatedCaller,
+    workflow_name: &str,
+    is_sandbox_startable: impl Fn(&str) -> bool,
+) -> Result<WorkflowCaller, ApiError> {
+    let allowed = caller.has_capability(Capability::WorkflowsWrite)
+        || (caller.class() == CallerClass::Principal && is_sandbox_startable(workflow_name));
+    if !allowed {
+        tracing::warn!(
+            caller_class = caller.class().as_str(),
+            workflow_name,
+            "caller may not start this workflow: it lacks workflows_write and the workflow is not sandbox-startable"
+        );
+        return Err(ApiError::Forbidden(
+            "caller is not authorized for this route".to_owned(),
+        ));
+    }
+    Ok(WorkflowCaller {
+        class: caller.class().as_str().to_owned(),
+        identity: caller.identity().to_owned(),
+        principal: caller.principal_subject().map(ToOwned::to_owned),
+    })
 }
 
 async fn list_workflow_runs(
@@ -2043,5 +2075,89 @@ mod webhook_tests {
             String::from_utf8(frames[0].as_ref().unwrap().to_vec()).unwrap(),
             "event: session.stream_error\ndata: {\"error\":\"API client access ended; request a new token\"}\n\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod workflow_run_access_tests {
+    use super::*;
+
+    /// A sandbox's principal caller, as `console::sandbox` builds it from a
+    /// proxy token.
+    fn principal_caller(workflows_write: bool) -> AuthenticatedCaller {
+        let mut capabilities = vec![Capability::SessionsRead];
+        if workflows_write {
+            capabilities.push(Capability::WorkflowsWrite);
+        }
+        AuthenticatedCaller::new(
+            CallerClass::Principal,
+            "prn_sandbox".to_owned(),
+            capabilities,
+            None,
+            Some("prn_sandbox".to_owned()),
+        )
+    }
+
+    fn authenticate(auth: &ApiAuthConfig, token: &str) -> AuthenticatedCaller {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        auth.authenticate(&headers).unwrap()
+    }
+
+    fn startable(workflow_name: &str) -> bool {
+        workflow_name == "follow_up_record"
+    }
+
+    #[test]
+    fn a_principal_without_workflows_write_starts_only_sandbox_startable_workflows() {
+        let caller = principal_caller(false);
+
+        let run_caller = authorize_workflow_run(&caller, "follow_up_record", startable).unwrap();
+        assert_eq!(
+            run_caller,
+            WorkflowCaller {
+                class: "principal".to_owned(),
+                identity: "prn_sandbox".to_owned(),
+                principal: Some("prn_sandbox".to_owned()),
+            }
+        );
+        assert!(matches!(
+            authorize_workflow_run(&caller, "ad_launch", startable),
+            Err(ApiError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn workflows_write_still_starts_any_workflow_and_the_run_names_its_caller() {
+        let auth = ApiAuthConfig::testing("jwt-secret").with_test_admin("admin-key");
+        let admin = authenticate(&auth, "admin-key");
+
+        let run_caller = authorize_workflow_run(&admin, "ad_launch", startable).unwrap();
+        assert_eq!(
+            (run_caller.class.as_str(), run_caller.principal),
+            ("admin", None)
+        );
+        assert_eq!(run_caller.identity, admin.identity());
+        assert!(authorize_workflow_run(&principal_caller(true), "ad_launch", startable).is_ok());
+    }
+
+    #[test]
+    fn the_run_route_admits_principals_and_cancel_still_needs_workflows_write() {
+        let principal = principal_caller(false);
+        assert!(principal.has_capability(Capability::WorkflowRunStart));
+        assert!(!principal.has_capability(Capability::WorkflowsWrite));
+        let read_only = AuthenticatedCaller::new(
+            CallerClass::Console,
+            "console".to_owned(),
+            [Capability::WorkflowsRead],
+            None,
+            None,
+        );
+        assert!(!read_only.has_capability(Capability::WorkflowRunStart));
+        assert!(principal_caller(true).has_capability(Capability::WorkflowRunStart));
+        assert_eq!(Capability::from_str("workflow_run_start"), None);
     }
 }
