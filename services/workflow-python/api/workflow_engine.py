@@ -48,11 +48,16 @@ class WorkflowContext:
         workflow_name: str,
         pool: Any = None,
         agent_defaults: dict[str, Any] | None = None,
+        caller: dict[str, Any] | None = None,
     ) -> None:
         self._rpc = rpc
         self.run_id = run_id
         self.task_id = task_id
         self.workflow_name = workflow_name
+        # Who started the run, as api-rs authenticated it: ``{"class",
+        # "identity", "principal"}``; ``principal`` is set for a principal
+        # token (a sandbox). None for schedules, webhooks, and child runs.
+        self.caller = dict(caller) if caller else None
         self._pool = pool
         self._action_names: set[str] = set()
         # Module-level `AGENT_DEFAULTS` (e.g. {"model": ..., "reasoning": ...})

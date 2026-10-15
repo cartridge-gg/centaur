@@ -677,6 +677,91 @@ class WorkflowHostTests(unittest.TestCase):
         registered.starters = True
         self.assertEqual(host.normalize_starters(registered), [])
 
+    def test_load_workflow_file_reads_sandbox_startable(self) -> None:
+        host = load_workflow_host()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "startable_workflow.py"
+            path.write_text(
+                "WORKFLOW_NAME = 'startable_workflow'\n"
+                "SANDBOX_STARTABLE = True\n"
+                "def handler(inp, ctx):\n"
+                "    return None\n"
+            )
+            registered = host.load_workflow_file(path)
+
+        assert registered is not None
+        self.assertIs(host.normalize_sandbox_startable(registered), True)
+        # Only a literal True opts in.
+        for value in (None, False, 1, "true", "yes"):
+            registered.sandbox_startable = value
+            self.assertIs(host.normalize_sandbox_startable(registered), False)
+
+    def test_discovery_payload_reports_sandbox_startable(self) -> None:
+        host = load_workflow_host()
+
+        def handler(inp, ctx):
+            return None
+
+        workflows = {
+            name: host.RegisteredWorkflow(
+                workflow_name=name,
+                source_path=f"workflows/{name}.py",
+                handler=handler,
+                input_cls=None,
+                webhooks=None,
+                schedule=None,
+                sandbox_startable=startable,
+            )
+            for name, startable in (("open_door", True), ("closed_door", None))
+        }
+        with patch.object(host, "discover_workflows", return_value=workflows):
+            payload = host.discovery_payload()
+
+        self.assertEqual(
+            {w["workflow_name"]: w["sandbox_startable"] for w in payload["workflows"]},
+            {"open_door": True, "closed_door": False},
+        )
+
+    def test_run_workflow_exposes_the_caller_on_the_context(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        seen = []
+
+        def handler(inp, ctx):
+            seen.append(ctx.caller)
+            return None
+
+        registered = host.RegisteredWorkflow(
+            workflow_name="sample_workflow",
+            source_path="workflows/sample.py",
+            handler=handler,
+            input_cls=None,
+            webhooks=None,
+            schedule=None,
+        )
+
+        async def create_pool():
+            return None
+
+        caller = {"class": "principal", "identity": "prn_abc", "principal": "prn_abc"}
+        with (
+            patch.object(host, "discover_workflows", return_value={"sample_workflow": registered}),
+            patch.object(host, "create_pool", create_pool),
+        ):
+            for message_caller in (caller, None, "not a mapping"):
+                message = {
+                    "type": "workflow.start",
+                    "workflow_name": "sample_workflow",
+                    "run_id": "run-123",
+                    "task_id": "task-456",
+                    "input": {},
+                }
+                if message_caller is not None:
+                    message["caller"] = message_caller
+                asyncio.run(host.run_workflow(message, rpc))
+
+        self.assertEqual(seen, [caller, None, None])
+
     def test_workflow_name_from_source_reads_string_constant(self) -> None:
         host = load_workflow_host()
         with tempfile.TemporaryDirectory() as tmp:
