@@ -351,7 +351,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .methods(
             "/api/workflows/runs/{run_id}",
             get(get_workflow_run),
-            [(Method::GET, Capability::WorkflowsRead)],
+            [(Method::GET, Capability::WorkflowRunRead)],
         )
         .methods(
             "/api/workflows/runs/{run_id}/cancel",
@@ -1197,11 +1197,44 @@ async fn list_workflow_schedules(
 
 async fn get_workflow_run(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(run_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
     let run = workflows.get_run(&run_id).await?;
+    authorize_workflow_run_read(&caller, &run)?;
     Ok(Json(json!({ "ok": true, "run": run })))
+}
+
+/// A caller with `workflows_read` may read any run. A principal token without
+/// it may read only a run that it started (`WorkflowRun::caller`), so a
+/// sandbox can wait for the result of a sandbox-startable workflow it ran
+/// without seeing any other run's input or result.
+fn authorize_workflow_run_read(
+    caller: &AuthenticatedCaller,
+    run: &centaur_workflows::WorkflowRun,
+) -> Result<(), ApiError> {
+    if caller.has_capability(Capability::WorkflowsRead) {
+        return Ok(());
+    }
+    let started_it = caller.class() == CallerClass::Principal
+        && caller.principal_subject().is_some()
+        && run
+            .caller
+            .as_ref()
+            .and_then(|run_caller| run_caller.principal.as_deref())
+            == caller.principal_subject();
+    if started_it {
+        return Ok(());
+    }
+    tracing::warn!(
+        caller_class = caller.class().as_str(),
+        workflow_name = run.workflow_name,
+        "caller may not read this workflow run: it lacks workflows_read and did not start the run"
+    );
+    Err(ApiError::Forbidden(
+        "caller is not authorized for this route".to_owned(),
+    ))
 }
 
 async fn cancel_workflow_run(
@@ -2144,6 +2177,49 @@ mod workflow_run_access_tests {
         assert!(authorize_workflow_run(&principal_caller(true), "ad_launch", startable).is_ok());
     }
 
+    fn run_started_by(principal: Option<&str>) -> centaur_workflows::WorkflowRun {
+        centaur_workflows::WorkflowRun {
+            run_id: "run".to_owned(),
+            initial_run_id: "run".to_owned(),
+            task_id: "task".to_owned(),
+            workflow_name: "follow_up_record".to_owned(),
+            status: "completed".to_owned(),
+            input: json!({}),
+            result: Some(json!({"recorded": true})),
+            failure: None,
+            attempts: 1,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            caller: principal.map(|principal| WorkflowCaller {
+                class: "principal".to_owned(),
+                identity: principal.to_owned(),
+                principal: Some(principal.to_owned()),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_principal_without_workflows_read_reads_only_runs_it_started() {
+        let caller = principal_caller(false);
+        assert!(authorize_workflow_run_read(&caller, &run_started_by(Some("prn_sandbox"))).is_ok());
+        for run in [run_started_by(Some("prn_other")), run_started_by(None)] {
+            assert!(matches!(
+                authorize_workflow_run_read(&caller, &run),
+                Err(ApiError::Forbidden(_))
+            ));
+        }
+        // workflows_read still reads every run.
+        let reader = AuthenticatedCaller::new(
+            CallerClass::Principal,
+            "proxy-reader".to_owned(),
+            [Capability::WorkflowsRead],
+            None,
+            Some("prn_reader".to_owned()),
+        );
+        assert!(authorize_workflow_run_read(&reader, &run_started_by(Some("prn_other"))).is_ok());
+        assert!(authorize_workflow_run_read(&reader, &run_started_by(None)).is_ok());
+    }
+
     #[test]
     fn the_run_route_admits_principals_and_cancel_still_needs_workflows_write() {
         let principal = principal_caller(false);
@@ -2159,5 +2235,9 @@ mod workflow_run_access_tests {
         assert!(!read_only.has_capability(Capability::WorkflowRunStart));
         assert!(principal_caller(true).has_capability(Capability::WorkflowRunStart));
         assert_eq!(Capability::from_str("workflow_run_start"), None);
+        assert!(principal.has_capability(Capability::WorkflowRunRead));
+        assert!(!principal.has_capability(Capability::WorkflowsRead));
+        assert!(read_only.has_capability(Capability::WorkflowRunRead));
+        assert_eq!(Capability::from_str("workflow_run_read"), None);
     }
 }
