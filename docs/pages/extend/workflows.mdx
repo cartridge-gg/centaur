@@ -198,6 +198,41 @@ curl -s "$CENTAUR_API_URL/api/workflows/runs?workflow_name=nightly_report&limit=
   -H "Authorization: Bearer $CENTAUR_API_TOKEN" | jq
 ```
 
+### Start a workflow from a sandbox
+
+Starting a run needs the `workflows_write` capability. A sandbox's principal
+token has it only when the principal's `sandbox_workflows_write_enabled` flag is
+set in the Console, and that flag allows the sandbox to start every workflow.
+
+To let a sandbox start one workflow without that flag, declare it in the
+module:
+
+```python
+WORKFLOW_NAME = "record_reminder"
+SANDBOX_STARTABLE = True
+```
+
+Then a principal token without `workflows_write` can create a run of this
+workflow with `POST /api/workflows/runs`, and of no other workflow. Only a
+literal `True` opts in, and `WORKFLOW_ENABLE_MODE=allowlist` still applies.
+
+The run sees who started it in `ctx.caller`. The API sets it from the
+authenticated token, never from the request body:
+
+```python
+async def handler(inp, ctx):
+    caller = ctx.caller or {}
+    # {"class": "principal", "identity": "prn_...", "principal": "prn_..."}
+    if caller.get("class") == "principal":
+        # Act only on work that belongs to caller["principal"].
+        ...
+```
+
+`ctx.caller` is `None` for schedules, webhooks, Slack buttons, and child runs.
+A sandbox-startable workflow must validate its input like a public endpoint:
+check that the principal in `ctx.caller` owns the session, thread, or record
+the input names before it acts.
+
 ## Start Workflows From Slack Buttons
 
 Use `ctx.slack_buttons` to post a message whose buttons start a named workflow.
