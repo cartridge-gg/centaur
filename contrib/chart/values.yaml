@@ -748,6 +748,11 @@ apiRs:
   # Reaper: stop sandboxes older than the max lifetime, regardless of whether
   # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days
+  # Keep a sandbox past sandboxMaxLifetimeSecs while its session was active
+  # within this window (a turn ended, started, or is queued or running). The
+  # reaper stops it once the session has been quiet this long. 0 stops on age
+  # alone.
+  sandboxMaxLifetimeActivityGraceSecs: 0
   sandboxReapIntervalSecs: 300
   # Delete session.output.line events older than this many days, once their
   # execution also completed before the cutoff. Accepts 0 through 3650;

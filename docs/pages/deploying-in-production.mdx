@@ -531,7 +531,8 @@ Sandbox lifecycle has two separate timers:
   3 hours, so api-rs can pause an idle sandbox after a turn finishes.
 - api-rs deletes old sandboxes through `apiRs.sandboxMaxLifetimeSecs`, default
   72 hours, regardless of whether the sandbox is still running or already
-  suspended.
+  suspended. Set `apiRs.sandboxMaxLifetimeActivityGraceSecs` to keep a sandbox
+  past that age while its session was active within that window.
 
 There is no suspended-only delete setting. If you want sandboxes gone after N
 hours, set `apiRs.sandboxMaxLifetimeSecs` to N hours in seconds.
