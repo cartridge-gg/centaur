@@ -2107,6 +2107,50 @@ impl PgSessionStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// The latest activity of each listed sandbox's session: the last touch,
+    /// or the last time one of its executions was created, started, or
+    /// completed. A queued or running execution counts as active now.
+    /// Sandboxes no session owns are left out.
+    pub async fn sandbox_last_activity(
+        &self,
+        sandbox_ids: &[String],
+    ) -> Result<BTreeMap<String, OffsetDateTime>, SessionStoreError> {
+        let rows = sqlx::query_as::<_, (String, Option<OffsetDateTime>)>(
+            r#"
+            select
+                s.sandbox_id,
+                greatest(
+                    s.sandbox_last_active_at,
+                    max(x.created_at),
+                    max(x.started_at),
+                    max(x.completed_at),
+                    case
+                        when bool_or(x.status in ('queued', 'running')) then now()
+                    end
+                ) as last_active_at
+            from sessions s
+            left join session_executions x on x.thread_key = s.thread_key
+            where s.sandbox_id = any($1)
+            group by s.thread_key, s.sandbox_id, s.sandbox_last_active_at
+            "#,
+        )
+        .bind(sandbox_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut activity = BTreeMap::new();
+        for (sandbox_id, last_active_at) in rows {
+            let Some(last_active_at) = last_active_at else {
+                continue;
+            };
+            activity
+                .entry(sandbox_id)
+                .and_modify(|latest: &mut OffsetDateTime| *latest = (*latest).max(last_active_at))
+                .or_insert(last_active_at);
+        }
+        Ok(activity)
+    }
+
     async fn set_session_status(
         &self,
         thread_key: &str,
@@ -3484,5 +3528,111 @@ mod tests {
                 .expect("list referenced sandboxes")
                 .contains(&sandbox_id)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sandbox_last_activity_takes_the_latest_turn_and_counts_open_turns_as_now() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let session = |name: &str| {
+            let suffix = Uuid::new_v4();
+            (
+                ThreadKey::parse(format!("test:activity-{name}-{suffix}")).unwrap(),
+                format!("sbx-activity-{name}-{suffix}"),
+            )
+        };
+        let (finished, finished_sandbox) = session("finished");
+        let (queued, queued_sandbox) = session("queued");
+        let (touched, touched_sandbox) = session("touched");
+        for (thread_key, sandbox_id) in [
+            (&finished, &finished_sandbox),
+            (&queued, &queued_sandbox),
+            (&touched, &touched_sandbox),
+        ] {
+            store
+                .create_or_get_session(
+                    thread_key,
+                    &HarnessType::Codex,
+                    None,
+                    json!({}),
+                    Default::default(),
+                )
+                .await
+                .expect("create session");
+            store
+                .update_sandbox_id(thread_key, Some(sandbox_id))
+                .await
+                .expect("set sandbox id");
+        }
+        for thread_key in [&finished, &queued] {
+            let execution_id = store
+                .create_execution(thread_key, None, json!({}))
+                .await
+                .expect("create execution")
+                .execution
+                .execution_id;
+            if thread_key == &finished {
+                store
+                    .complete_execution(&execution_id)
+                    .await
+                    .expect("complete execution");
+            }
+            sqlx::query(
+                r#"
+                update session_executions
+                set created_at = now() - interval '6 hours',
+                    started_at = case when started_at is null then null
+                                      else now() - interval '6 hours' end,
+                    completed_at = case when completed_at is null then null
+                                        else now() - interval '5 hours' end
+                where execution_id = $1
+                "#,
+            )
+            .bind(&execution_id)
+            .execute(store.pool())
+            .await
+            .expect("age execution");
+        }
+        for (thread_key, age) in [
+            (&finished, "6 hours"),
+            (&queued, "6 hours"),
+            (&touched, "1 hour"),
+        ] {
+            sqlx::query(
+                r#"
+                update sessions
+                set sandbox_last_active_at = now() - $2::interval
+                where thread_key = $1
+                "#,
+            )
+            .bind(thread_key.as_str())
+            .bind(age)
+            .execute(store.pool())
+            .await
+            .expect("age sandbox activity");
+        }
+
+        let unowned = format!("sbx-activity-unowned-{}", Uuid::new_v4());
+        let activity = store
+            .sandbox_last_activity(&[
+                finished_sandbox.clone(),
+                queued_sandbox.clone(),
+                touched_sandbox.clone(),
+                unowned.clone(),
+            ])
+            .await
+            .expect("read sandbox activity");
+        let age = |sandbox_id: &str| {
+            OffsetDateTime::now_utc() - activity.get(sandbox_id).copied().expect("activity")
+        };
+
+        // The completed turn (5 h ago) is newer than the touch and the start.
+        assert!((age(&finished_sandbox) - TimeDuration::hours(5)).abs() < TimeDuration::minutes(1));
+        // A queued turn keeps the session active however old its rows are.
+        assert!(age(&queued_sandbox) < TimeDuration::minutes(1));
+        // A session with no turns falls back to its last touch.
+        assert!((age(&touched_sandbox) - TimeDuration::hours(1)).abs() < TimeDuration::minutes(1));
+        assert!(!activity.contains_key(&unowned));
     }
 }
