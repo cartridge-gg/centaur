@@ -828,6 +828,15 @@ struct SandboxArgs {
         default_value_t = 259_200
     )]
     sandbox_max_lifetime_secs: u64,
+    /// Keep a sandbox past the max lifetime while its session was active
+    /// within this window; the reaper stops it once the session has been
+    /// quiet this long. 0 stops on age alone.
+    #[arg(
+        long = "session-sandbox-max-lifetime-activity-grace-secs",
+        env = "SESSION_SANDBOX_MAX_LIFETIME_ACTIVITY_GRACE_SECS",
+        default_value_t = 0
+    )]
+    sandbox_max_lifetime_activity_grace_secs: u64,
     /// Let a session keep its sandbox past the max lifetime while it owns
     /// open work (workflow RPCs `ctx.session_keepalive` /
     /// `ctx.stop_session_sandbox`). Needs the max-lifetime sweep: retention is
@@ -1818,6 +1827,7 @@ impl SandboxArgs {
                 .sandbox_keepalive_enabled
                 .then(|| ttl(self.sandbox_keepalive_max_secs))
                 .flatten(),
+            activity_grace: ttl(self.sandbox_max_lifetime_activity_grace_secs),
         }
     }
 
@@ -3489,6 +3499,24 @@ mod tests {
         let config = args.sandbox_reaper_config();
         assert_eq!(config.max_lifetime, Some(Duration::from_secs(259_200)));
         assert_eq!(config.orphan_sweep_grace, Duration::from_secs(600));
+        assert_eq!(config.activity_grace, None);
+    }
+
+    #[test]
+    fn sandbox_reaper_activity_grace_is_configurable() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-max-lifetime-activity-grace-secs",
+            "10800",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox_reaper_config().activity_grace,
+            Some(Duration::from_secs(10_800))
+        );
     }
 
     #[test]
