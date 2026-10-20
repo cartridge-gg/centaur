@@ -6,10 +6,12 @@ import {
   forwardToSessionApi,
   harnessRestartPreamble,
   interruptSessionExecution,
+  isRetryableSessionApiError,
   isSessionPrincipalAdmissionDenied,
   openSessionEventStream,
   resolveSlackHomeTeamId,
   SessionApiError,
+  SessionApiTransportError,
   serializeAttachment,
   serializeMessage
 } from '../src/session-api'
@@ -39,6 +41,89 @@ describe('session admission errors', () => {
 
     expect(isSessionPrincipalAdmissionDenied(error)).toBe(true)
     expect(isSessionPrincipalAdmissionDenied(new Error('forbidden'))).toBe(false)
+  })
+})
+
+// Bun's fetch rejects network failures with a plain Error and a `code`.
+function bunFetchError(code: string, message: string): Error {
+  return Object.assign(new Error(message), { code })
+}
+
+describe('session API transport errors', () => {
+  test('makes a refused api-rs connection retryable', async () => {
+    const refused = bunFetchError(
+      'ConnectionRefused',
+      'Unable to connect. Is the computer able to access the url?'
+    )
+    const fetchFn: SlackbotV2Options['fetch'] = async () => {
+      throw refused
+    }
+
+    const error = await interruptSessionExecution(
+      options(fetchFn),
+      'slack:C1:1700000000.000100',
+      'Interrupted from Slack by U1'
+    ).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(SessionApiTransportError)
+    expect(error).toMatchObject({
+      action: 'interrupt session',
+      cause: refused,
+      code: 'ConnectionRefused',
+      message:
+        'Centaur session interrupt session failed: Unable to connect. Is the computer able to access the url?'
+    })
+    expect(isRetryableSessionApiError(error)).toBe(true)
+  })
+
+  test('keeps other errors and raw network errors as they are', async () => {
+    const unexpected = new Error('unexpected failure')
+    const fetchFn: SlackbotV2Options['fetch'] = async () => {
+      throw unexpected
+    }
+
+    const error = await interruptSessionExecution(
+      options(fetchFn),
+      'slack:C1:1700000000.000100',
+      'Interrupted from Slack by U1'
+    ).catch((caught: unknown) => caught)
+
+    expect(error).toBe(unexpected)
+    expect(isRetryableSessionApiError(error)).toBe(false)
+    // A raw Bun network error comes from a Slack call, not from api-rs.
+    expect(isRetryableSessionApiError(bunFetchError('ConnectionRefused', 'refused'))).toBe(false)
+  })
+
+  test('makes a reset event stream retryable', async () => {
+    const reset = bunFetchError('ECONNRESET', 'The socket connection was closed unexpectedly.')
+    const fetchFn: SlackbotV2Options['fetch'] = async () =>
+      new Response(
+        new ReadableStream({
+          pull(controller) {
+            controller.error(reset)
+          }
+        }),
+        { headers: { 'content-type': 'text/event-stream' } }
+      )
+
+    const stream = await openSessionEventStream(options(fetchFn), {
+      afterEventId: 0,
+      executionId: 'exec-1',
+      onEventId: () => undefined,
+      threadId: 'slack:C1:1700000000.000100'
+    })
+    let error: unknown
+    try {
+      for await (const _event of stream) {
+        // The stream fails before it yields an event.
+      }
+    } catch (caught) {
+      error = caught
+    }
+
+    expect(error).toBeInstanceOf(SessionApiTransportError)
+    expect(error).toMatchObject({ action: 'stream events', cause: reset, code: 'ECONNRESET' })
+    expect(isRetryableSessionApiError(error)).toBe(true)
   })
 })
 

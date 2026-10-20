@@ -4181,6 +4181,190 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(1)
   })
 
+  it('locally retries a mention when api-rs refuses the connection', async () => {
+    // A rolling api-rs restart refuses connects for about a second. Bun
+    // rejects with a plain Error carrying `code`, not a TypeError.
+    let refuseNextCreate = true
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        const url = new URL(String(input))
+        if (
+          refuseNextCreate &&
+          url.origin === codexApi.url &&
+          init?.method === 'POST' &&
+          /^\/api\/session\/[^/]+$/.test(url.pathname)
+        ) {
+          refuseNextCreate = false
+          throw bunFetchError('ConnectionRefused', BUN_CONNECTION_REFUSED_MESSAGE)
+        }
+        return globalThis.fetch(input, init)
+      },
+      handoffRetryDelaysMs: [50]
+    })
+
+    const parent = await postUserMessage('History before api-rs restarts.')
+    const mentionText = `<@${BOT_USER_ID}> run while api-rs restarts`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-connection-refused-create',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: mentionText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+
+    await waitFor(() => codexApi.executes.length === 1, 3000)
+    await waitFor(async () => (await threadText(parent.ts)).includes('Executed request 1.'), 3000)
+    await Promise.all(waits)
+
+    expect(refuseNextCreate).toBe(false)
+    // The refused create never reached api-rs; only the retry did.
+    expect(codexApi.creates).toHaveLength(1)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(await threadText(parent.ts)).not.toContain('Execution failed')
+  })
+
+  it('retries an event stream that api-rs refuses after execute', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    let refuseNextEvents = true
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        const url = new URL(String(input))
+        if (refuseNextEvents && url.origin === codexApi.url && url.pathname.endsWith('/events')) {
+          refuseNextEvents = false
+          throw bunFetchError('ConnectionRefused', BUN_CONNECTION_REFUSED_MESSAGE)
+        }
+        return globalThis.fetch(input, init)
+      },
+      state: sharedState
+    })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a refused stream.')
+    const mentionText = `<@${BOT_USER_ID}> recover after a refused stream`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-connection-refused-events',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: mentionText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => !refuseNextEvents)
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.activeExecution === true && Boolean(threadState.renderObligation)
+    })
+
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Recovered after a refused stream.'))
+    await waitFor(() => codexApi.eventRequests.length >= 1, 3000)
+    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.stopStream'), 3000)
+    await Promise.all(waits)
+
+    expect(codexApi.executes).toHaveLength(1)
+    const text = await threadText(parent.ts)
+    expect(text).toContain('Recovered after a refused stream.')
+    expect(text).not.toContain('Execution failed')
+  })
+
+  it('retries an event stream that breaks with a connection reset', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    let resetNextEvents = true
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        const url = new URL(String(input))
+        if (!resetNextEvents || url.origin !== codexApi.url || !url.pathname.endsWith('/events')) {
+          return globalThis.fetch(input, init)
+        }
+        // The stream opens, then the old api-rs pod goes away mid-read.
+        resetNextEvents = false
+        const upstream = await globalThis.fetch(input, init)
+        await upstream.body?.cancel()
+        return new Response(
+          new ReadableStream({
+            pull(controller) {
+              controller.error(bunFetchError('ECONNRESET', BUN_CONNECTION_RESET_MESSAGE))
+            }
+          }),
+          { headers: upstream.headers, status: upstream.status }
+        )
+      },
+      state: sharedState
+    })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a reset stream.')
+    const mentionText = `<@${BOT_USER_ID}> recover after a reset stream`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-connection-reset-events',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: mentionText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => !resetNextEvents)
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.activeExecution === true && Boolean(threadState.renderObligation)
+    })
+
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Recovered after a reset stream.'))
+    await waitFor(() => codexApi.eventRequests.length >= 2, 3000)
+    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.stopStream'), 3000)
+    await Promise.all(waits)
+
+    expect(codexApi.executes).toHaveLength(1)
+    const text = await threadText(parent.ts)
+    expect(text).toContain('Recovered after a reset stream.')
+    expect(text).not.toContain('Execution failed')
+  })
+
   it('keeps a steering reaction when an append retry starts an execution', async () => {
     let failNextAppend = false
     bot = createTestBot({
@@ -4893,6 +5077,14 @@ function sampleCodexNotifications(answer: string): ServerNotification[] {
       }
     }
   ] as unknown as ServerNotification[]
+}
+
+const BUN_CONNECTION_REFUSED_MESSAGE = 'Unable to connect. Is the computer able to access the url?'
+const BUN_CONNECTION_RESET_MESSAGE = 'The socket connection was closed unexpectedly.'
+
+// Bun's fetch rejects network failures with a plain Error and a `code`.
+function bunFetchError(code: string, message: string): Error {
+  return Object.assign(new Error(message), { code })
 }
 
 function sampleCodexOutputLines(answer: string): string[] {
