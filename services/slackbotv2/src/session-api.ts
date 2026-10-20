@@ -61,8 +61,51 @@ export class SessionApiError extends Error {
   }
 }
 
+/**
+ * Codes Bun's fetch sets on the plain `Error` it rejects with when the network
+ * fails; Node/undici would reject with a `TypeError` instead. A refused
+ * connect, as during an api-rs rolling restart, never reached api-rs. A reset
+ * or timeout may follow a delivered request; the session API's message and
+ * execution idempotency keys make those safe to retry too.
+ */
+const SESSION_API_TRANSPORT_ERROR_CODES = new Set([
+  'ConnectionClosed',
+  'ConnectionRefused',
+  'ConnectionTimeout',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ETIMEDOUT',
+  'FailedToOpenSocket'
+])
+
+/**
+ * A network failure while talking to api-rs. Only api-rs calls produce it, so a
+ * Slack network failure is never mistaken for a retryable session API error.
+ */
+export class SessionApiTransportError extends Error {
+  readonly action: string
+  readonly code: string
+
+  constructor(action: string, code: string, cause: Error) {
+    super(`Centaur session ${action} failed: ${cause.message}`, { cause })
+    this.name = 'SessionApiTransportError'
+    this.action = action
+    this.code = code
+  }
+}
+
+function asSessionApiTransportError(action: string, error: unknown): unknown {
+  if (!(error instanceof Error)) return error
+  const code = (error as { code?: unknown }).code
+  if (typeof code !== 'string' || !SESSION_API_TRANSPORT_ERROR_CODES.has(code)) return error
+  return new SessionApiTransportError(action, code, error)
+}
+
 export function isRetryableSessionApiError(error: unknown): boolean {
   if (error instanceof SessionApiError) return error.retryable
+  if (error instanceof SessionApiTransportError) return true
   if (!(error instanceof Error)) return false
   return error.name === 'AbortError' || error.name === 'TypeError'
 }
@@ -157,6 +200,19 @@ export async function fetchWithTimeout(
   ).catch(error => {
     controller.abort()
     throw error
+  })
+}
+
+/** `fetchWithTimeout` for api-rs calls: network failures become retryable. */
+function fetchSessionApi(
+  fetchFn: SlackbotV2Fetch,
+  input: RequestInfo | URL,
+  init: RequestInit,
+  timeoutMs: number,
+  action: string
+): Promise<Response> {
+  return fetchWithTimeout(fetchFn, input, init, timeoutMs, action).catch(error => {
+    throw asSessionApiTransportError(action, error)
   })
 }
 
@@ -588,7 +644,7 @@ export async function dispatchWorkflowRun(
   const response = await recordSessionApiOperation(
     'create_workflow_run',
     () =>
-      fetchWithTimeout(
+      fetchSessionApi(
         options.fetch ?? globalThis.fetch,
         new URL('/api/workflows/runs', ensureTrailingSlash(options.apiUrl)),
         {
@@ -640,7 +696,7 @@ export async function dispatchSlackBlockAction(
   const response = await recordSessionApiOperation(
     workflowAction ? 'start_workflow_from_button' : 'emit_workflow_event',
     () =>
-      fetchWithTimeout(
+      fetchSessionApi(
         options.fetch ?? globalThis.fetch,
         new URL(
           workflowAction ? '/api/workflows/actions/invoke' : '/api/workflows/events',
@@ -969,7 +1025,7 @@ async function postCreateSession(
     ...(onHarnessConflict ? { on_harness_conflict: onHarnessConflict } : {}),
     ...(onHarnessConflict === 'restart' && harnessExplicit ? { harness_explicit: true } : {})
   }
-  return fetchWithTimeout(
+  return fetchSessionApi(
     fetchFn,
     apiSessionUrl(options.apiUrl, threadId),
     {
@@ -1445,7 +1501,7 @@ async function appendSessionMessages(
       messages.map(message => toSessionMessage(options, message, includeRequesterContext))
     )
   }
-  const response = await fetchWithTimeout(
+  const response = await fetchSessionApi(
     fetchFn,
     apiSessionUrl(options.apiUrl, threadId, 'messages'),
     {
@@ -1512,7 +1568,7 @@ async function executeSession(
     idle_timeout_ms: idleTimeoutMs,
     ...(options.maxDurationMs === undefined ? {} : { max_duration_ms: options.maxDurationMs })
   }
-  const response = await fetchWithTimeout(
+  const response = await fetchSessionApi(
     fetchFn,
     apiSessionUrl(options.apiUrl, threadId, 'execute'),
     {
@@ -1533,7 +1589,7 @@ async function postInterruptSessionExecution(
   reason: string
 ): Promise<SlackbotV2InterruptSessionResponse> {
   const fetchFn = options.fetch ?? fetch
-  const response = await fetchWithTimeout(
+  const response = await fetchSessionApi(
     fetchFn,
     apiSessionUrl(options.apiUrl, threadId, 'interrupt'),
     {
@@ -1580,7 +1636,7 @@ async function streamSessionNotifications(
   const url = new URL(apiSessionUrl(options.apiUrl, threadId, 'events'))
   url.searchParams.set('after_event_id', String(afterEventId))
   if (executionId) url.searchParams.set('execution_id', executionId)
-  const response = await fetchWithTimeout(
+  const response = await fetchSessionApi(
     fetchFn,
     url.toString(),
     {
@@ -2173,7 +2229,7 @@ async function* parseSseEvents(stream: ReadableStream<Uint8Array>): AsyncIterabl
         ;({ done, value } = await reader.read())
       } catch (error) {
         releaseConnection('error')
-        throw error
+        throw asSessionApiTransportError('stream events', error)
       }
       if (done) {
         releaseConnection('done')
