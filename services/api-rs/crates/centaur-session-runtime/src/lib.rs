@@ -1676,16 +1676,37 @@ impl SessionRuntime {
             .unwrap_or(HarnessType::Codex);
         let metadata =
             tool_host_session_metadata(principal_id, console_user_email, console_user_name);
-        let session = self
+        let session = match self
             .store
             .create_or_get_session_merging_metadata(
                 thread_key,
                 &harness,
                 None,
-                metadata,
+                metadata.clone(),
                 BTreeMap::new(),
             )
-            .await?;
+            .await
+        {
+            Ok(session) => session,
+            // The tool host runs `centaur-tool-host`, never a harness, and
+            // keeps no conversation. Its row only records the warm harness at
+            // creation, so after a default harness change, move the row to the
+            // new harness instead of failing every call for this principal.
+            Err(SessionStoreError::HarnessConflict { existing, .. }) => {
+                self.restart_session_on_harness(thread_key, &harness, &existing)
+                    .await?;
+                self.store
+                    .create_or_get_session_merging_metadata(
+                        thread_key,
+                        &harness,
+                        None,
+                        metadata,
+                        BTreeMap::new(),
+                    )
+                    .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
         if session.iron_control_principal.as_deref() != Some(principal_id) {
             self.store
                 .set_iron_control_principal(thread_key, Some(principal_id))
@@ -11147,6 +11168,67 @@ mod adoption_tests {
         assert_eq!(
             session_metadata(&store, &thread_key).await["persona"]["persona_id"],
             "old"
+        );
+        let events = events(&store, &thread_key).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "session.harness_switched")
+        );
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_host_session_moves_to_the_current_default_harness() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let principal = format!("prn_{}", uuid::Uuid::new_v4().simple());
+        let thread_key = tool_host_thread_key(&principal).unwrap();
+        // A row and sandbox left from an earlier default harness.
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Hermes,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create tool host session on the old harness");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-old-tool-host"))
+            .await
+            .expect("attach the old sandbox");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        assert_eq!(runtime.default_session_harness(), HarnessType::Codex);
+
+        runtime
+            .create_or_get_tool_host_session(
+                &thread_key,
+                &principal,
+                Some("test@example.com"),
+                None,
+            )
+            .await
+            .expect("tool host session after a default harness change");
+
+        let session = store.get_session(&thread_key).await.unwrap();
+        assert_eq!(session.harness_type, HarnessType::Codex);
+        assert_eq!(session.sandbox_id, None);
+        assert_eq!(
+            session.iron_control_principal.as_deref(),
+            Some(principal.as_str())
+        );
+        assert_eq!(
+            session_metadata(&store, &thread_key).await["console_user_email"],
+            "test@example.com"
+        );
+        assert_eq!(
+            *backend.stopped.lock().unwrap(),
+            vec!["asbx-old-tool-host".to_owned()]
         );
         let events = events(&store, &thread_key).await;
         assert!(
