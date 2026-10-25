@@ -848,3 +848,36 @@ def test_sheets_raw_batch_update_requires_json_array(monkeypatch):
     result = runner.invoke(app, ["sheets", "raw-batch-update", "s", '[{"a": 1}]'])
     assert result.exit_code == 0, result.output
     fake_update.assert_called_once_with("s", [{"a": 1}])
+
+
+def test_gmail_reply_passes_to_and_from_and_prints_the_sender(monkeypatch):
+    calls = []
+
+    def fake_reply(message_id, body, **kwargs):
+        calls.append((message_id, body, kwargs))
+        return {"id": "sent-1", "thread_id": "thread-1", "from": "support@example.com"}
+
+    monkeypatch.setattr(client, "gmail_reply", fake_reply)
+    result = runner.invoke(
+        app,
+        [
+            "gmail",
+            "reply",
+            "msg-1",
+            "Thanks",
+            "--to",
+            "pat@example.org",
+            "--from",
+            "support@example.com",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        (
+            "msg-1",
+            "Thanks",
+            {"attachments": None, "to": "pat@example.org", "from_address": "support@example.com"},
+        )
+    ]
+    assert "From: support@example.com" in result.stdout
