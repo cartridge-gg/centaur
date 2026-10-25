@@ -9,6 +9,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable
 from email.mime.text import MIMEText
+from email.utils import getaddresses
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse, urlsplit
 
@@ -192,7 +193,58 @@ def gmail_read(message_id: str) -> dict:
     }
 
 
-def gmail_send(to: str, subject: str, body: str, cc: str | None = None) -> dict:
+def _send_message(service, message, thread_id: str = "", from_address: str | None = None) -> dict:
+    """Send a MIME message and return its id and thread id.
+
+    With ``from_address``, the message goes out from that send-as alias.
+    Gmail uses the account's own address instead when the alias is not a
+    verified send-as address of the account, and does not report it. So the
+    result also carries ``from``: the From header of the sent message (or
+    ``from_error`` when that lookup fails).
+    """
+    if from_address:
+        message["from"] = from_address
+    body = {"raw": base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")}
+    if thread_id:
+        body["threadId"] = thread_id
+
+    result = service.users().messages().send(userId="me", body=body).execute()
+
+    sent = {
+        "id": result.get("id", ""),
+        "thread_id": result.get("threadId", ""),
+    }
+    if from_address and sent["id"]:
+        # The message is already sent: a failed lookup must not raise, or a
+        # caller that retries sends it twice.
+        try:
+            detail = (
+                service.users()
+                .messages()
+                .get(userId="me", id=sent["id"], format="metadata", metadataHeaders=["From"])
+                .execute()
+            )
+            sent["from"] = _header(detail, "From")
+        except Exception as e:
+            sent["from_error"] = str(e)
+    return sent
+
+
+def _header(message: dict, name: str) -> str:
+    """One header of a Gmail API message resource, matched without case."""
+    for header in message.get("payload", {}).get("headers", []):
+        if header.get("name", "").lower() == name.lower():
+            return header.get("value", "")
+    return ""
+
+
+def gmail_send(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    from_address: str | None = None,
+) -> dict:
     """Send an email.
 
     Args:
@@ -200,9 +252,13 @@ def gmail_send(to: str, subject: str, body: str, cc: str | None = None) -> dict:
         subject: Email subject
         body: Email body (plain text)
         cc: Optional CC recipients
+        from_address: Optional send-as alias to send from (for example a
+            group address). It must be a verified send-as address of the
+            account, or Gmail sends from the account's own address.
 
     Returns:
-        Dict with id, thread_id
+        Dict with id, thread_id, and with from_address also from (the From
+        header Gmail used)
     """
     service = get_gmail_service()
 
@@ -212,14 +268,7 @@ def gmail_send(to: str, subject: str, body: str, cc: str | None = None) -> dict:
     if cc:
         message["cc"] = cc
 
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-
-    result = service.users().messages().send(userId="me", body={"raw": raw}).execute()
-
-    return {
-        "id": result.get("id", ""),
-        "thread_id": result.get("threadId", ""),
-    }
+    return _send_message(service, message, from_address=from_address)
 
 
 def gmail_labels() -> list[dict]:
@@ -284,16 +333,28 @@ def gmail_reply(
     message_id: str,
     body: str,
     attachments: list[str] | None = None,
+    to: str | None = None,
+    from_address: str | None = None,
 ) -> dict:
-    """Reply to a Gmail message.
+    """Reply to a Gmail message, in its thread.
+
+    The reply goes to the message's Reply-To addresses, or to its From when
+    it has no Reply-To. It carries In-Reply-To and References with the
+    message's Message-ID, so the recipient's mail app threads it too.
 
     Args:
         message_id: The message ID to reply to
         body: Reply body (plain text)
         attachments: Optional list of file paths to attach
+        to: Optional recipients in place of Reply-To / From. Use it for mail
+            from a mailing list or group, where From can be the list itself.
+        from_address: Optional send-as alias to reply from. It must be a
+            verified send-as address of the account, or Gmail sends from the
+            account's own address.
 
     Returns:
-        Dict with id, thread_id
+        Dict with id, thread_id, and with from_address also from (the From
+        header Gmail used)
     """
     import mimetypes
     from email import encoders
@@ -302,13 +363,27 @@ def gmail_reply(
 
     service = get_gmail_service()
 
-    original = gmail_read(message_id)
+    original = (
+        service.users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="metadata",
+            metadataHeaders=["Subject", "From", "Reply-To", "Message-ID", "References"],
+        )
+        .execute()
+    )
 
-    reply_to = original["from"]
-    if "<" in reply_to:
-        reply_to = reply_to.split("<")[1].rstrip(">")
+    recipients = to or ", ".join(
+        address
+        for _, address in getaddresses([_header(original, "Reply-To") or _header(original, "From")])
+        if address
+    )
+    if not recipients:
+        raise RuntimeError(f"Message {message_id} has no address to reply to")
 
-    subject = original["subject"]
+    subject = _header(original, "Subject")
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"
 
@@ -339,24 +414,23 @@ def gmail_reply(
     else:
         message = MIMEText(body)
 
-    message["to"] = reply_to
+    message["to"] = recipients
     message["subject"] = subject
-    message["In-Reply-To"] = message_id
-    message["References"] = message_id
+    # Threading headers take the RFC 822 Message-ID, never the Gmail id: a
+    # recipient's mail app knows only the former.
+    rfc822_id = _header(original, "Message-ID")
+    if rfc822_id:
+        message["In-Reply-To"] = rfc822_id
+        message["References"] = " ".join(
+            part for part in (_header(original, "References"), rfc822_id) if part
+        )
 
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-
-    result = (
-        service.users()
-        .messages()
-        .send(userId="me", body={"raw": raw, "threadId": original["thread_id"]})
-        .execute()
+    return _send_message(
+        service,
+        message,
+        thread_id=original.get("threadId", ""),
+        from_address=from_address,
     )
-
-    return {
-        "id": result.get("id", ""),
-        "thread_id": result.get("threadId", ""),
-    }
 
 
 # Calendar functions
@@ -3056,7 +3130,12 @@ class GSuiteClient:
         return gmail_read(message_id)
 
     def gmail_send(
-        self, to: str, subject: str, body: str, cc: str | None = None
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        cc: str | None = None,
+        from_address: str | None = None,
     ) -> dict:
         """Send an email.
 
@@ -3065,11 +3144,14 @@ class GSuiteClient:
             subject: Email subject
             body: Email body (plain text)
             cc: Optional CC recipients
+            from_address: Optional send-as alias to send from (must be a
+                verified send-as address of the account)
 
         Returns:
-            Dict with id, thread_id
+            Dict with id, thread_id, and with from_address also from (the
+            From header Gmail used)
         """
-        return gmail_send(to, subject, body, cc=cc)
+        return gmail_send(to, subject, body, cc=cc, from_address=from_address)
 
     def gmail_labels(self) -> list[dict]:
         """List Gmail labels.
@@ -3106,18 +3188,34 @@ class GSuiteClient:
         message_id: str,
         body: str,
         attachments: list[str] | None = None,
+        to: str | None = None,
+        from_address: str | None = None,
     ) -> dict:
-        """Reply to a Gmail message.
+        """Reply to a Gmail message, in its thread.
+
+        Goes to the message's Reply-To (or From), with In-Reply-To and
+        References set from its Message-ID.
 
         Args:
             message_id: The message ID to reply to
             body: Reply body (plain text)
             attachments: Optional list of file paths to attach
+            to: Optional recipients in place of Reply-To / From (for mail
+                from a group, where From can be the group itself)
+            from_address: Optional send-as alias to reply from (must be a
+                verified send-as address of the account)
 
         Returns:
-            Dict with id, thread_id
+            Dict with id, thread_id, and with from_address also from (the
+            From header Gmail used)
         """
-        return gmail_reply(message_id, body, attachments=attachments)
+        return gmail_reply(
+            message_id,
+            body,
+            attachments=attachments,
+            to=to,
+            from_address=from_address,
+        )
 
     # --- Calendar ---
 
