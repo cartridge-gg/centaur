@@ -804,3 +804,36 @@ def test_directory_json_takes_precedence_over_markdown(monkeypatch):
 
     assert result.exit_code == 0
     assert json.loads(result.stdout) == []
+
+
+def test_gmail_reply_passes_to_and_from_and_prints_the_sender(monkeypatch):
+    calls = []
+
+    def fake_reply(message_id, body, **kwargs):
+        calls.append((message_id, body, kwargs))
+        return {"id": "sent-1", "thread_id": "thread-1", "from": "support@example.com"}
+
+    monkeypatch.setattr(client, "gmail_reply", fake_reply)
+    result = runner.invoke(
+        app,
+        [
+            "gmail",
+            "reply",
+            "msg-1",
+            "Thanks",
+            "--to",
+            "pat@example.org",
+            "--from",
+            "support@example.com",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        (
+            "msg-1",
+            "Thanks",
+            {"attachments": None, "to": "pat@example.org", "from_address": "support@example.com"},
+        )
+    ]
+    assert "From: support@example.com" in result.stdout

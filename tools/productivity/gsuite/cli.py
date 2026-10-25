@@ -145,19 +145,25 @@ def gmail_send(
     subject: str = typer.Argument(..., help="Email subject"),
     body: str = typer.Argument(..., help="Email body"),
     cc: str = typer.Option(None, "--cc", help="CC recipients"),
+    from_address: str = typer.Option(
+        None, "--from", help="Send-as alias to send from (must be verified)"
+    ),
 ):
     """Send an email.
 
     Examples:
         gsuite gmail send "someone@example.com" "Hello" "Message body"
         gsuite gmail send "a@b.com" "Subject" "Body" --cc "c@d.com"
+        gsuite gmail send "a@b.com" "Subject" "Body" --from "team@example.com"
     """
     from .client import gmail_send as send
 
     try:
-        result = send(to, subject, body, cc=cc)
+        result = send(to, subject, body, cc=cc, from_address=from_address)
         console.print("[green]✓ Email sent[/]")
         console.print(f"[dim]ID: {result['id']}[/]")
+        if from_address:
+            console.print(f"[dim]From: {result.get('from') or result.get('from_error')}[/]")
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
@@ -232,20 +238,31 @@ def gmail_reply_cmd(
     message_id: str = typer.Argument(..., help="Message ID to reply to"),
     body: str = typer.Argument(..., help="Reply body"),
     attachments: list[str] = typer.Option(None, "--attach", "-a", help="File paths to attach"),
+    to: str = typer.Option(None, "--to", help="Recipients in place of Reply-To / From"),
+    from_address: str = typer.Option(
+        None, "--from", help="Send-as alias to reply from (must be verified)"
+    ),
 ):
-    """Reply to a Gmail message with optional attachments.
+    """Reply to a Gmail message, in its thread, with optional attachments.
+
+    The reply goes to the message's Reply-To, or to its From.
 
     Examples:
         gsuite gmail reply "18d1234567890abc" "Thanks for the update!"
         gsuite gmail reply "id" "See attached" -a "/path/to/file.pdf"
         gsuite gmail reply "id" "Files attached" -a file1.pdf -a file2.png
+        gsuite gmail reply "id" "Thanks" --to "player@example.com" --from "support@example.com"
     """
     from .client import gmail_reply
 
     try:
-        result = gmail_reply(message_id, body, attachments=attachments)
+        result = gmail_reply(
+            message_id, body, attachments=attachments, to=to, from_address=from_address
+        )
         console.print("[green]✓ Reply sent[/]")
         console.print(f"[dim]ID: {result['id']}[/]")
+        if from_address:
+            console.print(f"[dim]From: {result.get('from') or result.get('from_error')}[/]")
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
