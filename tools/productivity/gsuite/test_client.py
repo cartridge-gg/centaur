@@ -318,6 +318,199 @@ def test_gmail_read_returns_plain_html_and_raw_content(monkeypatch):
     ]
 
 
+class _FakeGmailSendApi:
+    """Gmail ``users().messages()`` for send and reply: ``get`` serves the
+    metadata headers of stored messages, ``send`` records the request and
+    stores the sent message with the From that Gmail would use."""
+
+    def __init__(self, messages: dict[str, dict], *, sent_from: str = "", lookup_error=None):
+        self.messages = messages
+        self.sent_from = sent_from
+        self.lookup_error = lookup_error
+        self.send_calls: list[dict] = []
+        self.get_calls: list[dict] = []
+
+    def get(self, **kwargs):
+        self.get_calls.append(kwargs)
+        assert kwargs["format"] == "metadata"
+        if kwargs["id"].startswith("sent-") and self.lookup_error:
+            raise self.lookup_error
+        return _CreateRequest(self.messages[kwargs["id"]])
+
+    def send(self, **kwargs):
+        self.send_calls.append(kwargs)
+        sent_id = f"sent-{len(self.send_calls)}"
+        self.messages[sent_id] = {
+            "id": sent_id,
+            "payload": {"headers": [{"name": "From", "value": self.sent_from}]},
+        }
+        return _CreateRequest({"id": sent_id, "threadId": kwargs["body"].get("threadId", "new")})
+
+
+def _gmail_send_service(monkeypatch, api: _FakeGmailSendApi) -> _FakeGmailSendApi:
+    users = Mock()
+    users.messages.return_value = api
+    service = Mock()
+    service.users.return_value = users
+    monkeypatch.setattr(client, "get_gmail_service", lambda: service)
+    return api
+
+
+def _sent_mime(api: _FakeGmailSendApi, index: int = 0):
+    import email
+
+    raw = api.send_calls[index]["body"]["raw"]
+    return email.message_from_bytes(base64.urlsafe_b64decode(raw))
+
+
+def _group_message(**headers: str) -> dict:
+    values = {
+        "Subject": "Can't verify my account",
+        "From": "'Pat' via support <support@example.com>",
+        "Reply-To": "Pat <pat@example.net>",
+        "Message-ID": "<abc123@mail.example.net>",
+        **headers,
+    }
+    return {
+        "id": "msg-1",
+        "threadId": "thread-1",
+        "payload": {
+            "headers": [{"name": name, "value": value} for name, value in values.items() if value]
+        },
+    }
+
+
+def test_gmail_reply_answers_reply_to_and_threads_on_the_message_id(monkeypatch):
+    api = _gmail_send_service(monkeypatch, _FakeGmailSendApi({"msg-1": _group_message()}))
+
+    result = client.gmail_reply("msg-1", "We got your message.")
+
+    sent = _sent_mime(api)
+    assert sent["To"] == "pat@example.net"
+    assert sent["Subject"] == "Re: Can't verify my account"
+    assert sent["In-Reply-To"] == "<abc123@mail.example.net>"
+    assert sent["References"] == "<abc123@mail.example.net>"
+    assert sent["From"] is None
+    assert sent.get_payload() == "We got your message."
+    assert api.send_calls[0]["body"]["threadId"] == "thread-1"
+    assert result == {"id": "sent-1", "thread_id": "thread-1"}
+
+
+def test_gmail_reply_falls_back_to_from_and_extends_references(monkeypatch):
+    message = _group_message(
+        **{
+            "Reply-To": "",
+            "From": "Pat <pat@example.net>",
+            "Subject": "Re: Can't verify my account",
+            "References": "<root@mail.example.net>",
+        }
+    )
+    api = _gmail_send_service(monkeypatch, _FakeGmailSendApi({"msg-1": message}))
+
+    client.gmail_reply("msg-1", "Thanks")
+
+    sent = _sent_mime(api)
+    assert sent["To"] == "pat@example.net"
+    assert sent["Subject"] == "Re: Can't verify my account"
+    assert sent["References"] == "<root@mail.example.net> <abc123@mail.example.net>"
+
+
+def test_gmail_reply_without_message_id_sets_no_threading_headers(monkeypatch):
+    api = _gmail_send_service(
+        monkeypatch, _FakeGmailSendApi({"msg-1": _group_message(**{"Message-ID": ""})})
+    )
+
+    client.gmail_reply("msg-1", "Thanks")
+
+    sent = _sent_mime(api)
+    assert sent["In-Reply-To"] is None
+    assert sent["References"] is None
+    assert api.send_calls[0]["body"]["threadId"] == "thread-1"
+
+
+def test_gmail_reply_sends_to_and_from_the_given_addresses(monkeypatch):
+    api = _gmail_send_service(
+        monkeypatch,
+        _FakeGmailSendApi({"msg-1": _group_message()}, sent_from="support@example.com"),
+    )
+
+    result = client.gmail_reply(
+        "msg-1", "Thanks", to="pat@example.org", from_address="support@example.com"
+    )
+
+    sent = _sent_mime(api)
+    assert sent["To"] == "pat@example.org"
+    assert sent["From"] == "support@example.com"
+    assert result == {"id": "sent-1", "thread_id": "thread-1", "from": "support@example.com"}
+    assert api.get_calls[-1] == {
+        "userId": "me",
+        "id": "sent-1",
+        "format": "metadata",
+        "metadataHeaders": ["From"],
+    }
+
+
+def test_gmail_reply_rejects_a_message_without_an_address(monkeypatch):
+    message = _group_message(**{"Reply-To": "", "From": ""})
+    api = _gmail_send_service(monkeypatch, _FakeGmailSendApi({"msg-1": message}))
+
+    with pytest.raises(RuntimeError, match="no address to reply to"):
+        client.gmail_reply("msg-1", "Thanks")
+    assert api.send_calls == []
+
+
+def test_gmail_send_reports_the_from_gmail_used(monkeypatch):
+    # Gmail sends from the account's own address when the alias is not a
+    # verified send-as address; the result must show it.
+    api = _gmail_send_service(monkeypatch, _FakeGmailSendApi({}, sent_from="me@example.com"))
+
+    result = client.gmail_send("pat@example.net", "Hi", "Body", from_address="team@example.com")
+
+    sent = _sent_mime(api)
+    assert sent["From"] == "team@example.com"
+    assert "threadId" not in api.send_calls[0]["body"]
+    assert result["from"] == "me@example.com"
+
+
+def test_gmail_send_without_from_address_skips_the_lookup(monkeypatch):
+    api = _gmail_send_service(monkeypatch, _FakeGmailSendApi({}))
+
+    result = client.gmail_send("pat@example.net", "Hi", "Body")
+
+    assert _sent_mime(api)["From"] is None
+    assert api.get_calls == []
+    assert result == {"id": "sent-1", "thread_id": "new"}
+
+
+def test_gmail_send_lookup_failure_does_not_raise_after_sending(monkeypatch):
+    api = _gmail_send_service(
+        monkeypatch, _FakeGmailSendApi({}, lookup_error=RuntimeError("insufficient scope"))
+    )
+
+    result = client.gmail_send("pat@example.net", "Hi", "Body", from_address="team@example.com")
+
+    assert len(api.send_calls) == 1
+    assert result == {"id": "sent-1", "thread_id": "new", "from_error": "insufficient scope"}
+
+
+def test_gsuite_client_passes_reply_addresses_through(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        client, "gmail_reply", lambda *args, **kwargs: calls.append((args, kwargs)) or {}
+    )
+
+    client.GSuiteClient().gmail_reply(
+        "msg-1", "Thanks", to="pat@example.org", from_address="support@example.com"
+    )
+
+    assert calls == [
+        (
+            ("msg-1", "Thanks"),
+            {"attachments": None, "to": "pat@example.org", "from_address": "support@example.com"},
+        )
+    ]
+
+
 def test_drive_list_searches_name_by_default(monkeypatch):
     fake_service = _FakeDriveService()
     monkeypatch.setattr(client, "get_drive_service", lambda: fake_service)
