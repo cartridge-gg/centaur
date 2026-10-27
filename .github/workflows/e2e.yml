@@ -29,7 +29,7 @@ permissions:
 jobs:
   e2e:
     name: ${{ matrix.name }}
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false

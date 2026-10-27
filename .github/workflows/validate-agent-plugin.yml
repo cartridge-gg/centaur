@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

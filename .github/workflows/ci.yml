@@ -17,7 +17,7 @@ permissions:
 jobs:
   ci_changes:
     name: Detect CI changes
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     outputs:
       migration_order: ${{ steps.filter.outputs.migration_order }}
       rust_checks: ${{ steps.filter.outputs.rust_checks }}
@@ -215,7 +215,7 @@ jobs:
 
   migration-order:
     name: Migration order
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.migration_order == 'true'
     steps:
@@ -229,7 +229,7 @@ jobs:
 
   rust-checks:
     name: Rust fmt and clippy
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_checks == 'true'
     steps:
@@ -254,7 +254,7 @@ jobs:
 
   harness-server-checks:
     name: Harness server tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.harness_server_checks == 'true'
     steps:
@@ -279,7 +279,7 @@ jobs:
 
   harness-server-conformance:
     name: Harness server Codex protocol conformance
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.harness_server_checks == 'true'
     steps:
@@ -311,7 +311,7 @@ jobs:
 
   company-context-checks:
     name: Company context tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.company_context_checks == 'true'
     steps:
@@ -335,7 +335,7 @@ jobs:
 
   proxy-sync-checks:
     name: Proxy sync tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.proxy_sync_checks == 'true'
     steps:
@@ -386,7 +386,7 @@ jobs:
 
   token-broker-checks:
     name: Token broker tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.token_broker_checks == 'true'
     steps:
@@ -442,7 +442,7 @@ jobs:
 
   rust-api:
     name: Rust API tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -495,7 +495,7 @@ jobs:
 
   rust-api-postgres:
     name: Rust API migrations on PostgreSQL
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -527,7 +527,7 @@ jobs:
 
   sandbox-tests:
     name: Sandbox Python tests
-    runs-on: depot-ubuntu-24.04-4
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.sandbox_tests == 'true'
     steps:
@@ -550,7 +550,7 @@ jobs:
 
   workflow-python-tests:
     name: Workflow Python tests
-    runs-on: depot-ubuntu-24.04-4
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.workflow_python_tests == 'true'
     steps:
@@ -582,7 +582,7 @@ jobs:
 
   tool-tests:
     name: Tool tests
-    runs-on: depot-ubuntu-24.04-4
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.tool_tests == 'true'
     steps:
@@ -669,7 +669,7 @@ jobs:
 
   linearbot-tests:
     name: Linearbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -799,7 +799,7 @@ jobs:
 
   ci-success:
     name: CI success
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     if: always()
     needs:
       - ci_changes
