@@ -15,7 +15,8 @@
 # e2e/infra/kind.yaml.
 #
 # Images are built from the working tree and loaded into kind by default. Set
-# CENTAUR_E2E_IMAGE_TAG (e.g. main or sha-abc1234) to pull published images.
+# CENTAUR_E2E_IMAGE_TAG (e.g. main or sha-abc1234) to pull published images
+# from CENTAUR_E2E_IMAGE_NAMESPACE (default ghcr.io/paradigmxyz/centaur).
 #
 # CENTAUR_E2E_AUTH_MODE picks how the harnesses authenticate, for both Codex
 # and Claude Code: api_key (default) or access_token, the ChatGPT and Claude.ai
@@ -30,6 +31,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CLUSTER="${CENTAUR_E2E_CLUSTER:-centaur-e2e}"
+IMAGE_NAMESPACE="${CENTAUR_E2E_IMAGE_NAMESPACE:-ghcr.io/paradigmxyz/centaur}"
 RELEASE=centaur # contrib/scripts/bootstrap-k8s-secrets.sh assumes this name
 NAMESPACE=centaur
 SLACK_NAMESPACE=centaur-e2e-slack
@@ -94,13 +96,13 @@ up() {
     service="${entry%%:*}" key="${entry#*:}"
     if [[ -n "${CENTAUR_E2E_IMAGE_TAG:-}" ]]; then
       image_args+=(
-        --set "${key}.image.repository=ghcr.io/paradigmxyz/centaur/centaur-${service}"
+        --set "${key}.image.repository=${IMAGE_NAMESPACE}/centaur-${service}"
         --set "${key}.image.tag=${CENTAUR_E2E_IMAGE_TAG}"
       )
       # Pull the multi-GB agent image now, not inside a sandbox's ready timeout.
       if [[ "$service" == agent ]]; then
         docker exec "${CLUSTER}-control-plane" crictl pull \
-          "ghcr.io/paradigmxyz/centaur/centaur-agent:${CENTAUR_E2E_IMAGE_TAG}"
+          "${IMAGE_NAMESPACE}/centaur-agent:${CENTAUR_E2E_IMAGE_TAG}"
       fi
     else
       just build-one "$service"

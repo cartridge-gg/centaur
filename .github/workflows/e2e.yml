@@ -44,6 +44,8 @@ jobs:
     env:
       HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       IMAGE_TAG: ${{ inputs.image_tag }}
+      # This workflow's own repository publishes the images it tests.
+      CENTAUR_E2E_IMAGE_NAMESPACE: ghcr.io/${{ github.repository }}
       CENTAUR_E2E_AUTH_MODE: ${{ matrix.auth-mode }}
       CENTAUR_E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
       E2E_TESTS: ${{ matrix.tests }}
