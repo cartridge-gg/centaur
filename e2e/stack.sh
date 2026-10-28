@@ -123,9 +123,10 @@ up() {
   SLACKBOT_API_KEY="$(openssl rand -hex 32)" \
   OP_SERVICE_ACCOUNT_TOKEN=unused OP_VAULT=unused \
     contrib/scripts/bootstrap-k8s-secrets.sh --namespace "$NAMESPACE"
-  # iron-proxy's env secret source resolves the provider keys from here.
+  # iron-proxy's env secret source resolves the provider keys from here. The
+  # console requires the GitHub App keys; empty values skip its seed migration.
   kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p \
-    "{\"stringData\":{\"OPENAI_API_KEY\":\"$OPENAI_TEST_KEY\",\"ANTHROPIC_API_KEY\":\"$ANTHROPIC_TEST_KEY\",\"OPENAI_CODEX_ACCOUNT_ID\":\"$CHATGPT_ACCOUNT_ID\",\"CENTAUR_APIRS_ADMIN_API_KEY\":\"$API_ADMIN_KEY\"}}" > /dev/null
+    "{\"stringData\":{\"OPENAI_API_KEY\":\"$OPENAI_TEST_KEY\",\"ANTHROPIC_API_KEY\":\"$ANTHROPIC_TEST_KEY\",\"OPENAI_CODEX_ACCOUNT_ID\":\"$CHATGPT_ACCOUNT_ID\",\"CENTAUR_APIRS_ADMIN_API_KEY\":\"$API_ADMIN_KEY\",\"GITHUB_APP_ID\":\"\",\"GITHUB_APP_INSTALLATION_ID\":\"\",\"GITHUB_APP_PRIVATE_KEY_B64\":\"\"}}" > /dev/null
   # iron-proxy pods mount the release CA at this path; trusting it lets them
   # verify the model server, whose certificate the same CA signs below.
   kubectl -n "$NAMESPACE" create secret generic centaur-e2e-iron-proxy-env \
