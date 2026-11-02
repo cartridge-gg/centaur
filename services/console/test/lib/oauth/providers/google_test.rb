@@ -75,6 +75,17 @@ module Oauth
         assert_equal "https://oauth2.googleapis.com/token", strategy.token_endpoint
         assert_equal({ "access_type" => "offline", "prompt" => "consent" }, strategy.extra_authorization_params)
       end
+
+      test "api hosts are the Workspace hosts, never a googleapis wildcard or a Cloud API host" do
+        hosts = strategy.api_hosts
+        assert_includes hosts, "gmail.googleapis.com"
+        assert_includes hosts, "www.googleapis.com" # Drive v3 lives here
+        assert hosts.none? { |host| host.include?("*") }, "wildcard in #{hosts.inspect}"
+        %w[logging.googleapis.com monitoring.googleapis.com connectgateway.googleapis.com
+           storage.googleapis.com oauth2.googleapis.com accounts.google.com].each do |cloud_host|
+          assert_not_includes hosts, cloud_host
+        end
+      end
     end
   end
 end
