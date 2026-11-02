@@ -13,10 +13,31 @@ module Oauth
       # carries an id_token identifying the Google account.
       IDENTITY_SCOPES = %w[openid https://www.googleapis.com/auth/userinfo.email].freeze
       # Hosts a minted access token may be sent to, as request-rule host patterns.
-      # Every Google API is served under *.googleapis.com; accounts.google.com is
-      # auth-only and intentionally excluded. Drives the rules on the static secret
-      # auto-created alongside a minted credential.
-      API_HOSTS = %w[*.googleapis.com].freeze
+      # Drives the rules on the static secret auto-created alongside a minted
+      # credential. These are the Workspace API hosts: the hosts the gsuite tool
+      # calls (tools/productivity/gsuite/pyproject.toml), plus drive.googleapis.com.
+      #
+      # Not `*.googleapis.com`. Google Cloud APIs (logging, monitoring,
+      # connectgateway, storage, ...) are served there too, and they need the
+      # cloud-platform token that a gcp_auth secret mints. A consent token carries
+      # only the app's Workspace scopes. With a wildcard rule, a principal that
+      # holds both credentials sends the consent token to Cloud APIs and gets
+      # 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT, or loses the gcp_auth credential to
+      # conflict resolution when the consent token's grant has higher priority.
+      # An operator who needs another Google API adds its host to the wrapper
+      # secret's rules. accounts.google.com is auth-only and intentionally excluded.
+      API_HOSTS = %w[
+        gmail.googleapis.com
+        calendar.googleapis.com
+        people.googleapis.com
+        www.googleapis.com
+        drive.googleapis.com
+        docs.googleapis.com
+        sheets.googleapis.com
+        slides.googleapis.com
+        analyticsdata.googleapis.com
+        docs.google.com
+      ].freeze
       # The issuers Google stamps into the id_token; both forms are accepted per
       # Google's OIDC discovery document.
       VALID_ISSUERS = %w[https://accounts.google.com accounts.google.com].freeze

@@ -833,7 +833,8 @@ module Oauth
       assert_equal({ "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }, secret.inject_config)
       assert_equal "token_broker", secret.source.source_type
       assert_equal cred.oid, secret.source.config["credential_id"]
-      assert_equal [ "*.googleapis.com" ], secret.rules.map(&:host)
+      assert_equal Oauth::Providers::Google::API_HOSTS, secret.rules.map(&:host)
+      assert_not_includes secret.rules.map(&:host), "*.googleapis.com"
       # The source resolves the credential's live token at sync time.
       assert_equal({ "type" => "control_plane", "value" => "AT" }, secret.source.to_proxy_source)
     end
