@@ -1720,6 +1720,61 @@ describe('slackbotv2', () => {
     expect(await threadText(mention.ts)).toContain('Done thinking.')
   })
 
+  it('posts a card fence from the answer as a native Slack card after the streamed text', async () => {
+    codexApi.autoRespond = false
+    const spec = {
+      root: 'card',
+      elements: {
+        card: { type: 'Card', props: { title: 'Weekly installs' }, children: ['table'] },
+        table: {
+          type: 'Table',
+          props: { headers: ['Day', 'Installs'], rows: [['Mon', 600], ['Tue', 684]] },
+          children: []
+        }
+      }
+    }
+
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> show installs`)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-card-fence',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          text: `<@${BOT_USER_ID}> show installs`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    codexApi.emitOutputLines(
+      threadKey(mention.ts),
+      sampleCodexOutputLines(`Installs are up.\n\n\`\`\`card\n${JSON.stringify(spec)}\n\`\`\``)
+    )
+    await Promise.all(waits)
+
+    const streamed = JSON.stringify(
+      slackApi.calls.filter(call => call.method.endsWith('Stream')).map(call => call.body)
+    )
+    expect(streamed).toContain('Installs are up.')
+    expect(streamed).not.toContain('Weekly installs')
+    const replies = (await slack.conversations.replies({ channel: CHANNEL_ID, ts: mention.ts })).messages ?? []
+    const card = replies.at(-1)!
+    expect(replies).toHaveLength(3)
+    expect(card.text).not.toContain('```card')
+    expect(card.blocks).toMatchObject([
+      { type: 'header', text: { text: 'Weekly installs' } },
+      { rows: [[{ text: 'Day' }, { text: 'Installs' }], [{ text: 'Mon' }, { text: '600' }], [{ text: 'Tue' }, { text: '684' }]] }
+    ])
+  })
+
   it('auto-disables steering reactions when reactions:write is missing', async () => {
     const logs: CapturedLog[] = []
     bot = createTestBot({
