@@ -11,3 +11,9 @@ patchedDependencies:
   '@chat-adapter/discord@4.31.0': patches/@chat-adapter__discord@4.31.0.patch
   '@chat-adapter/slack@4.40.0': patches/@chat-adapter__slack@4.40.0.patch
   '@chat-adapter/state-pg@4.31.0': patches/@chat-adapter__state-pg@4.31.0.patch
+
+peerDependencyRules:
+  allowedVersions:
+    # @json-render/chat only builds plain Chat SDK card objects; the pinned
+    # Slack adapter patch keeps chat at 4.40, which renders every element it emits.
+    '@json-render/chat>chat': '4.40.0'
