@@ -30,6 +30,12 @@ import {
   type ChatSDKStreamChunk,
   type RendererEvent
 } from '@centaur/rendering'
+import {
+  CardFenceExtractor,
+  extractCardFences,
+  postCardSpecs,
+  withheldCardFences
+} from './cards'
 import { conflateChatSdkStream } from './conflate'
 import { CitationTextFilter, stripUnresolvedCitations } from './citation-text'
 import { triggerFileEventWorkflow } from './file-event-trigger'
@@ -1995,7 +2001,7 @@ async function renderExecutionAttempt(
           threadId: input.threadId
         },
         trace,
-        { replaceMessageId: streamResult.messageId }
+        { replaceMessageId: streamResult.messageId, postedCardSpecs: streamResult.cardSpecs ?? [] }
       )
       if (reconciled) {
         divergenceReconciled = true
@@ -2204,7 +2210,7 @@ async function renderFallbackFinalAnswer(
   options: SlackbotV2Options,
   source: { afterEventId: number; executionId?: string; threadId: string },
   trace?: SlackbotV2Trace,
-  replacement?: { replaceMessageId: string }
+  replacement?: { replaceMessageId: string; postedCardSpecs?: string[] }
 ): Promise<{ lastEventId: number } | null> {
   const startedAtMs = nowMs()
   let outcome = 'error'
@@ -2252,20 +2258,30 @@ async function renderFallbackFinalAnswer(
       return null
     }
     const text = fallback.textOrDefault()
+    const answer = extractCardFences(text)
     const fallbackMarkdown = truncateSlackText(
-      text,
+      answer.markdown.trim() || (answer.specs.length ? '' : text),
       SLACK_FALLBACK_MARKDOWN_MAX_CHARS,
       'Slack final answer'
     )
     if (replacement) {
-      await thread.adapter.editMessage(
-        thread.id,
-        replacement.replaceMessageId,
-        { markdown: fallbackMarkdown }
-      )
-    } else {
+      if (fallbackMarkdown) {
+        await thread.adapter.editMessage(
+          thread.id,
+          replacement.replaceMessageId,
+          { markdown: fallbackMarkdown }
+        )
+      }
+    } else if (fallbackMarkdown) {
       await thread.post({ markdown: fallbackMarkdown })
     }
+    const posted = new Set(replacement?.postedCardSpecs ?? [])
+    await postAnswerCards(
+      thread,
+      answer.specs.filter(spec => !posted.has(spec)),
+      options,
+      trace
+    )
     traceLog(options, 'slackbotv2_render_fallback_complete', trace, {
       chars: text.length,
       last_event_id: lastEventId,
@@ -2622,7 +2638,7 @@ async function recoverRenderObligation(
           threadId
         },
         trace,
-        { replaceMessageId: streamResult.messageId }
+        { replaceMessageId: streamResult.messageId, postedCardSpecs: streamResult.cardSpecs ?? [] }
       )
       if (reconciled) {
         divergenceReconciled = true
@@ -2840,6 +2856,32 @@ function renewRenderLease(
   }
 }
 
+type RenderedExecutionStream = { diverged: boolean; messageId?: string; cardSpecs?: string[] }
+
+/**
+ * Posts the answer's ```card specs as native cards after the streamed text.
+ * Failures are logged and swallowed: the text answer is already delivered, and
+ * throwing here would make the caller post the whole answer a second time.
+ */
+async function postAnswerCards(
+  thread: Thread,
+  specs: string[],
+  options: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): Promise<void> {
+  if (!specs.length) return
+  try {
+    const { posted, rejected } = await postCardSpecs(message => thread.post(message), specs)
+    traceLog(options, 'slackbotv2_render_cards_posted', trace, {
+      posted,
+      rejected: rejected.length,
+      ...(rejected.length ? { rejected_issues: rejected.flat().slice(0, 10).join('; ') } : {})
+    })
+  } catch (error) {
+    traceLog(options, 'slackbotv2_render_cards_failed', trace, { error: errorMessage(error) })
+  }
+}
+
 async function renderExecutionStream(
   thread: Thread,
   stream: AsyncIterable<SlackbotV2RendererSource>,
@@ -2848,7 +2890,7 @@ async function renderExecutionStream(
   trace?: SlackbotV2Trace,
   assistantStatusVisible = false,
   responseContextBlock?: SlackContextBlock
-): Promise<{ diverged: boolean; messageId?: string }> {
+): Promise<RenderedExecutionStream> {
   const promptText = slackMessagePromptText(message)
   if (isPlainTextOnlyRequest(promptText)) {
     await renderPlainTextExecutionStream(
@@ -2873,22 +2915,29 @@ async function renderExecutionStream(
   })
   const capture = { diverged: false }
   let visibleStream: FirstChunkStream | null = null
+  const cards = new CardFenceExtractor()
   try {
     const taskDisplayMode = slackStreamTaskDisplayMode(options)
     visibleStream = await streamAfterFirstChunk(
       conflateChatSdkStream(
         slackSafeChatSdkStream(
           slackVisibleChatSdkStream(
-            harnessToChatSdkStream(
-              restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace),
-              rendererOptions(thread, options, capture, trace, statusTracker)
+            withheldCardFences(
+              harnessToChatSdkStream(
+                restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace),
+                rendererOptions(thread, options, capture, trace, statusTracker)
+              ),
+              cards
             ),
             taskDisplayMode
           )
         )
       )
     )
-    if (!visibleStream) return { diverged: false }
+    if (!visibleStream) {
+      await postAnswerCards(thread, cards.cardSpecs(), options, trace)
+      return { diverged: false, cardSpecs: cards.cardSpecs() }
+    }
     // Stream via the adapter (as renderRecoveredExecutionStream does) so the
     // posted message id is available for divergence reconciliation. For Slack
     // this matches thread.post(StreamingPlan): updateIntervalMs is a no-op
@@ -2902,7 +2951,8 @@ async function renderExecutionStream(
       // message via chat.stopStream.
       ...(responseContextBlock ? { stopBlocks: [responseContextBlock] } : {})
     }) ?? await thread.post(visibleStream)
-    return { diverged: capture.diverged, messageId: sent?.id }
+    await postAnswerCards(thread, cards.cardSpecs(), options, trace)
+    return { diverged: capture.diverged, messageId: sent?.id, cardSpecs: cards.cardSpecs() }
   } finally {
     // Stop the conflation pump and SSE even if the adapter abandoned the
     // stream without draining it, then clear the status this render owns.
@@ -2917,7 +2967,7 @@ async function renderRecoveredExecutionStream(
   message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
   trace?: SlackbotV2Trace
-): Promise<{ diverged: boolean; messageId?: string }> {
+): Promise<RenderedExecutionStream> {
   const promptText = slackMessagePromptText(message)
   if (isPlainTextOnlyRequest(promptText)) {
     await renderPlainTextExecutionStream(thread, stream, message, options, trace)
@@ -2932,22 +2982,29 @@ async function renderRecoveredExecutionStream(
   })
   const capture = { diverged: false }
   let visibleStream: FirstChunkStream | null = null
+  const cards = new CardFenceExtractor()
   try {
     const taskDisplayMode = slackStreamTaskDisplayMode(options)
     visibleStream = await streamAfterFirstChunk(
       conflateChatSdkStream(
         slackSafeChatSdkStream(
           slackVisibleChatSdkStream(
-            harnessToChatSdkStream(
-              restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace),
-              rendererOptions(thread, options, capture, trace, statusTracker)
+            withheldCardFences(
+              harnessToChatSdkStream(
+                restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace),
+                rendererOptions(thread, options, capture, trace, statusTracker)
+              ),
+              cards
             ),
             taskDisplayMode
           )
         )
       )
     )
-    if (!visibleStream) return { diverged: false }
+    if (!visibleStream) {
+      await postAnswerCards(thread, cards.cardSpecs(), options, trace)
+      return { diverged: false, cardSpecs: cards.cardSpecs() }
+    }
     const sent = await thread.adapter.stream!(
       thread.id,
       visibleStream,
@@ -2957,7 +3014,8 @@ async function renderRecoveredExecutionStream(
         ...(taskDisplayMode === 'none' ? {} : { taskDisplayMode })
       }
     ) ?? await thread.post(visibleStream)
-    return { diverged: capture.diverged, messageId: sent?.id }
+    await postAnswerCards(thread, cards.cardSpecs(), options, trace)
+    return { diverged: capture.diverged, messageId: sent?.id, cardSpecs: cards.cardSpecs() }
   } finally {
     // Stop the conflation pump and SSE even if the adapter abandoned the
     // stream without draining it, then clear the status this render owns.

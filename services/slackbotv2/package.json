@@ -14,9 +14,11 @@
     "@centaur/rendering": "workspace:*",
     "@chat-adapter/slack": "4.40.0",
     "@chat-adapter/state-pg": "4.40.0",
+    "@json-render/chat": "0.22.0",
     "chat": "4.40.0",
     "hono": "^4.13.13",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@chat-adapter/state-memory": "4.40.0",
