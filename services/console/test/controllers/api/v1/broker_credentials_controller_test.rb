@@ -199,9 +199,9 @@ module Api
         created = BrokerCredential.find_by_oid(data["id"])
         assert_equal private_key, created.client_secret
         # A freshly-created github_app credential must be due for its first mint.
-        # next_attempt_at is left nil on create here, which the refreshable scope
-        # treats as immediately due (next_attempt_at IS NULL).
-        assert BrokerCredential.refreshable.exists?(id: created.id)
+        # The Rust broker selects live credentials with no next_attempt_at immediately.
+        assert_nil created.next_attempt_at
+        assert_not created.dead?
       end
 
       test "create rejects a missing client_id" do

@@ -18,6 +18,14 @@ class BrokerCredentialTest < ActiveSupport::TestCase
 
   # --- validations ----------------------------------------------------------
 
+  test "github_app requires an encrypted private key but no refresh token" do
+    credential = build_credential(grant: "github_app", refresh_token: nil)
+    assert credential.valid?
+    credential.client_secret = nil
+    assert_not credential.valid?
+    assert_includes credential.errors[:client_secret], "can't be blank for the GitHub App broker grant"
+  end
+
   test "valid with a client_id" do
     assert build_credential.valid?
   end

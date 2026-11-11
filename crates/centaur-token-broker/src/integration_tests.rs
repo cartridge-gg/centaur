@@ -763,3 +763,115 @@ async fn due_credentials_follow_the_refreshable_scope() {
     let due: Vec<bool> = credentials.iter().map(|id| due.contains(id)).collect();
     assert_eq!(due, [true, true, false, false, false]);
 }
+
+#[tokio::test]
+async fn github_app_mints_without_sending_private_key_or_oauth_fields() {
+    use crate::grants::{self, Credential, Outcome};
+    let expires_at = (Utc::now() + TimeDelta::hours(1)).to_rfc3339();
+    let (url, endpoint) = Endpoint::start(&[(
+        201,
+        json!({"token": "installation-token", "expires_at": expires_at}),
+    )])
+    .await;
+    let credential = Credential {
+        oid: "bcr_test".into(),
+        grant: "github_app".into(),
+        token_endpoint: url,
+        provider: None,
+        client_id: Some("123".into()),
+        client_secret: Some(include_str!("../testdata/github-app-test-private.pem").into()),
+        refresh_token: Some("stale-refresh-token".into()),
+        username: None,
+        password: None,
+        api_key: None,
+        token_endpoint_headers: vec![("Authorization".into(), "wrong".into())],
+        scopes: vec!["ignored".into()],
+        resource: None,
+        timeout: std::time::Duration::from_secs(5),
+    };
+    let outcome = grants::refresh(&credential, &TokenClient::new().unwrap())
+        .await
+        .unwrap();
+    let Outcome::Refreshed {
+        token,
+        clear_refresh_token,
+    } = outcome
+    else {
+        panic!("expected a token")
+    };
+    assert_eq!(token.access_token, "installation-token");
+    assert!(within(token.expires_in, 3600));
+    assert!(clear_refresh_token);
+    let requests = endpoint.requests.lock().unwrap();
+    let request = &requests[0];
+    assert!(request.body.is_empty());
+    assert_eq!(
+        request.header("accept"),
+        Some("application/vnd.github+json")
+    );
+    assert_eq!(request.header("x-github-api-version"), Some("2022-11-28"));
+    let jwt = request
+        .header("authorization")
+        .unwrap()
+        .strip_prefix("Bearer ")
+        .unwrap();
+    let claims = jsonwebtoken::decode::<Value>(
+        jwt,
+        &jsonwebtoken::DecodingKey::from_rsa_pem(include_bytes!(
+            "../testdata/github-app-test-public.pem"
+        ))
+        .unwrap(),
+        &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256),
+    )
+    .unwrap()
+    .claims;
+    assert_eq!(claims["iss"], "123");
+}
+
+#[tokio::test]
+async fn github_app_is_due_and_refreshes_encrypted_tokens_without_a_refresh_token() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let expires_at = (Utc::now() + TimeDelta::hours(1)).to_rfc3339();
+    let fixture = fixture![(
+        201,
+        json!({"token": "installation-token", "expires_at": expires_at})
+    )];
+    let key = STANDARD.encode(include_str!("../testdata/github-app-test-private.pem"));
+    let id = fixture
+        .credential("github_app", &[("client_secret", &key)])
+        .await;
+    assert!(
+        store::due_credential_ids(&fixture.pool, Utc::now().naive_utc())
+            .await
+            .unwrap()
+            .contains(&id)
+    );
+    let [direct, member] = fixture.grantees(id).await;
+    let stored = fixture.refresh(id).await;
+    assert_eq!(stored.access_token.as_deref(), Some("installation-token"));
+    assert_eq!(stored.refresh_token, None);
+    assert!(within(stored.expires_in, 3600));
+    assert!(!stored.dead);
+    assert_eq!(stored.failure_count, 0);
+    assert!(
+        stored
+            .next_attempt_in
+            .is_some_and(|seconds| seconds > 0 && seconds < 3600)
+    );
+    assert!(
+        !store::due_credential_ids(&fixture.pool, Utc::now().naive_utc())
+            .await
+            .unwrap()
+            .contains(&id)
+    );
+    // Rotation follows the existing encrypted persistence and proxy invalidation path.
+    for principal in [direct, member] {
+        let version: i64 =
+            sqlx::query_scalar("SELECT sync_config_cache_version FROM principals WHERE id = $1")
+                .bind(principal)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert!(version > 0);
+    }
+}

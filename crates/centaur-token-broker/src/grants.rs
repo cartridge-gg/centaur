@@ -8,7 +8,7 @@ use serde::Deserialize;
 use tracing::warn;
 use url::{Url, form_urlencoded::byte_serialize};
 
-use crate::client::{RefreshError, TokenClient, TokenRequest, TokenResponse};
+use crate::client::{RefreshError, TokenClient, TokenProtocol, TokenRequest, TokenResponse};
 
 /// A locked credential with its secrets decrypted. Flow-minted credentials
 /// carry their OAuth app's provider and client credentials.
@@ -101,6 +101,7 @@ pub(crate) async fn refresh(
     client: &TokenClient,
 ) -> Result<Outcome, RefreshError> {
     match credential.grant.as_str() {
+        "github_app" => refresh_github_app(credential, client).await,
         "client_credentials" => {
             required(&credential.client_secret, "client_secret")?;
             let form = oauth_form(credential, "client_credentials", vec![])?;
@@ -172,6 +173,63 @@ pub(crate) async fn refresh(
             refreshed(post(credential, client, url, form, false).await?)
         }
     }
+}
+
+/// The existing credential contract stores the App ID in client_id and a PEM
+/// (or base64-encoded PEM) RSA key in the encrypted client_secret column.
+fn github_app_jwt(credential: &Credential, now: i64) -> Result<String, RefreshError> {
+    let issuer = required(&credential.client_id, "client_id")?;
+    let secret = required(&credential.client_secret, "client_secret")?;
+    let pem = if secret.contains("-----BEGIN") {
+        secret.into_bytes()
+    } else {
+        STANDARD
+            .decode(secret.trim())
+            .map_err(|_| RefreshError::config("invalid_private_key"))?
+    };
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(&pem)
+        .map_err(|_| RefreshError::config("invalid_private_key"))?;
+    let claims = serde_json::json!({ "iat": now - 60, "exp": now + 540, "iss": issuer });
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+        &claims,
+        &key,
+    )
+    .map_err(|_| RefreshError::config("invalid_private_key"))
+}
+
+async fn refresh_github_app(
+    credential: &Credential,
+    client: &TokenClient,
+) -> Result<Outcome, RefreshError> {
+    let jwt = github_app_jwt(credential, chrono::Utc::now().timestamp())?;
+    let mut headers = HeaderMap::new();
+    let mut authorization = HeaderValue::try_from(format!("Bearer {jwt}"))
+        .map_err(|_| RefreshError::config("invalid_client_credentials"))?;
+    authorization.set_sensitive(true);
+    headers.insert(AUTHORIZATION, authorization);
+    headers.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(
+        "X-GitHub-Api-Version",
+        HeaderValue::from_static("2022-11-28"),
+    );
+    let token = client
+        .post(TokenRequest {
+            provider: &credential.provider_label(),
+            url: &credential.token_endpoint,
+            form: vec![],
+            protocol: TokenProtocol::GitHubApp,
+            headers,
+            timeout: credential.timeout,
+        })
+        .await?;
+    Ok(Outcome::Refreshed {
+        token,
+        clear_refresh_token: true,
+    })
 }
 
 type Form = Vec<(&'static str, String)>;
@@ -288,9 +346,12 @@ async fn post(
             provider: &credential.provider_label(),
             url,
             form,
-            multipart: preqin,
+            protocol: if preqin {
+                TokenProtocol::Preqin
+            } else {
+                TokenProtocol::OAuth
+            },
             headers,
-            strict_4xx: preqin,
             timeout: credential.timeout,
         })
         .await
@@ -329,6 +390,40 @@ mod tests {
             resource: None,
             timeout: Duration::from_secs(30),
         }
+    }
+
+    #[test]
+    fn github_app_signs_rs256_with_pem_or_base64_pem_and_safe_errors() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let pem = include_str!("../testdata/github-app-test-private.pem");
+        let public = include_bytes!("../testdata/github-app-test-public.pem");
+        let now = chrono::Utc::now().timestamp();
+        for secret in [pem.to_owned(), STANDARD.encode(pem)] {
+            let mut credential = credential(None);
+            credential.client_secret = Some(secret);
+            let jwt = super::github_app_jwt(&credential, now).unwrap();
+            let decoded = jsonwebtoken::decode::<serde_json::Value>(
+                &jwt,
+                &jsonwebtoken::DecodingKey::from_rsa_pem(public).unwrap(),
+                &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256),
+            )
+            .unwrap();
+            assert_eq!(decoded.claims["iss"], "cid");
+            assert_eq!(decoded.claims["iat"], now - 60);
+            assert_eq!(decoded.claims["exp"], now + 540);
+        }
+        let mut credential = credential(None);
+        credential.client_secret = Some("invalid-secret-value".into());
+        let error = super::github_app_jwt(&credential, now).unwrap_err();
+        assert_eq!(error.reason(), "invalid_private_key");
+        assert!(!format!("{error:?}").contains("invalid-secret-value"));
+        credential.client_secret = None;
+        assert_eq!(
+            super::github_app_jwt(&credential, now)
+                .unwrap_err()
+                .reason(),
+            "missing_client_secret"
+        );
     }
 
     #[test]
