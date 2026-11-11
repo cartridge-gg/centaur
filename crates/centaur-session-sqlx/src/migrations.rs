@@ -138,10 +138,13 @@ pub async fn migrate(
     backend: TextSearchBackend,
 ) -> Result<(), SessionStoreError> {
     ensure_text_search_backend(conn, backend).await?;
-    Migrator::new(MigrationList(migration_list(backend)))
-        .await?
-        .run(conn)
-        .await?;
+    let bundle = crate::extension_migrations::Bundle::from_env()?;
+    crate::extension_migrations::run(
+        conn,
+        Migrator::new(MigrationList(migration_list(backend))).await?,
+        bundle.as_ref(),
+    )
+    .await?;
     Ok(())
 }
 
