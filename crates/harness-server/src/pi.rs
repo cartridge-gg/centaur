@@ -31,6 +31,7 @@ const DEFAULT_THINKING_LEVEL: &str = "medium";
 /// ingresses offer. Each needs its provider's `api_key` credential.
 const MODELS: &[(&str, &str)] = &[
     ("anthropic", "claude-fable-5"),
+    ("anthropic", "claude-fable-5-2"),
     ("anthropic", "claude-haiku-4-5"),
     ("anthropic", "claude-opus-4-7"),
     ("anthropic", "claude-opus-4-8"),

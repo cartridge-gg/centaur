@@ -109,7 +109,7 @@ describe("extractMessageOverrides", () => {
       "claude-haiku-4-5",
     );
     expect(extractMessageOverrides("--fable fix it").model).toBe(
-      "claude-fable-5",
+      "claude-fable-5-2",
     );
   });
 
@@ -123,7 +123,7 @@ describe("extractMessageOverrides", () => {
       "claude-sonnet-5",
     );
     expect(extractMessageOverrides("--model fable go").model).toBe(
-      "claude-fable-5",
+      "claude-fable-5-2",
     );
   });
 
