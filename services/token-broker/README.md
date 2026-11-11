@@ -18,6 +18,13 @@ Grants:
 - `refresh_token`: exchanges the stored refresh token. Without one, the
   credential is marked dead.
 - `client_credentials`: requests a token with the client credentials.
+- `github_app`: signs an RS256 JWT using `client_id` as the App ID and the
+  encrypted `client_secret` as a PEM or base64-encoded PEM RSA key. Posts to
+  the configured installation access-token endpoint and stores its `token`
+  with the absolute `expires_at` expiry. It needs no refresh token and clears
+  any stale one after success. GitHub 4xx responses other than 429 mark the
+  credential dead; network errors, redirects, 429, 5xx, malformed responses,
+  and invalid key configuration retry with backoff.
 - `password`: exchanges the stored refresh token, falling back to the username
   and password when there is none or the endpoint rejects it.
 - `preqin`: like `password`, with Preqin's username and API key, as multipart

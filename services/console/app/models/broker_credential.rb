@@ -20,7 +20,7 @@ class BrokerCredential < ApplicationRecord
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
 
   PREQIN_TOKEN_ENDPOINT = "https://api.preqin.com/connect/token".freeze
-  GRANTS = %w[refresh_token client_credentials password preqin].freeze
+  GRANTS = %w[refresh_token client_credentials password preqin github_app].freeze
 
   # The access token must keep at least this much life past the scheduled
   # refresh, regardless of slack/fraction. Matches centaur-token-broker.
@@ -161,6 +161,8 @@ class BrokerCredential < ApplicationRecord
     when "password"
       errors.add(:username, "can't be blank for the password grant") if username.blank?
       errors.add(:password, "can't be blank for the password grant") if password.blank?
+    when "github_app"
+      errors.add(:client_secret, "can't be blank for the GitHub App broker grant") if client_secret.blank?
     when "preqin"
       errors.add(:username, "can't be blank for the Preqin broker grant") if username.blank?
       errors.add(:api_key, "can't be blank for the Preqin broker grant") if api_key.blank?

@@ -18,7 +18,7 @@ pub(crate) type Error = Box<dyn std::error::Error + Send + Sync>;
 const REFRESHABLE: &str = "broker_credentials.dead = FALSE \
      AND ((broker_credentials.\"grant\" = 'refresh_token' \
            AND (broker_credentials.last_refresh IS NULL OR broker_credentials.refresh_token IS NOT NULL)) \
-          OR broker_credentials.\"grant\" IN ('client_credentials', 'password', 'preqin')) \
+          OR broker_credentials.\"grant\" IN ('client_credentials', 'password', 'preqin', 'github_app')) \
      AND (broker_credentials.next_attempt_at IS NULL OR broker_credentials.next_attempt_at <= $1)";
 
 pub(crate) async fn due_credential_ids(
