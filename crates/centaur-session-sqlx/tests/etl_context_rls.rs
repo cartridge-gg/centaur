@@ -269,16 +269,10 @@ async fn assert_channel_visibility(conn: &mut PgConnection) -> Result<(), Box<dy
 async fn assert_company_context_reader_search_behavior(
     conn: &mut PgConnection,
 ) -> Result<(), Box<dyn Error>> {
-    // Public-context readers see public Slack plus company-scoped memory notes;
-    // other c7e_memory document types and user-scoped notes stay hidden.
     let company_context_public = company_context_docs(conn, None, r#"[]"#, true).await?;
     assert_eq!(
         company_context_public,
-        vec![
-            "doc_memory_note".to_owned(),
-            "doc_slack_alpha".to_owned(),
-            "doc_slack_beta".to_owned(),
-        ]
+        vec!["doc_slack_alpha".to_owned(), "doc_slack_beta".to_owned(),]
     );
 
     let company_context_private_history =
@@ -286,14 +280,12 @@ async fn assert_company_context_reader_search_behavior(
     assert_eq!(
         company_context_private_history,
         vec![
-            "doc_memory_note".to_owned(),
             "doc_slack_alpha".to_owned(),
             "doc_slack_beta".to_owned(),
             "doc_slack_private".to_owned(),
         ]
     );
 
-    // Without public context, memory notes are hidden too (fail closed).
     let company_context_history_no_public =
         company_context_docs(conn, None, r#"["C_ALPHA"]"#, false).await?;
     assert_eq!(
@@ -313,7 +305,6 @@ async fn assert_company_context_reader_search_behavior(
         search_rows,
         CompanyContextSearchRows {
             company_context_docs: vec![
-                "doc_memory_note".to_owned(),
                 "doc_slack_alpha".to_owned(),
                 "doc_slack_beta".to_owned(),
                 "doc_slack_private".to_owned(),
@@ -1195,13 +1186,7 @@ async fn assert_company_context_reader_public_message_visibility(
                 "C_ALPHA:1000.000004".to_owned(),
                 "C_BETA:1000.000002".to_owned(),
             ],
-            // Public Slack access also admits company-scoped memory notes
-            // (migration 0056).
-            company_context_docs: vec![
-                "doc_memory_note".to_owned(),
-                "doc_slack_alpha".to_owned(),
-                "doc_slack_beta".to_owned(),
-            ],
+            company_context_docs: vec!["doc_slack_alpha".to_owned(), "doc_slack_beta".to_owned(),],
             google_docs_observations: Vec::new(),
             google_docs: Vec::new(),
             granola_docs: Vec::new(),
@@ -1318,15 +1303,7 @@ async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error>
             ('doc_slack_unknown_channel', 'slack', 'slack_thread', 'unknown', '{}'),
             ('doc_gdrive', 'google_drive', 'google_doc', 'gdrive_file', '{}'),
             ('doc_gcal', 'google_calendar', 'calendar_event', 'gcal_event', '{}'),
-            ('doc_linear', 'linear', 'linear_issue', 'linear_issue', '{}'),
-            ('doc_memory_note', 'c7e_memory', 'memory_note', 'note', '{}'),
-            ('doc_memory_update', 'c7e_memory', 'memory_update', 'update', '{}');
-        -- A user-scoped note must stay hidden from the company-context reader
-        -- even when public context is enabled.
-        insert into company_context_documents
-            (document_id, source, source_type, source_document_id, metadata, access_scope)
-        values
-            ('doc_memory_note_user', 'c7e_memory', 'memory_note', 'note_user', '{}', 'user:U_OTHER');
+            ('doc_linear', 'linear', 'linear_issue', 'linear_issue', '{}');
 
         insert into google_drive_sync_runs (run_id, status) values ('gdrive_run', 'succeeded');
         insert into google_drive_sync_files (file_id) values ('gdrive_file');

@@ -11314,6 +11314,12 @@ mod adoption_tests {
             .run_migrations(centaur_session_sqlx::TextSearchBackend::Postgres)
             .await
             .expect("run migrations");
+        // Provider-health is an optional deployment extension. Runtime tests
+        // install their own fixture rather than occupying upstream versions.
+        sqlx::raw_sql(include_str!("../testdata/provider-health.sql"))
+            .execute(store.pool())
+            .await
+            .unwrap();
         Some(store)
     }
 

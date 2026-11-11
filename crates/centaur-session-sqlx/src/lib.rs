@@ -22,6 +22,7 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
+mod extension_migrations;
 mod migrations;
 
 pub use migrations::{TextSearchBackend, migrate, migration_list};
@@ -2406,6 +2407,8 @@ pub struct SessionEventNotification {
 
 #[derive(Debug, Error)]
 pub enum SessionStoreError {
+    #[error("extension migration error: {0}")]
+    ExtensionMigration(String),
     #[error("session not found for thread_key {thread_key}")]
     NotFound { thread_key: String },
     #[error(
