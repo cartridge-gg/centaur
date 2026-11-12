@@ -2460,6 +2460,17 @@ pub enum SessionStoreError {
     Bm25IndexesPresent { indexes: Vec<String> },
 }
 
+impl SessionStoreError {
+    /// The one-queued-or-running-execution index rejected a second active turn.
+    pub fn is_active_turn_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlx(sqlx::Error::Database(database))
+                if database.constraint() == Some("session_executions_one_active_idx")
+        )
+    }
+}
+
 #[derive(Debug, FromRow)]
 struct SessionRow {
     thread_key: String,
