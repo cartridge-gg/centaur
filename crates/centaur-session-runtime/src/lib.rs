@@ -1053,6 +1053,33 @@ impl SessionRuntime {
         Ok(self.store.active_execution_for_thread(thread_key).await?)
     }
 
+    /// Wait for a thread's active execution to end, polling every `poll`.
+    /// An execution with `own_idempotency_key` does not count: a replayed
+    /// caller finds its own turn still active. Returns the execution that is
+    /// still active at `deadline`, if any.
+    pub async fn wait_for_idle_thread(
+        &self,
+        thread_key: &ThreadKey,
+        own_idempotency_key: Option<&str>,
+        poll: Duration,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<SessionExecution>, SessionRuntimeError> {
+        loop {
+            let active = self.active_execution(thread_key).await?;
+            let Some(active) = active.filter(|active| {
+                own_idempotency_key.is_none()
+                    || active.idempotency_key.as_deref() != own_idempotency_key
+            }) else {
+                return Ok(None);
+            };
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(Some(active));
+            }
+            tokio::time::sleep(poll.min(deadline - now)).await;
+        }
+    }
+
     pub async fn latest_execution(
         &self,
         thread_key: &ThreadKey,
@@ -8790,6 +8817,13 @@ pub enum SessionRuntimeError {
     },
 }
 
+impl SessionRuntimeError {
+    /// The one-queued-or-running-execution index rejected a second active turn.
+    pub fn is_active_turn_conflict(&self) -> bool {
+        matches!(self, Self::Store(error) if error.is_active_turn_conflict())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12186,6 +12220,65 @@ mod adoption_tests {
                 .is_err(),
             "unscoped stream should stay open after a terminal event"
         );
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_idle_thread_waits_for_another_turn_only() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+        let thread_key =
+            ThreadKey::parse(format!("test:idle-wait-{}", uuid::Uuid::new_v4())).unwrap();
+        let active = orphaned_execution(&store, &thread_key, None, true).await;
+        let poll = Duration::from_millis(20);
+        let soon = || tokio::time::Instant::now() + Duration::from_millis(100);
+
+        let blocker = runtime
+            .wait_for_idle_thread(&thread_key, Some("workflow-turn"), poll, soon())
+            .await
+            .unwrap();
+        assert_eq!(
+            blocker.map(|execution| execution.execution_id),
+            Some(active.clone())
+        );
+
+        let waiter = {
+            let runtime = runtime.clone();
+            let thread_key = thread_key.clone();
+            tokio::spawn(async move {
+                runtime
+                    .wait_for_idle_thread(
+                        &thread_key,
+                        Some("workflow-turn"),
+                        poll,
+                        tokio::time::Instant::now() + Duration::from_secs(10),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished());
+        store.complete_execution(&active).await.unwrap();
+        assert!(waiter.await.unwrap().unwrap().is_none());
+
+        let own = store
+            .create_execution(&thread_key, Some("workflow-turn"), json!({}))
+            .await
+            .unwrap()
+            .execution
+            .execution_id;
+        let blocker = runtime
+            .wait_for_idle_thread(&thread_key, Some("workflow-turn"), poll, soon())
+            .await
+            .unwrap();
+        assert!(blocker.is_none());
+        store.complete_execution(&own).await.unwrap();
         reset_test_store(&store).await;
     }
 
