@@ -542,7 +542,7 @@ async fn send_locked(
         Ok(execution) => Ok(reply(&execution, Delivery::NewTurn)),
         // Another api-rs process started a turn after the checks above. The
         // append may have steered the prompt into it.
-        Err(error) if is_active_turn_conflict(&error) => {
+        Err(error) if error.is_active_turn_conflict() => {
             match runtime.active_execution(thread_key).await? {
                 Some(active)
                     if steering_delivered(runtime, &active.execution_id, &message_ids).await? =>
@@ -563,15 +563,6 @@ fn undelivered_error(execution_id: &str) -> SessionToolError {
     caller_error(format!(
         "the prompt was saved but could not be delivered to running turn {execution_id}. Wait for that turn with session_read, then send the prompt again with a new idempotency_key."
     ))
-}
-
-/// The one-queued-or-running-execution index rejects a second active turn.
-fn is_active_turn_conflict(error: &SessionRuntimeError) -> bool {
-    matches!(
-        error,
-        SessionRuntimeError::Store(SessionStoreError::Sqlx(sqlx::Error::Database(database)))
-            if database.constraint() == Some("session_executions_one_active_idx")
-    )
 }
 
 /// A send whose key already produced a turn, or already steered one, returns

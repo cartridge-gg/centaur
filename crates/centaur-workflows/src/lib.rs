@@ -50,6 +50,7 @@ const WORKFLOW_STARTUP_DISCOVERY_INITIAL_DELAY: Duration = Duration::from_secs(2
 const WORKFLOW_STARTUP_DISCOVERY_MAX_DELAY: Duration = Duration::from_secs(30);
 const DEFAULT_AGENT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
+const AGENT_TURN_BUSY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_AGENT_BATCH_CONCURRENCY: usize = 4;
 const MAX_AGENT_BATCH_CONCURRENCY: usize = 16;
 const MAX_AGENT_BATCH_SIZE: usize = 32;
@@ -4187,6 +4188,16 @@ async fn run_agent_session_turn(
         .await?
         .session;
     set_execution_persona_metadata(&mut execution_metadata, session.persona_id.as_deref());
+    // A message appended to a busy thread steers its running turn, so wait for
+    // that turn to end before this one appends its prompt.
+    let busy_deadline = tokio::time::Instant::now() + Duration::from_millis(max_duration_ms);
+    wait_for_idle_thread(
+        &session_runtime,
+        &thread_key,
+        &execution_idempotency_key,
+        busy_deadline,
+    )
+    .await?;
     session_runtime
         .append_messages(
             &thread_key,
@@ -4198,23 +4209,36 @@ async fn run_agent_session_turn(
             }],
         )
         .await?;
-    let execution = session_runtime
-        .execute_session(
-            &thread_key,
-            ExecuteSessionInput {
-                idempotency_key: Some(execution_idempotency_key),
-                metadata: Some(execution_metadata),
-                input_lines: vec![agent_turn_input_line(
-                    &parts,
-                    model.as_deref(),
-                    provider.as_deref(),
-                    reasoning.as_deref(),
-                )?],
-                idle_timeout_ms: Some(idle_timeout_ms),
-                max_duration_ms: Some(max_duration_ms),
-            },
-        )
-        .await?;
+    let input = ExecuteSessionInput {
+        idempotency_key: Some(execution_idempotency_key.clone()),
+        metadata: Some(execution_metadata),
+        input_lines: vec![agent_turn_input_line(
+            &parts,
+            model.as_deref(),
+            provider.as_deref(),
+            reasoning.as_deref(),
+        )?],
+        idle_timeout_ms: Some(idle_timeout_ms),
+        max_duration_ms: Some(max_duration_ms),
+    };
+    let execution = loop {
+        match session_runtime
+            .execute_session(&thread_key, input.clone())
+            .await
+        {
+            // Another turn started on the thread after the wait above.
+            Err(error) if error.is_active_turn_conflict() => {
+                wait_for_idle_thread(
+                    &session_runtime,
+                    &thread_key,
+                    &execution_idempotency_key,
+                    busy_deadline,
+                )
+                .await?;
+            }
+            result => break result?,
+        }
+    };
 
     let events = session_runtime
         .stream_events(&thread_key, 0, Some(&execution.execution_id))
@@ -4260,6 +4284,29 @@ async fn run_agent_session_turn(
     Err(WorkflowRuntimeError::Upstream(
         "session event stream ended before terminal execution event".to_owned(),
     ))
+}
+
+async fn wait_for_idle_thread(
+    session_runtime: &SessionRuntime,
+    thread_key: &ThreadKey,
+    execution_idempotency_key: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), WorkflowRuntimeError> {
+    match session_runtime
+        .wait_for_idle_thread(
+            thread_key,
+            Some(execution_idempotency_key),
+            AGENT_TURN_BUSY_POLL_INTERVAL,
+            deadline,
+        )
+        .await?
+    {
+        None => Ok(()),
+        Some(active) => Err(WorkflowRuntimeError::Upstream(format!(
+            "thread {thread_key} is still running turn {}, so this agent turn could not start",
+            active.execution_id
+        ))),
+    }
 }
 
 fn agent_turn_result_text(terminal_payload: &Value, output_lines: &[String]) -> String {

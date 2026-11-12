@@ -2467,6 +2467,17 @@ pub enum SessionStoreError {
     Bm25IndexesPresent { indexes: Vec<String> },
 }
 
+impl SessionStoreError {
+    /// The one-queued-or-running-execution index rejected a second active turn.
+    pub fn is_active_turn_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlx(sqlx::Error::Database(database))
+                if database.constraint() == Some("session_executions_one_active_idx")
+        )
+    }
+}
+
 /// Harness type of sessions created before the nanocodex harness was removed.
 /// Such rows are left in place: they load as Codex sessions with no harness
 /// thread or sandbox (Codex cannot resume a Nanocodex run, and the old sandbox
