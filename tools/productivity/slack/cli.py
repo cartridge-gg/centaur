@@ -142,6 +142,54 @@ def unreact(
 
 
 @app.command()
+def delete(
+    channel_id: str = typer.Argument(..., help="Slack conversation ID, e.g. C1234567890"),
+    timestamp: str = typer.Argument(..., help="Timestamp of the message to delete"),
+):
+    """Delete a message that this bot posted, using the bot's chat:write scope.
+
+    Slack refuses a message that another user or app posted. The delete cannot be undone.
+    A file that the message shares stays in the workspace: delete it with `delete-file`.
+
+    Example: slack delete C1234567890 1234567890.123456
+    """
+    from .client import delete_message
+
+    try:
+        result = delete_message(channel_id, timestamp)
+        if result["deleted"]:
+            console.print("[green]✓ Message deleted[/]")
+        else:
+            console.print("[green]✓ No message at that timestamp; nothing deleted[/]")
+    except (RuntimeError, ValueError) as e:
+        stderr_console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
+
+
+@app.command("delete-file")
+def delete_file_cmd(
+    file_id: str = typer.Argument(..., help="Slack file ID, e.g. F1234567890"),
+):
+    """Delete a file from the workspace, using the bot's files:write scope.
+
+    Slack refuses a file that the bot may not delete. The delete cannot be undone.
+
+    Example: slack delete-file F1234567890
+    """
+    from .client import delete_file
+
+    try:
+        result = delete_file(file_id)
+        if result["deleted"]:
+            console.print("[green]✓ File deleted[/]")
+        else:
+            console.print("[green]✓ No file with that ID is visible; nothing deleted[/]")
+    except (RuntimeError, ValueError) as e:
+        stderr_console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
+
+
+@app.command()
 def dm(
     user_id: str = typer.Argument(..., help="Slack user ID, e.g. U12345678"),
     message: str = typer.Argument(..., help="Message text to send"),

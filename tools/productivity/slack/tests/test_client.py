@@ -61,6 +61,10 @@ class _FakeWebClient:
         self.last_kwargs = kwargs
         return {"ok": True}
 
+    def chat_delete(self, **kwargs):
+        self.last_kwargs = kwargs
+        return {"ok": True}
+
     def chat_getPermalink(self, **kwargs):
         self.permalink_calls.append(kwargs)
         channel = kwargs["channel"]
@@ -2027,3 +2031,133 @@ def test_remove_reaction_handles_slack_errors(monkeypatch, error) -> None:
         with pytest.raises(expected):
             client.remove_reaction("C1234567890", "123.456", "pencil2")
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("channel", ["C1234567890", " c1234567890 ", "<#C1234567890|general>"])
+def test_delete_message_preserves_target(channel) -> None:
+    client, web_client = _make_client()
+
+    result = client.delete_message(channel, " 1789546423.000001 ")
+
+    assert web_client.last_kwargs == {"channel": "C1234567890", "ts": "1789546423.000001"}
+    assert result == {
+        "ok": True,
+        "channel": "C1234567890",
+        "ts": "1789546423.000001",
+        "deleted": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("channel", "timestamp"),
+    [
+        ("general", "123.456"),
+        ("U1234567890", "123.456"),
+        ("C1234567890", "not-a-timestamp"),
+        ("C1234567890", "1789546423"),
+        ("C1234567890", ""),
+    ],
+)
+def test_delete_message_rejects_invalid_input_before_request(channel, timestamp) -> None:
+    client, web_client = _make_client()
+    with pytest.raises(ValueError):
+        client.delete_message(channel, timestamp)
+    assert web_client.last_kwargs is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "message_not_found",
+        "cant_delete_message",
+        "missing_scope",
+        "channel_not_found",
+        "ratelimited",
+    ],
+)
+def test_delete_message_handles_slack_errors(monkeypatch, error) -> None:
+    client, web_client = _make_client()
+    calls = []
+
+    def fail(**kwargs):
+        calls.append(kwargs)
+        raise _make_slack_error(error=error, status_code=429 if error == "ratelimited" else 200)
+
+    monkeypatch.setattr(web_client, "chat_delete", fail)
+    if error == "message_not_found":
+        assert client.delete_message("C1234567890", "123.456")["deleted"] is False
+    else:
+        expected = {
+            "cant_delete_message": RuntimeError,
+            "missing_scope": SlackAuthError,
+            "channel_not_found": RuntimeError,
+            "ratelimited": SlackRateLimitError,
+        }[error]
+        with pytest.raises(expected, match=error if expected is RuntimeError else None):
+            client.delete_message("C1234567890", "123.456")
+    assert len(calls) == 1
+
+
+def test_delete_message_explains_a_message_of_another_author(monkeypatch) -> None:
+    client, web_client = _make_client()
+
+    def fail(**kwargs):
+        raise _make_slack_error(error="cant_delete_message", status_code=200)
+
+    monkeypatch.setattr(web_client, "chat_delete", fail)
+    with pytest.raises(RuntimeError, match="only the bot's own messages") as raised:
+        client.delete_message("C1234567890", "123.456")
+    assert not isinstance(raised.value, SlackAuthError)
+
+
+@pytest.mark.parametrize("file_id", ["F1234567890", " f1234567890 "])
+def test_delete_file_preserves_target(file_id) -> None:
+    client, web_client = _make_client()
+
+    result = client.delete_file(file_id)
+
+    assert web_client.files_delete_calls == [{"file": "F1234567890"}]
+    assert result == {"ok": True, "file_id": "F1234567890", "deleted": True}
+
+
+@pytest.mark.parametrize("file_id", ["", "F1", "C1234567890", "1789546423.000001", "F123 4567890"])
+def test_delete_file_rejects_invalid_input_before_request(file_id) -> None:
+    client, web_client = _make_client()
+    with pytest.raises(ValueError):
+        client.delete_file(file_id)
+    assert web_client.files_delete_calls == []
+
+
+@pytest.mark.parametrize(
+    "error", ["file_not_found", "file_deleted", "cant_delete_file", "missing_scope", "ratelimited"]
+)
+def test_delete_file_handles_slack_errors(monkeypatch, error) -> None:
+    client, web_client = _make_client()
+    calls = []
+
+    def fail(**kwargs):
+        calls.append(kwargs)
+        raise _make_slack_error(error=error, status_code=429 if error == "ratelimited" else 200)
+
+    monkeypatch.setattr(web_client, "files_delete", fail)
+    if error in {"file_not_found", "file_deleted"}:
+        assert client.delete_file("F1234567890")["deleted"] is False
+    else:
+        expected = {
+            "cant_delete_file": RuntimeError,
+            "missing_scope": SlackAuthError,
+            "ratelimited": SlackRateLimitError,
+        }[error]
+        with pytest.raises(expected, match=error if expected is RuntimeError else None):
+            client.delete_file("F1234567890")
+    assert len(calls) == 1
+
+
+def test_delete_wrappers_use_the_module_client(monkeypatch) -> None:
+    client, web_client = _make_client()
+    monkeypatch.setattr(slack_client, "_client", lambda: client)
+
+    assert slack_client.delete_message("C1234567890", "123.456")["deleted"] is True
+    assert slack_client.delete_file("F1234567890")["deleted"] is True
+    assert web_client.last_kwargs == {"channel": "C1234567890", "ts": "123.456"}
+    assert web_client.files_delete_calls == [{"file": "F1234567890"}]
