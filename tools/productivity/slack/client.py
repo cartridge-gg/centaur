@@ -1878,6 +1878,73 @@ class SlackClient:
                 )
         return {"ok": True, "channel": channel_id, "ts": timestamp, "name": name, "removed": removed}
 
+    def delete_message(self, channel_id: str, timestamp: str) -> dict:
+        """Delete a message that this token posted; requires Slack's chat:write scope.
+
+        Slack decides what the token may delete: a bot token deletes only the
+        bot's own messages. No message at the timestamp is a successful no-op.
+        Message timestamps stay strings to preserve their precision. The delete
+        cannot be undone.
+        """
+        channel_id = self._normalize_explicit_channel_id(channel_id)
+        timestamp = timestamp.strip()
+        if not re.fullmatch(r"\d+\.\d+", timestamp):
+            raise ValueError("timestamp must be a Slack message timestamp like 1234567890.123456")
+
+        deleted = True
+        try:
+            self._retry_on_ratelimit(
+                self._client.chat_delete,
+                channel=channel_id,
+                ts=timestamp,
+            )
+        except SlackApiError as error:
+            error_code = self._slack_error_code(error)
+            if error_code == "message_not_found":
+                deleted = False
+            elif error_code == "cant_delete_message":
+                raise RuntimeError(
+                    "Slack API error: cant_delete_message (this token may not delete this "
+                    "message; a bot token deletes only the bot's own messages)"
+                ) from error
+            else:
+                self._raise_slack_api_error(
+                    error,
+                    slack_method="chat.delete",
+                    access_path="slack_api",
+                    requested_channel=channel_id,
+                    resolved_channel=channel_id,
+                )
+        return {"ok": True, "channel": channel_id, "ts": timestamp, "deleted": deleted}
+
+    def delete_file(self, file_id: str) -> dict:
+        """Delete a file from the workspace; requires Slack's files:write scope.
+
+        Slack decides what the token may delete. A file that is already
+        deleted, or that the token cannot see, is a successful no-op. The
+        delete cannot be undone.
+        """
+        file_id = self._normalize_file_id(file_id)
+
+        deleted = True
+        try:
+            self._retry_on_ratelimit(self._client.files_delete, file=file_id)
+        except SlackApiError as error:
+            error_code = self._slack_error_code(error)
+            if error_code in {"file_not_found", "file_deleted"}:
+                deleted = False
+            elif error_code == "cant_delete_file":
+                raise RuntimeError(
+                    "Slack API error: cant_delete_file (this token may not delete this file)"
+                ) from error
+            else:
+                self._raise_slack_api_error(
+                    error,
+                    slack_method="files.delete",
+                    access_path="slack_api",
+                )
+        return {"ok": True, "file_id": file_id, "deleted": deleted}
+
     def send_dm(
         self,
         user_id: str,
@@ -2737,3 +2804,11 @@ def get_user_profile(*args, **kwargs):
 
 def remove_reaction(*args, **kwargs):
     return _client().remove_reaction(*args, **kwargs)
+
+
+def delete_message(*args, **kwargs):
+    return _client().delete_message(*args, **kwargs)
+
+
+def delete_file(*args, **kwargs):
+    return _client().delete_file(*args, **kwargs)

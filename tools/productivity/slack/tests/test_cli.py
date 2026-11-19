@@ -849,3 +849,89 @@ def test_unreact_is_discoverable() -> None:
     result = CliRunner().invoke(app, ["unreact", "--help"])
     assert result.exit_code == 0
     assert "reactions:write" in result.output
+
+
+@pytest.mark.parametrize("deleted", [True, False])
+def test_delete_calls_client_and_reports_result(monkeypatch, deleted) -> None:
+    calls = []
+
+    def fake_delete_message(*args):
+        calls.append(args)
+        return {"deleted": deleted}
+
+    monkeypatch.setitem(
+        sys.modules, "slack.client", types.SimpleNamespace(delete_message=fake_delete_message)
+    )
+    result = CliRunner().invoke(app, ["delete", "C1234567890", "123.000001"])
+
+    assert result.exit_code == 0
+    assert calls == [("C1234567890", "123.000001")]
+    assert ("Message deleted" if deleted else "nothing deleted") in result.output
+    if not deleted:
+        assert "Message deleted" not in result.output
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("Slack API error: cant_delete_message"), ValueError("invalid timestamp")],
+)
+def test_delete_reports_failure(monkeypatch, error) -> None:
+    def fake_delete_message(*args):
+        raise error
+
+    monkeypatch.setitem(
+        sys.modules, "slack.client", types.SimpleNamespace(delete_message=fake_delete_message)
+    )
+    result = CliRunner().invoke(app, ["delete", "C1234567890", "123.456"])
+
+    assert result.exit_code == 1
+    assert str(error) in result.output
+    assert "Message deleted" not in result.output
+
+
+@pytest.mark.parametrize("deleted", [True, False])
+def test_delete_file_calls_client_and_reports_result(monkeypatch, deleted) -> None:
+    calls = []
+
+    def fake_delete_file(*args):
+        calls.append(args)
+        return {"deleted": deleted}
+
+    monkeypatch.setitem(
+        sys.modules, "slack.client", types.SimpleNamespace(delete_file=fake_delete_file)
+    )
+    result = CliRunner().invoke(app, ["delete-file", "F1234567890"])
+
+    assert result.exit_code == 0
+    assert calls == [("F1234567890",)]
+    assert ("File deleted" if deleted else "nothing deleted") in result.output
+    if not deleted:
+        assert "File deleted" not in result.output
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("Slack API error: cant_delete_file"), ValueError("invalid file id")]
+)
+def test_delete_file_reports_failure(monkeypatch, error) -> None:
+    def fake_delete_file(*args):
+        raise error
+
+    monkeypatch.setitem(
+        sys.modules, "slack.client", types.SimpleNamespace(delete_file=fake_delete_file)
+    )
+    result = CliRunner().invoke(app, ["delete-file", "F1234567890"])
+
+    assert result.exit_code == 1
+    assert str(error) in result.output
+    assert "File deleted" not in result.output
+
+
+def test_delete_commands_are_discoverable() -> None:
+    help_output = CliRunner().invoke(app, ["--help"]).output
+    assert "delete-file" in help_output
+    result = CliRunner().invoke(app, ["delete", "--help"])
+    assert result.exit_code == 0
+    assert "chat:write" in result.output
+    result = CliRunner().invoke(app, ["delete-file", "--help"])
+    assert result.exit_code == 0
+    assert "files:write" in result.output
