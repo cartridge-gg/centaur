@@ -895,11 +895,11 @@ The token credentials it refreshes with are fields on the credential, resolved b
 | `foreign_id`                   | optional    | Globally unique. Immutable. |
 | `name`, `description`          | optional    | |
 | `labels`                       | optional    | |
-| `grant`                        | optional    | One of `refresh_token`, `client_credentials`, `password`, or `preqin`. Defaults to `refresh_token`. |
+| `grant`                        | optional    | One of `refresh_token`, `client_credentials`, `password`, `preqin`, or `github_app`. Defaults to `refresh_token`. |
 | `token_endpoint`               | conditional | Token endpoint the refresh request is sent to. Required except `preqin`, which uses the fixed `https://api.preqin.com/connect/token` endpoint. |
 | `scopes`                       | optional    | Array of strings. |
-| `client_id`                    | conditional | OAuth client id. Required for standalone `refresh_token`, `client_credentials`, and `password` credentials. Returned in responses. Not used for `preqin`. |
-| `client_secret`                | conditional | OAuth client secret. Required for `client_credentials`, optional for `refresh_token` and `password`, and not used for `preqin`. Write-only and encrypted at rest; omit for public clients. Never returned. |
+| `client_id`                    | conditional | OAuth client id. Required for standalone `refresh_token`, `client_credentials`, and `password` credentials, and for `github_app` (the GitHub App ID). Returned in responses. Not used for `preqin`. |
+| `client_secret`                | conditional | OAuth client secret. Required for `client_credentials` and `github_app` (the App's RSA private key, PEM or base64-encoded PEM), optional for `refresh_token` and `password`, and not used for `preqin`. Write-only and encrypted at rest; omit for public clients. Never returned. |
 | `token_endpoint_headers`       | optional    | Object mapping header name to a string value, sent on the refresh request. Values are write-only and encrypted; only the header names are returned (as `token_endpoint_header_names`). |
 | `refresh_token`                | optional    | Write-only initial value for `refresh_token` credentials. Also used by `password` credentials when the provider returns one. Not used by `client_credentials` credentials. Supplying a value schedules the credential immediately and clears dead state. Never returned. |
 | `username`                     | conditional | Required for `password` credentials. Write-only and encrypted at rest. Never returned. |
@@ -1035,7 +1035,22 @@ Preqin Operational API credentials use the provider-specific `preqin` grant. iro
 }
 ```
 
-The token is still consumed like any other broker token:
+GitHub App installation tokens use the `github_app` grant. `client_id` is the App ID, `client_secret` is the App's RSA private key (PEM or base64-encoded PEM), and `token_endpoint` is the installation's access-token URL. The broker signs a short-lived RS256 App JWT, posts it to that URL, and stores the returned installation `token` with its absolute `expires_at`; no refresh token is needed. GitHub `4xx` responses other than `429` mark the credential dead; supply a new `client_secret` to clear it:
+
+```json
+{
+  "data": {
+    "foreign_id": "github-app",
+    "name": "GitHub App",
+    "grant": "github_app",
+    "client_id": "123456",
+    "client_secret": "<base64-encoded private key PEM>",
+    "token_endpoint": "https://api.github.com/app/installations/987654/access_tokens"
+  }
+}
+```
+
+Every broker token, Preqin's included, is consumed the same way:
 
 ```json
 {
@@ -1066,7 +1081,7 @@ To put the credential to use, reference it from a grantable secret's `token_brok
 
 ### Re-authenticating a dead credential
 
-When a refresh fails unrecoverably (for example the IdP returns `invalid_grant` because the refresh token was revoked), the credential's `status` becomes `dead` and it stops minting tokens. Supply a fresh `refresh_token` for a `refresh_token` credential, fresh `username` / `password` fields for a `password` credential, or fresh `username` / `api_key` fields for a `preqin` credential, via `PUT` / `PATCH` to clear the dead state and reschedule it:
+When a refresh fails unrecoverably (for example the IdP returns `invalid_grant` because the refresh token was revoked), the credential's `status` becomes `dead` and it stops minting tokens. Supply a fresh `refresh_token` for a `refresh_token` credential, fresh `username` / `password` fields for a `password` credential, fresh `username` / `api_key` fields for a `preqin` credential, or a fresh `client_secret` for a `client_credentials` or `github_app` credential, via `PUT` / `PATCH` to clear the dead state and reschedule it:
 
 ```json
 { "data": { "refresh_token": "1//0gNEW..." } }

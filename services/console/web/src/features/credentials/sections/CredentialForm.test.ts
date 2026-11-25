@@ -24,4 +24,23 @@ describe("toPayload", () => {
     expect(body).not.toHaveProperty("early_refresh_fraction");
     expect(body.refresh_timeout_seconds).toBe("soon");
   });
+
+  it("sends a GitHub App's private key as the client secret and no other grant fields", () => {
+    const values = {
+      ...defaultValues(),
+      name: "GitHub App",
+      grant: "github_app" as const,
+      token_endpoint: "https://api.github.com/app/installations/1/access_tokens",
+      client_id: "123",
+      client_secret: "private-key",
+      refresh_token: "ignored",
+      username: "ignored",
+    };
+    const payload = toPayload(values);
+    expect(payload.grant).toBe("github_app");
+    expect(payload.client_id).toBe("123");
+    expect(payload.client_secret).toBe("private-key");
+    expect(payload).not.toHaveProperty("refresh_token");
+    expect(payload).not.toHaveProperty("username");
+  });
 });

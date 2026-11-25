@@ -293,6 +293,14 @@ export function CredentialForm({ credential, submitLabel, error, onSubmit }: Cre
                 Uses the client ID and client secret above to mint each access token. No refresh token is required.
               </p>
             )}
+            {grant === "github_app" && (
+              <p className="text-xs text-muted-foreground">
+                Signs a GitHub App JWT with the App ID as the client ID and the App&apos;s RSA private key (PEM or
+                base64-encoded PEM) as the client secret, then mints an installation token from the token endpoint
+                (https://api.github.com/app/installations/&lt;installation_id&gt;/access_tokens). No refresh token is
+                required.
+              </p>
+            )}
             {grant === "refresh_token" && (
               <SecretField
                 control={form.control}

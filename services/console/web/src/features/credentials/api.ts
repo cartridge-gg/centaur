@@ -7,7 +7,7 @@ import { createQueryKeys } from "@/lib/query-keys";
 
 export const credentialKeys = createQueryKeys("credentials");
 
-export const GRANTS = ["refresh_token", "client_credentials", "password", "preqin"] as const;
+export const GRANTS = ["refresh_token", "client_credentials", "password", "preqin", "github_app"] as const;
 export type Grant = (typeof GRANTS)[number];
 
 /** Preqin's token endpoint. */

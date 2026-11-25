@@ -4,6 +4,7 @@ export function providerLabel(provider: string): string {
 }
 
 export function grantLabel(grant: string): string {
+  if (grant === "github_app") return "GitHub App";
   return grant
     .split("_")
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))

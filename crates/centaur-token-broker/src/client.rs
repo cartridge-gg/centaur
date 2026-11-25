@@ -19,15 +19,20 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// `tokenBroker.terminationGracePeriodSeconds`).
 pub(crate) const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum TokenProtocol {
+    OAuth,
+    Preqin,
+    GitHubApp,
+}
+
 pub(crate) struct TokenRequest<'a> {
     /// The `provider` metrics label.
     pub provider: &'a str,
     pub url: &'a str,
     pub form: Vec<(&'static str, String)>,
-    pub multipart: bool,
+    pub protocol: TokenProtocol,
     pub headers: HeaderMap,
-    /// Treat a 4xx without an OAuth error body as unrecoverable.
-    pub strict_4xx: bool,
     pub timeout: Duration,
 }
 
@@ -133,7 +138,7 @@ impl TokenClient {
             .post(request.url)
             .timeout(request.timeout)
             .header(ACCEPT, "application/json");
-        let builder = if request.multipart {
+        let builder = if request.protocol == TokenProtocol::Preqin {
             let form = request
                 .form
                 .into_iter()
@@ -141,8 +146,10 @@ impl TokenClient {
                     form.text(name, value)
                 });
             builder.multipart(form)
-        } else {
+        } else if request.protocol == TokenProtocol::OAuth {
             builder.form(&request.form)
+        } else {
+            builder
         };
         // Credential headers go last so they override the defaults.
         let mut response = builder
@@ -160,7 +167,11 @@ impl TokenClient {
             }
         }
         body.truncate(MAX_BODY_BYTES);
-        interpret(status, &body, request.strict_4xx)
+        if request.protocol == TokenProtocol::GitHubApp {
+            interpret_github_app(status, &body, chrono::Utc::now().timestamp())
+        } else {
+            interpret(status, &body, request.protocol == TokenProtocol::Preqin)
+        }
     }
 }
 
@@ -242,6 +253,37 @@ fn interpret(status: u16, body: &[u8], strict_4xx: bool) -> Result<TokenResponse
     })
 }
 
+/// GitHub installation tokens use `token` and an absolute RFC 3339 expiry.
+/// Never include GitHub's response message (or body) in an error.
+fn interpret_github_app(status: u16, body: &[u8], now: i64) -> Result<TokenResponse, RefreshError> {
+    if !(200..300).contains(&status) {
+        return Err(RefreshError {
+            stage: "http",
+            code: Some(format!("http_{status}")),
+            status: Some(status),
+            retryable: status >= 500 || status == 429 || (300..400).contains(&status),
+        });
+    }
+    let malformed = || RefreshError::retryable("parse", Some(status));
+    let body: Value = serde_json::from_slice(body).map_err(|_| malformed())?;
+    let access_token = present_string(body.get("token")).ok_or_else(malformed)?;
+    let expires_at = body
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .ok_or_else(malformed)?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at).map_err(|_| malformed())?;
+    let expires_in = expires_at
+        .timestamp()
+        .checked_sub(now)
+        .filter(|ttl| *ttl > 0)
+        .ok_or_else(malformed)?;
+    Ok(TokenResponse {
+        access_token,
+        refresh_token: None,
+        expires_in: Some(expires_in),
+    })
+}
+
 fn present_string(value: Option<&Value>) -> Option<String> {
     value
         .and_then(Value::as_str)
@@ -268,6 +310,46 @@ mod tests {
             code: Some(code.to_owned()),
             status: Some(status),
             retryable: false,
+        }
+    }
+
+    #[test]
+    fn github_app_responses_require_a_token_and_future_absolute_expiry() {
+        use super::interpret_github_app;
+        let now = 1_700_000_000;
+        let expiry = chrono::DateTime::from_timestamp(now + 3600, 0)
+            .unwrap()
+            .to_rfc3339();
+        let body = serde_json::json!({"token": "installation-token", "expires_at": expiry});
+        let token = interpret_github_app(201, &serde_json::to_vec(&body).unwrap(), now).unwrap();
+        assert_eq!(token.access_token, "installation-token");
+        assert_eq!(token.expires_in, Some(3600));
+        assert_eq!(token.refresh_token, None);
+        for body in [
+            serde_json::json!({"token": "installation-token"}),
+            serde_json::json!({"token": "", "expires_at": expiry}),
+            serde_json::json!({"token": "installation-token", "expires_at": "invalid"}),
+            serde_json::json!({"token": "installation-token", "expires_at": "2000-01-01T00:00:00Z"}),
+        ] {
+            let error =
+                interpret_github_app(201, &serde_json::to_vec(&body).unwrap(), now).unwrap_err();
+            assert_eq!(error.stage, "parse");
+            assert!(error.retryable);
+        }
+        for (status, retryable) in [
+            (401, false),
+            (403, false),
+            (404, false),
+            (422, false),
+            (429, true),
+            (500, true),
+            (302, true),
+        ] {
+            let error = interpret_github_app(status, br#"{"message":"secret response body"}"#, now)
+                .unwrap_err();
+            assert_eq!(error.retryable, retryable);
+            assert_eq!(error.reason(), format!("http_{status}"));
+            assert!(!format!("{error:?}").contains("secret response body"));
         }
     }
 

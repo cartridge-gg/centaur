@@ -45,7 +45,13 @@ use crate::{
     },
 };
 
-const GRANTS: [&str; 4] = ["refresh_token", "client_credentials", "password", "preqin"];
+const GRANTS: [&str; 5] = [
+    "refresh_token",
+    "client_credentials",
+    "password",
+    "preqin",
+    "github_app",
+];
 
 /// The credential list: the label filter binds `$1`.
 const CREDENTIAL_LIST: ListSource = ListSource::new(
@@ -455,7 +461,7 @@ impl Write {
             && !blank(secret)
         {
             self.incoming.client_secret = Some(secret.clone());
-            if self.grant == "client_credentials" {
+            if matches!(self.grant.as_str(), "client_credentials" | "github_app") {
                 self.reset_refresh_state = true;
             }
         }
@@ -547,6 +553,14 @@ impl Write {
         }
         if self.grant == "client_credentials" && self.effective_client_secret().is_none_or(blank) {
             validation.add("client_secret", "can't be blank");
+        }
+        // The GitHub App ID is the client_id and its RSA private key the
+        // encrypted client_secret; the broker signs an App JWT with it.
+        if self.grant == "github_app" && self.effective_client_secret().is_none_or(blank) {
+            validation.add(
+                "client_secret",
+                "can't be blank for the GitHub App broker grant",
+            );
         }
         let username_message = match self.grant.as_str() {
             "password" => Some("can't be blank for the password grant"),
@@ -1008,6 +1022,21 @@ mod tests {
         );
         write.incoming.username = Some("user".to_owned());
         write.incoming.api_key = Some("key".to_owned());
+        assert!(
+            write
+                .validation_errors(&HeadersValue::Stored(None))
+                .is_empty()
+        );
+
+        let mut write = base_write();
+        write.grant = "github_app".to_owned();
+        write.client_id = None;
+        assert_eq!(
+            keys(write.validation_errors(&HeadersValue::Stored(None))),
+            ["client_id", "client_secret"]
+        );
+        write.client_id = Some("123".to_owned());
+        write.incoming.client_secret = Some("private-key".to_owned());
         assert!(
             write
                 .validation_errors(&HeadersValue::Stored(None))
