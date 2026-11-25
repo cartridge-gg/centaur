@@ -219,6 +219,8 @@ pub(super) struct ProviderPayload {
     key: &'static str,
     display_name: String,
     presettable: bool,
+    /// A public client: the app needs no client secret.
+    public_client: bool,
     config_keys: Vec<&'static str>,
     optional_config_keys: Vec<&'static str>,
 }
@@ -462,7 +464,7 @@ impl AppWrite {
             labels: self.labels.clone(),
             provider: self.provider.clone(),
             client_id: self.client_id.clone(),
-            client_secret: self.client_secret_stored.clone().unwrap_or_default(),
+            client_secret: self.client_secret_stored.clone(),
             allowed_scopes: self.allowed_scopes.clone(),
             provider_config: self.provider_config.clone(),
             enabled: self.enabled,
@@ -535,7 +537,8 @@ fn app_validation(
                 .as_deref()
                 .filter(|secret| !secret.is_empty())
         });
-    if secret.is_none() {
+    let public_client = Provider::registry(&write.provider).is_some_and(|p| p.public_client());
+    if secret.is_none() && !public_client {
         validation.add("client_secret", "can't be blank");
     }
     if existing_shared.is_some_and(|existing| {
@@ -816,6 +819,7 @@ pub(super) async fn console_providers() -> Json<DataPayload<Vec<ProviderPayload>
                 key: provider.key(),
                 display_name: provider.display_name(),
                 presettable: provider.key() == providers::MERCATOR_KEY,
+                public_client: provider.public_client(),
                 config_keys: if custom {
                     CUSTOM_CONFIG_KEYS.to_vec()
                 } else {
@@ -972,7 +976,7 @@ pub(super) async fn console_preset(
                 labels: attributes.labels.clone(),
                 provider: attributes.provider.to_owned(),
                 client_id,
-                client_secret: secret,
+                client_secret: Some(secret),
                 allowed_scopes: attributes.allowed_scopes.clone(),
                 provider_config: setup.provider_config.clone(),
                 enabled: true,
@@ -1292,6 +1296,14 @@ mod tests {
                 "slug",
             ]
         );
+    }
+
+    #[test]
+    fn app_validation_needs_no_secret_for_a_public_client() {
+        let mut write = app_write();
+        write.provider = "merchmaker".to_owned();
+        write.client_secret_stored = None;
+        assert!(app_validation(&write, None, None, false).is_empty());
     }
 
     #[test]

@@ -1115,14 +1115,14 @@ The `provider` field is validated against the [supported providers](#supported-p
 | `provider`             | required    | The provider strategy. See [supported providers](#supported-providers). |
 | `provider_config`      | conditional | Required for `"custom"` and must be empty (`{}`) otherwise. An object with `authorization_endpoint`, `token_endpoint`, `resource`, and optionally `userinfo_endpoint` and `revocation_endpoint` (RFC 7009, used by Disconnect), each an `https` URL. |
 | `client_id`            | required    | OAuth client id. Not secret; returned in responses. |
-| `client_secret`        | required on create | OAuth client secret. Write-only and encrypted at rest; on update it is only changed when supplied. Never returned. |
+| `client_secret`        | required on create | OAuth client secret. Write-only and encrypted at rest; on update it is only changed when supplied. Never returned. Not required for a public-client provider (`merchmaker`), whose exchange sends only `client_id`. |
 | `allowed_scopes`       | required    | Non-empty array of scope strings the start endpoint requests. A flow's optional `scopes` param must be a subset; omitting it requests all of these. |
 | `enabled`              | optional    | Defaults to `true`. A disabled app rejects new consent flows; existing credentials keep refreshing. |
 | `shared`               | optional    | Defaults to `false`. One admin-connected account with role-granted access. Create-only; changes return `422`. Incompatible with `always_available`. |
 | `always_available`     | optional    | Defaults to `false`. Use the connecting user's credential automatically whenever they ask the bot, not only in their DMs. |
 | `owner_only`           | optional    | Defaults to `false`. Each Console user's connection is keyed by that user (no provider identity is resolved) and its token is delivered only to that user's own principals through a direct grant -- never roles, other principals, or email matching -- and only while live, the app enabled, and the user active. Create-only; changes return `422`. Incompatible with `shared`. |
 
-The `client_secret` is required and write-only: it is accepted on writes but never returned in any response.
+The `client_secret` is required (except for a public-client provider) and write-only: it is accepted on writes but never returned in any response.
 
 ### Create
 
@@ -1275,6 +1275,7 @@ A tampered, expired, or missing flow state or cookie renders an error page with 
 | Granola   | `granola`        |
 | Linear    | `linear`         |
 | Mercator  | `mercator`       |
+| Merch Maker | `merchmaker`   |
 | Microsoft | `microsoft`      |
 | Slack     | `slack`          |
 | Zoom      | `zoom`           |
@@ -2017,15 +2018,15 @@ Console-only actions:
 ```json
 {
   "data": [
-    { "key": "google", "display_name": "Google", "presettable": false, "config_keys": [], "optional_config_keys": [] },
-    { "key": "custom", "display_name": "Custom", "presettable": false,
+    { "key": "google", "display_name": "Google", "presettable": false, "public_client": false, "config_keys": [], "optional_config_keys": [] },
+    { "key": "custom", "display_name": "Custom", "presettable": false, "public_client": false,
       "config_keys": ["authorization_endpoint", "token_endpoint", "userinfo_endpoint", "revocation_endpoint", "resource"],
       "optional_config_keys": ["userinfo_endpoint", "revocation_endpoint"] }
   ]
 }
 ```
 
-`config_keys` lists the `provider_config` keys the provider takes. `presettable` is `true` when the provider can be set up with `POST /api/v1/console/oauth_apps/presets/:provider`.
+`config_keys` lists the `provider_config` keys the provider takes. `presettable` is `true` when the provider can be set up with `POST /api/v1/console/oauth_apps/presets/:provider`. `public_client` is `true` when the provider's apps take no client secret.
 
 #### Integrations
 

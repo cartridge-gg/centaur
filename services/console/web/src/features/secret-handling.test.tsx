@@ -106,7 +106,7 @@ const forms: SecretForm[] = [
     write: "POST /api/v1/console/oauth_apps",
     reads: {
       "GET /api/v1/console/oauth_providers": {
-        data: [{ key: "google", display_name: "Google", presettable: false, config_keys: [], optional_config_keys: [] }],
+        data: [{ key: "google", display_name: "Google", presettable: false, public_client: false, config_keys: [], optional_config_keys: [] }],
       },
     },
     accepted: { data: { id: "oap_new" } },

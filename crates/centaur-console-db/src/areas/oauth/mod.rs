@@ -218,7 +218,8 @@ pub struct NewOauthApp {
     pub labels: Map<String, Value>,
     pub provider: String,
     pub client_id: String,
-    pub client_secret: String,
+    /// The encrypted client secret; `None` for a public client.
+    pub client_secret: Option<String>,
     pub allowed_scopes: Vec<String>,
     pub provider_config: Map<String, Value>,
     pub enabled: bool,

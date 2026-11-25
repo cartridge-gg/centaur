@@ -1,7 +1,7 @@
 // The client secret is write-only: never prefilled, and a blank value on edit
 // is omitted so the stored secret is kept. `shared` and `owner_only` are create-only.
 import { zodResolver } from "@hookform/resolvers/zod";
-import { FormProvider, useForm, type FieldError } from "react-hook-form";
+import { FormProvider, useForm, useWatch, type FieldError } from "react-hook-form";
 import { Link } from "react-router";
 import { z } from "zod";
 
@@ -130,6 +130,8 @@ export function OauthAppForm({ app, providers, submitLabel, cancelTo, onSubmit }
     defaultValues: initialValues(app, providers[0]?.key ?? ""),
   });
   const customKeys = providers.find((p) => p.key === CUSTOM_PROVIDER)?.config_keys ?? Object.keys(CONFIG_LABELS);
+  const provider = useWatch({ control: form.control, name: "provider" });
+  const publicClient = providers.find((p) => p.key === provider)?.public_client ?? false;
   // provider_config errors are set on the whole map (one model attribute).
   const configError = (form.formState.errors.provider_config as FieldError | undefined)?.message;
 
@@ -182,9 +184,15 @@ export function OauthAppForm({ app, providers, submitLabel, cancelTo, onSubmit }
             <SecretField
               control={form.control}
               name="client_secret"
-              label={isNew ? "Client secret *" : "Client secret"}
+              label={isNew && !publicClient ? "Client secret *" : "Client secret"}
               hasStoredValue={!isNew && Boolean(app?.client_secret_set)}
-              hint={isNew ? "Stored encrypted." : "Stored encrypted. Leave blank to keep the current secret."}
+              hint={
+                publicClient
+                  ? "This provider uses a public client. Leave blank."
+                  : isNew
+                    ? "Stored encrypted."
+                    : "Stored encrypted. Leave blank to keep the current secret."
+              }
             />
           </div>
         </FormSection>

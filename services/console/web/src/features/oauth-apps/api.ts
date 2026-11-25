@@ -48,6 +48,8 @@ export interface OauthProvider {
   key: string;
   display_name: string;
   presettable: boolean;
+  /** The provider's apps take no client secret. */
+  public_client: boolean;
   config_keys: string[];
   optional_config_keys: string[];
 }

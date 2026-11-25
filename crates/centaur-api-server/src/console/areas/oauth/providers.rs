@@ -81,7 +81,7 @@ impl Identity {
 
 /// The registry order is the console provider list; the first entry is the
 /// form default.
-pub(crate) const PROVIDER_KEYS: [&str; 10] = [
+pub(crate) const PROVIDER_KEYS: [&str; 11] = [
     "attio",
     "custom",
     "github",
@@ -89,6 +89,7 @@ pub(crate) const PROVIDER_KEYS: [&str; 10] = [
     "granola",
     "linear",
     "mercator",
+    "merchmaker",
     "microsoft",
     "slack",
     "zoom",
@@ -111,6 +112,7 @@ pub(crate) const CUSTOM_OPTIONAL_CONFIG_KEYS: [&str; 2] =
 
 const MERCATOR_ORIGIN: &str = "https://mercator.sh";
 const MERCATOR_SCOPE: &str = "mercator:tools";
+const MERCHMAKER_ORIGIN: &str = "https://merchmaker.ai";
 
 struct ProviderSpec {
     key: &'static str,
@@ -123,7 +125,7 @@ struct ProviderSpec {
     separator: &'static str,
 }
 
-const PROVIDERS: [ProviderSpec; 10] = [
+const PROVIDERS: [ProviderSpec; 11] = [
     ProviderSpec {
         key: "attio",
         display_name: "Attio",
@@ -208,6 +210,16 @@ const PROVIDERS: [ProviderSpec; 10] = [
         api_hosts: &["mercator.sh"],
         identity_scopes: &[],
         required_scopes: &[MERCATOR_SCOPE],
+        separator: " ",
+    },
+    ProviderSpec {
+        key: "merchmaker",
+        display_name: "Merch Maker",
+        authorization_endpoint: Some("https://merchmaker.ai/oauth/authorize"),
+        token_endpoint: Some("https://merchmaker.ai/oauth/token"),
+        api_hosts: &["merchmaker.ai"],
+        identity_scopes: &[],
+        required_scopes: &[],
         separator: " ",
     },
     ProviderSpec {
@@ -404,6 +416,8 @@ impl Provider {
             ],
             "microsoft" => vec![("prompt".to_owned(), "select_account".to_owned())],
             "mercator" => vec![("resource".to_owned(), format!("{MERCATOR_ORIGIN}/mcp/auth"))],
+            // RFC 8707: the token is bound to the MCP resource.
+            "merchmaker" => vec![("resource".to_owned(), format!("{MERCHMAKER_ORIGIN}/mcp"))],
             CUSTOM_KEY => self
                 .config_str("resource")
                 .map(|resource| vec![("resource".to_owned(), resource)])
@@ -443,6 +457,13 @@ impl Provider {
         } else {
             self.refreshable()
         }
+    }
+
+    /// A public client (PKCE, no client secret): the app needs no secret and
+    /// the exchange sends only `client_id`. Merch Maker registers predefined
+    /// public clients and refuses a secret.
+    pub(crate) fn public_client(&self) -> bool {
+        self.kind == "merchmaker"
     }
 
     pub(crate) fn token_endpoint_auth_method(&self) -> &'static str {
@@ -607,6 +628,7 @@ impl Provider {
             "granola" => self.granola_identity(result, client_id),
             "linear" => self.linear_identity(result).await,
             "mercator" => self.mercator_identity(result).await,
+            "merchmaker" => self.merchmaker_identity(result).await,
             "microsoft" => self.microsoft_identity(result, client_id),
             "slack" => self.slack_identity(result, client_id),
             "zoom" => self.zoom_identity(result).await,
@@ -888,6 +910,56 @@ impl Provider {
         identity.name = nonempty_string(viewer.get("name"))
             .or_else(|| identity.email.clone())
             .or(Some(subject));
+        Ok(identity)
+    }
+
+    /// Merch Maker's token response has no id_token; its userinfo endpoint
+    /// re-reads the live connection. A person may connect several workspaces,
+    /// each its own grant, so the subject is the account and the workspace.
+    async fn merchmaker_identity(
+        &self,
+        result: &CodeExchangeResult,
+    ) -> Result<Identity, ExchangeError> {
+        if result.access_token.is_empty() {
+            return Err(missing_access_token());
+        }
+        let response = http::send(
+            reqwest::Method::GET,
+            &format!("{MERCHMAKER_ORIGIN}/oauth/userinfo"),
+            &[
+                http::bearer(&result.access_token),
+                http::header("User-Agent", "centaur-console"),
+            ],
+            None,
+            None,
+            Duration::from_secs(30),
+            64 * 1024,
+        )
+        .await;
+        let info = self.get_identity_json(response).await?;
+        self.merchmaker_identity_from_userinfo(&info)
+    }
+
+    fn merchmaker_identity_from_userinfo(&self, info: &Value) -> Result<Identity, ExchangeError> {
+        let account = self.require_identity(info.get("sub"))?;
+        let workspace = self.require_identity(info.get("tenant_id"))?;
+        let mut identity = Identity::new(format!("{account}.{workspace}"));
+        identity.email = nonempty_string(info.get("email"));
+        let who = identity.email.clone().unwrap_or(account);
+        identity.name = Some(match nonempty_string(info.get("tenant_name")) {
+            Some(tenant) => format!("{who} · {tenant}"),
+            None => who,
+        });
+        for (label, key) in [
+            ("merchmaker_tenant", "tenant_slug"),
+            ("merchmaker_connection", "connection_kind"),
+        ] {
+            if let Some(value) = nonempty_string(info.get(key)) {
+                identity
+                    .labels
+                    .insert(label.to_owned(), Value::String(value));
+            }
+        }
         Ok(identity)
     }
 
@@ -1681,5 +1753,49 @@ mod tests {
         for cloud in ["logging.googleapis.com", "storage.googleapis.com"] {
             assert!(!hosts.contains(&cloud.to_owned()), "{cloud}");
         }
+    }
+
+    #[test]
+    fn merchmaker_is_a_public_client_bound_to_its_mcp_resource() {
+        let merchmaker = Provider::registry("merchmaker").unwrap();
+        assert!(merchmaker.public_client());
+        assert!(!Provider::registry("google").unwrap().public_client());
+        assert!(merchmaker.refreshable());
+        assert_eq!(merchmaker.api_hosts(), vec!["merchmaker.ai".to_owned()]);
+        assert_eq!(
+            merchmaker.extra_authorization_params(),
+            vec![(
+                "resource".to_owned(),
+                "https://merchmaker.ai/mcp".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn merchmaker_identity_is_the_account_and_workspace() {
+        let merchmaker = Provider::registry("merchmaker").unwrap();
+        let identity = merchmaker
+            .merchmaker_identity_from_userinfo(&json!({
+                "sub": "acct_1",
+                "tenant_id": "ten_9",
+                "tenant_slug": "acme",
+                "tenant_name": "Acme",
+                "email": "a@acme.test",
+                "connection_kind": ""
+            }))
+            .unwrap();
+        assert_eq!(identity.subject, "acct_1.ten_9");
+        assert_eq!(identity.email.as_deref(), Some("a@acme.test"));
+        assert_eq!(identity.name.as_deref(), Some("a@acme.test · Acme"));
+        assert_eq!(
+            identity.labels.get("merchmaker_tenant"),
+            Some(&json!("acme"))
+        );
+        assert!(!identity.labels.contains_key("merchmaker_connection"));
+
+        let error = merchmaker
+            .merchmaker_identity_from_userinfo(&json!({"sub": "acct_1"}))
+            .unwrap_err();
+        assert_eq!(error.reason(), "missing_identity");
     }
 }

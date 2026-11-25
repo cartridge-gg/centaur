@@ -23,7 +23,7 @@ const GITHUB_PROVIDER: &str = "github";
 const EMAIL_LABELS: [&str; 2] = ["email", "google_email"];
 const SLACK_TEAM_LABEL: &str = "slack_team_id";
 const DEFAULT_DIRECT_PRIORITY: i32 = 100;
-const PROVIDERS: [&str; 10] = [
+const PROVIDERS: [&str; 11] = [
     "attio",
     "custom",
     "github",
@@ -31,6 +31,7 @@ const PROVIDERS: [&str; 10] = [
     "granola",
     "linear",
     "mercator",
+    "merchmaker",
     "microsoft",
     "slack",
     "zoom",
