@@ -92,6 +92,11 @@ Each entry in `secrets` declares one credential the tool can request with
   request the placeholder is allowed to appear. At least one is required.
 - `hosts` is the upstream allowlist for this secret. iron-proxy will only
   inject the real value on requests to these hosts.
+- `source = {type = "token_broker", credential_id = "..."}` on an `http`
+  secret resolves the real value from a Console broker credential (for
+  example a `github_app` credential's rotating installation token) instead of
+  the `name`/`secret_ref` value. The sandbox still sees only the placeholder.
+  No other `source` type is accepted.
 
 Use `optional_secrets` for credentials the tool can run without.
 

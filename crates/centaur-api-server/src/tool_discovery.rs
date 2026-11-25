@@ -587,6 +587,10 @@ enum ToolSecret {
 struct HttpSecret {
     name: String,
     secret_ref: String,
+    /// Broker credential id from `source = {type = "token_broker", ...}`; when
+    /// set, iron-proxy resolves the value from the token broker instead of the
+    /// `secret_ref` placeholder.
+    token_broker_credential: Option<String>,
     labels: BTreeMap<String, String>,
     mode: HttpSecretMode,
     hosts: Vec<String>,
@@ -707,6 +711,7 @@ fn parse_secret(
         return Ok(ToolSecret::Http(HttpSecret {
             name: name.clone(),
             secret_ref: name.clone(),
+            token_broker_credential: None,
             labels: labels.clone(),
             mode: HttpSecretMode::Replace,
             hosts: default_hosts.to_vec(),
@@ -753,6 +758,7 @@ fn parse_http_secret(
     default_hosts: &[String],
     labels: &BTreeMap<String, String>,
 ) -> Result<ToolSecret, ToolDiscoveryError> {
+    let token_broker_credential = parse_http_secret_source(table.get("source"), &name)?;
     let hosts =
         optional_string_array(table.get("hosts"))?.unwrap_or_else(|| default_hosts.to_vec());
     if hosts.is_empty() || hosts.iter().any(String::is_empty) {
@@ -778,6 +784,7 @@ fn parse_http_secret(
             Ok(ToolSecret::Http(HttpSecret {
                 name,
                 secret_ref,
+                token_broker_credential,
                 labels: labels.clone(),
                 mode: HttpSecretMode::Replace,
                 hosts,
@@ -813,6 +820,7 @@ fn parse_http_secret(
             Ok(ToolSecret::Http(HttpSecret {
                 name,
                 secret_ref,
+                token_broker_credential,
                 labels: labels.clone(),
                 mode: HttpSecretMode::Inject,
                 hosts,
@@ -829,6 +837,47 @@ fn parse_http_secret(
             "unknown HTTP secret mode {other:?}"
         ))),
     }
+}
+
+/// Parse an HTTP secret's optional `source` table. Only
+/// `{type = "token_broker", credential_id = "..."}` is supported (iron-control
+/// resolves nothing else from a typed source); `credential_namespace` is a
+/// legacy key and is accepted but ignored.
+fn parse_http_secret_source(
+    value: Option<&TomlValue>,
+    name: &str,
+) -> Result<Option<String>, ToolDiscoveryError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let table = value.as_table().ok_or_else(|| {
+        ToolDiscoveryError::Invalid(format!("HTTP secret {name:?} 'source' must be a table"))
+    })?;
+    if let Some(key) = table.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "type" | "credential_id" | "credential_namespace"
+        )
+    }) {
+        return Err(ToolDiscoveryError::Invalid(format!(
+            "HTTP secret {name:?} 'source' has unknown key {key:?}"
+        )));
+    }
+    match optional_str(table, "type") {
+        Some("token_broker") => {}
+        other => {
+            return Err(ToolDiscoveryError::Invalid(format!(
+                "HTTP secret {name:?} 'source.type' must be \"token_broker\", got {:?}",
+                other.unwrap_or_default()
+            )));
+        }
+    }
+    let credential_id = optional_str(table, "credential_id").ok_or_else(|| {
+        ToolDiscoveryError::Invalid(format!(
+            "HTTP secret {name:?} token_broker source requires a non-empty 'credential_id'"
+        ))
+    })?;
+    Ok(Some(credential_id.to_owned()))
 }
 
 fn parse_oauth_token_secret(
@@ -1084,7 +1133,13 @@ fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, To
         let mut extra = BTreeMap::new();
         let mut entry = Secret {
             id: Some(key.name.clone()),
-            source: Some(yaml_map([("placeholder", yaml_string(&key.secret_ref))])?),
+            source: Some(match &key.token_broker_credential {
+                Some(credential_id) => yaml_map([
+                    ("type", yaml_string("token_broker")),
+                    ("credential_id", yaml_string(credential_id)),
+                ])?,
+                None => yaml_map([("placeholder", yaml_string(&key.secret_ref))])?,
+            }),
             rules: host_rules(hosts)?,
             ..Default::default()
         };
@@ -1133,6 +1188,7 @@ fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, To
 struct HttpSecretKey {
     name: String,
     secret_ref: String,
+    token_broker_credential: Option<String>,
     mode: HttpSecretMode,
     replacer: String,
     match_headers: Vec<String>,
@@ -1148,6 +1204,7 @@ impl From<&HttpSecret> for HttpSecretKey {
         Self {
             name: secret.name.clone(),
             secret_ref: secret.secret_ref.clone(),
+            token_broker_credential: secret.token_broker_credential.clone(),
             mode: secret.mode.clone(),
             replacer: secret.replacer.clone(),
             match_headers: secret.match_headers.clone(),
@@ -1698,6 +1755,60 @@ settings = [
             err.to_string().contains("must declare exactly one"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn http_secret_token_broker_source_reaches_proxy_fragment() {
+        let doc: TomlValue = toml::from_str(
+            r#"
+secrets = [
+  {type = "http", name = "GITHUB_TOKEN", source = {type = "token_broker", credential_id = "github-app", credential_namespace = "default"}, replacer = "GITHUB_TOKEN", match_headers = ["Authorization"], hosts = ["api.github.com"]},
+  {type = "http", name = "PLAIN_TOKEN", match_headers = ["Authorization"], hosts = ["api.plain.test"]},
+]
+"#,
+        )
+        .unwrap();
+        let secrets = parse_secret_list(doc.get("secrets"), &[], &BTreeMap::new()).unwrap();
+        let transform = http_secret_transform(&secrets).unwrap().unwrap();
+        let by_id = |id: &str| {
+            transform
+                .config
+                .secrets
+                .iter()
+                .find(|secret| secret.id.as_deref() == Some(id))
+                .and_then(|secret| secret.source.clone())
+                .unwrap()
+        };
+
+        let broker = by_id("GITHUB_TOKEN");
+        assert_eq!(broker["type"].as_str(), Some("token_broker"));
+        assert_eq!(broker["credential_id"].as_str(), Some("github-app"));
+        assert!(broker.get("placeholder").is_none());
+        assert!(broker.get("credential_namespace").is_none());
+        assert_eq!(
+            by_id("PLAIN_TOKEN")["placeholder"].as_str(),
+            Some("PLAIN_TOKEN")
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_http_secret_sources() {
+        for (source, expected) in [
+            (r#"{type = "github_app", app_id_env = "X"}"#, "unknown key"),
+            (r#"{type = "github_app"}"#, "must be \"token_broker\""),
+            (
+                r#"{type = "token_broker"}"#,
+                "requires a non-empty 'credential_id'",
+            ),
+            (r#""github-app""#, "must be a table"),
+        ] {
+            let doc: TomlValue = toml::from_str(&format!(
+                r#"secrets = [{{type = "http", name = "T", source = {source}, match_headers = ["Authorization"], hosts = ["h.test"]}}]"#
+            ))
+            .unwrap();
+            let err = parse_secret_list(doc.get("secrets"), &[], &BTreeMap::new()).unwrap_err();
+            assert!(err.to_string().contains(expected), "{source}: {err}");
+        }
     }
 
     #[test]

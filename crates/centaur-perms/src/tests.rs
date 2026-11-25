@@ -477,6 +477,48 @@ fn translates_http_replace_to_static_input() {
 }
 
 #[test]
+fn translates_http_token_broker_source_to_static_input() {
+    let secrets = vec![
+        tools::parse_secret(
+            &entry(r#"{type = "http", name = "GITHUB_TOKEN", source = {type = "token_broker", credential_id = "github-app", credential_namespace = "default"}, match_headers = ["Authorization"], hosts = ["api.github.com"]}"#),
+            &[],
+        )
+        .unwrap(),
+    ];
+    let out = translate::translate("tool-gh", &secrets, &SourcePolicy::env());
+    let SecretInput::Static(input) = &out.inputs[0] else {
+        panic!("expected static")
+    };
+    assert_eq!(input.source.source_type, "token_broker");
+    assert_eq!(
+        input.source.config,
+        serde_json::json!({ "credential_id": "github-app" })
+    );
+    assert_eq!(
+        input.replace_config.as_ref().unwrap().proxy_value,
+        "GITHUB_TOKEN"
+    );
+}
+
+#[test]
+fn http_source_rejects_anything_but_a_token_broker_reference() {
+    for (source, expected) in [
+        (r#"{type = "github_app", app_id_env = "X"}"#, "unknown key"),
+        (r#"{type = "env"}"#, "must be \"token_broker\""),
+        (r#"{type = "token_broker"}"#, "credential_id"),
+    ] {
+        let err = tools::parse_secret(
+            &entry(&format!(
+                r#"{{type = "http", name = "T", source = {source}, match_headers = ["Authorization"], hosts = ["h.test"]}}"#
+            )),
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains(expected), "{source}: {err:#}");
+    }
+}
+
+#[test]
 fn translates_gcp_auth_defaults_scopes_when_unset() {
     let secrets = vec![
         tools::parse_secret(

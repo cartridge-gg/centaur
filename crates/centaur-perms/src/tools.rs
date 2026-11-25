@@ -91,6 +91,9 @@ pub struct FieldSource {
 pub struct HttpSecret {
     pub name: String,
     pub secret_ref: String,
+    /// Broker credential id from `source = {type = "token_broker", ...}`; when
+    /// set, the value is resolved from the token broker instead of `secret_ref`.
+    pub token_broker_credential: Option<String>,
     pub mode: SecretMode,
     pub hosts: Vec<String>,
     // replace mode
@@ -426,6 +429,7 @@ pub fn parse_secret(entry: &Value, default_hosts: &[String]) -> Result<ParsedSec
         return Ok(ParsedSecret::Http(HttpSecret {
             name: s.to_owned(),
             secret_ref: s.to_owned(),
+            token_broker_credential: None,
             mode: SecretMode::Replace,
             hosts: default_hosts.to_vec(),
             replacer: s.to_owned(),
@@ -490,6 +494,7 @@ fn parse_http(
     secret_ref: &str,
     default_hosts: &[String],
 ) -> Result<HttpSecret> {
+    let token_broker_credential = parse_http_source(table, name)?;
     let mode = match table
         .get("mode")
         .and_then(Value::as_str)
@@ -536,6 +541,7 @@ fn parse_http(
             Ok(HttpSecret {
                 name: name.to_owned(),
                 secret_ref: secret_ref.to_owned(),
+                token_broker_credential: token_broker_credential.clone(),
                 mode,
                 hosts,
                 replacer,
@@ -572,6 +578,7 @@ fn parse_http(
             Ok(HttpSecret {
                 name: name.to_owned(),
                 secret_ref: secret_ref.to_owned(),
+                token_broker_credential: token_broker_credential.clone(),
                 mode,
                 hosts,
                 replacer: String::new(),
@@ -584,6 +591,35 @@ fn parse_http(
             })
         }
     }
+}
+
+/// Parse an HTTP secret's optional `source` table. Mirrors
+/// `centaur_api_server::tool_discovery::parse_http_secret_source`: only
+/// `{type = "token_broker", credential_id = "..."}` is supported, and the
+/// legacy `credential_namespace` key is accepted but ignored.
+fn parse_http_source(table: &toml::Table, name: &str) -> Result<Option<String>> {
+    let Some(raw) = table.get("source") else {
+        return Ok(None);
+    };
+    let source = raw
+        .as_table()
+        .ok_or_else(|| eyre!("HTTP secret {name:?} 'source' must be a table"))?;
+    if let Some(key) = source.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "type" | "credential_id" | "credential_namespace"
+        )
+    }) {
+        bail!("HTTP secret {name:?} 'source' has unknown key {key:?}");
+    }
+    let source_type = opt_str(source, "type").unwrap_or_default();
+    if source_type != "token_broker" {
+        bail!("HTTP secret {name:?} 'source.type' must be \"token_broker\", got {source_type:?}");
+    }
+    let credential_id = opt_str(source, "credential_id").ok_or_else(|| {
+        eyre!("HTTP secret {name:?} token_broker source requires a non-empty 'credential_id'")
+    })?;
+    Ok(Some(credential_id))
 }
 
 fn parse_oauth(table: &toml::Table, name: &str) -> Result<OAuthTokenSecret> {

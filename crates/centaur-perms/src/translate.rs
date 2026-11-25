@@ -183,7 +183,10 @@ fn static_input(
         labels: labels.clone(),
         inject_config,
         replace_config,
-        source: source_from_placeholder(policy, &http.secret_ref, None),
+        source: match &http.token_broker_credential {
+            Some(credential_id) => SecretSource::token_broker(credential_id),
+            None => source_from_placeholder(policy, &http.secret_ref, None),
+        },
         rules: rules_from_hosts(&http.hosts),
     }
 }
