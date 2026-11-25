@@ -259,20 +259,24 @@ interface OutgoingMessage {
   bcc?: string;
   html?: string;
   attachments?: AttachmentInput[];
-  /** Original `Message-ID`, threaded into `In-Reply-To` and `References`. */
+  /** Send-as alias for the `From` header; Gmail uses the account's own address when unset. */
+  from?: string;
+  /** Original `Message-ID`, threaded into `In-Reply-To`. */
   inReplyTo?: string;
+  /** `References` header: the original's `References` followed by its `Message-ID`. */
+  references?: string;
 }
 
 /** RFC 2822 (MIME) text for a message; the caller base64urls it. */
 async function buildMessage(ctx: Ctx, input: OutgoingMessage, what: string): Promise<string> {
-  const head: string[] = [`To: ${addressList(ctx, input.to)}`];
+  const head: string[] = [];
+  if (input.from) head.push(`From: ${addressList(ctx, input.from)}`);
+  head.push(`To: ${addressList(ctx, input.to)}`);
   if (input.cc) head.push(`Cc: ${addressList(ctx, input.cc)}`);
   if (input.bcc) head.push(`Bcc: ${addressList(ctx, input.bcc)}`);
   head.push(`Subject: ${headerValue(ctx, input.subject)}`);
-  if (input.inReplyTo) {
-    head.push(`In-Reply-To: ${input.inReplyTo}`);
-    head.push(`References: ${input.inReplyTo}`);
-  }
+  if (input.inReplyTo) head.push(`In-Reply-To: ${input.inReplyTo}`);
+  if (input.references) head.push(`References: ${input.references}`);
   head.push("MIME-Version: 1.0");
 
   let content: string;
@@ -320,12 +324,57 @@ async function buildMessage(ctx: Ctx, input: OutgoingMessage, what: string): Pro
   return `${[...head, content].join("\r\n")}\r\n`;
 }
 
-/** Address list without display names, for replies: `Ana <a@b.com>` becomes `a@b.com`. */
+/** One address without its display name: `"Doe, Ana" <a@b.com>` becomes `a@b.com`. */
 function addressOf(value: string): string {
   const open = value.lastIndexOf("<");
   const close = value.lastIndexOf(">");
   if (open !== -1 && close > open) return value.slice(open + 1, close).trim();
   return value.trim();
+}
+
+/** Every address in an RFC 5322 list, without display names, joined with `, `. */
+function addressesOf(value: string): string {
+  return splitAddresses(value).map(addressOf).filter(Boolean).join(", ");
+}
+
+/** One header of a Gmail message, matched without case; `""` when absent. */
+function headerOf(message: GmailMessage, name: string): string {
+  const wanted = name.toLowerCase();
+  const header = ((message.payload?.headers ?? []) as Header[]).find((h) => h.name.toLowerCase() === wanted);
+  return (header?.value ?? "").replace(/[\r\n]+/g, " ").trim();
+}
+
+/** A sent message, and with a send-as alias the `From` header Gmail actually used. */
+export interface SentMessage {
+  message: GmailMessage;
+  /**
+   * With `from`: the sent message's `From` header. Gmail sends from the account's own address,
+   * without an error, when the alias is not a verified send-as address of the account.
+   */
+  from?: string;
+  /** With `from`: why reading the sent message's `From` failed. The message was still sent. */
+  from_error?: string;
+}
+
+/** POST a raw message and, with a send-as alias, report the `From` Gmail used. */
+async function sendRaw(
+  ctx: Ctx,
+  body: { raw: string; threadId?: string },
+  from: string | undefined,
+): Promise<SentMessage> {
+  const message: GmailMessage = await gmail(ctx, "/messages", { body });
+  if (!from || !message.id) return { message };
+  // The message is already sent: a failed lookup must not throw, or a caller that retries
+  // sends it twice.
+  try {
+    const sent: GmailMessage = await gmail(
+      ctx,
+      `/messages/${seg(message.id)}?${["format=metadata", metadataQuery(["From"])].join("&")}`,
+    );
+    return { message, from: headerOf(sent, "From") };
+  } catch (error) {
+    return { message, from_error: String((error as Error)?.message ?? error) };
+  }
 }
 
 function decodeText(ctx: Ctx, data: string): string {
@@ -472,7 +521,10 @@ export async function list_labels(args: {}, ctx: Ctx): Promise<{ labels: Label[]
  * lists (`Ana <a@b.com>, b@c.com`); subject and display names are RFC 2047 encoded when not
  * ASCII. Attachments are `{ path }` entries naming files in the sandbox: the runtime reads each
  * one into the MIME message (Gmail takes the bytes inside the raw message), refusing when they
- * total more than Gmail's 25 MB limit. Returns the sent message (id, threadId, labelIds).
+ * total more than Gmail's 25 MB limit. `from` sends from a send-as alias (for example a group
+ * address); it must be a verified send-as address of the account, or Gmail silently sends from the
+ * account's own address, so the result then carries `from`, the `From` header Gmail used. Returns
+ * the sent message (id, threadId, labelIds).
  */
 export async function send_message(
   args: {
@@ -483,57 +535,63 @@ export async function send_message(
     bcc?: string;
     html?: string;
     attachments?: AttachmentInput[];
+    from?: string;
   },
   ctx: Ctx,
-): Promise<{ message: GmailMessage }> {
+): Promise<SentMessage> {
   const raw = b64url(ctx, await buildMessage(ctx, args, "gmail.send_message"));
-  return { message: await gmail(ctx, "/messages", { body: { raw } }) };
+  return sendRaw(ctx, { raw }, args.from);
 }
 
 /**
- * Reply in the original message's thread: recipient is the original `From`, the subject gets a
- * `Re: ` prefix unless it has one, and `In-Reply-To`/`References` carry the original `Message-ID`.
- * Same `html`/`attachments` support as `send_message`: each attachment is a `path` in the sandbox.
+ * Reply in the original message's thread. The reply goes to the original's `Reply-To`
+ * addresses, or to its `From` when it has none; `to` replaces them, for mail from a group or
+ * mailing list whose `From` or `Reply-To` is the list itself. The subject gets a `Re: ` prefix
+ * unless it has one; `In-Reply-To` carries the original `Message-ID` and `References` appends it
+ * to the original's `References`, so the recipient's mail app threads the reply too. `from`
+ * replies from a send-as alias, as in `send_message`. Same `html`/`attachments` support as
+ * `send_message`: each attachment is a `path` in the sandbox.
  */
 export async function reply(
   args: {
     message_id: string;
     body: string;
+    to?: string;
+    from?: string;
     html?: string;
     attachments?: AttachmentInput[];
   },
   ctx: Ctx,
-): Promise<{ message: GmailMessage }> {
-  const original = await gmail(
+): Promise<SentMessage> {
+  const original: GmailMessage = await gmail(
     ctx,
-    `/messages/${seg(args.message_id)}?${["format=metadata", metadataQuery(["From", "Subject", "Message-ID"])].join("&")}`,
+    `/messages/${seg(args.message_id)}?${["format=metadata", metadataQuery(["From", "Reply-To", "Subject", "Message-ID", "References"])].join("&")}`,
   );
-  const fields: Record<string, string> = {};
-  for (const header of (original.payload?.headers ?? []) as Header[]) fields[header.name] = header.value;
-  const subject = fields.Subject ?? "(no subject)";
-  const messageId = (fields["Message-ID"] || args.message_id).replace(/[\r\n]+/g, " ").trim();
-  const to = addressOf(fields.From ?? "");
-  if (!to) throw new Error(`message ${args.message_id} has no From header to reply to`);
+  const subject = headerOf(original, "Subject") || "(no subject)";
+  const to = args.to?.trim() || addressesOf(headerOf(original, "Reply-To") || headerOf(original, "From"));
+  if (!to) throw new Error(`message ${args.message_id} has no Reply-To or From address to reply to`);
+  // Threading headers take the RFC 822 Message-ID, never the Gmail id: a recipient's mail app
+  // knows only the former.
+  const messageId = headerOf(original, "Message-ID");
+  const references = [headerOf(original, "References"), messageId].filter(Boolean).join(" ");
   const raw = b64url(
     ctx,
     await buildMessage(
       ctx,
       {
         to,
+        from: args.from,
         subject: subject.toLowerCase().startsWith("re:") ? subject : `Re: ${subject}`,
         body: args.body,
         html: args.html,
         attachments: args.attachments,
-        inReplyTo: messageId,
+        inReplyTo: messageId || undefined,
+        references: messageId ? references : undefined,
       },
       "gmail.reply",
     ),
   );
-  return {
-    message: await gmail(ctx, "/messages", {
-      body: { raw, threadId: original.threadId },
-    }),
-  };
+  return sendRaw(ctx, { raw, threadId: original.threadId }, args.from);
 }
 
 /** Archive messages by removing the INBOX label; they stay in All Mail. One request per ID. */
