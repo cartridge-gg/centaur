@@ -515,6 +515,70 @@ export async function add_reaction(
   }
 }
 
+/** Slack's error code from a `slackResult` failure, or `undefined` for any other error. */
+function slackErrorCode(error: unknown, method: string): string | undefined {
+  const prefix = `Slack ${method} failed: `;
+  const message = String((error as Error)?.message ?? "");
+  return message.startsWith(prefix) ? message.slice(prefix.length) : undefined;
+}
+
+/**
+ * Write: delete a message this token posted (`chat.delete`, scope `chat:write`). Slack decides
+ * what the token may delete: a bot token deletes only the bot's own messages, a user token only
+ * the user's. No message at `ts` is a successful no-op (`deleted: false`). A message that shares
+ * a file keeps the file; delete it with `delete_file`. Cannot be undone. Direct access only.
+ */
+export async function delete_message(
+  args: { channel: string; ts: string },
+  ctx: Ctx,
+): Promise<{ channel: string; ts: string; deleted: boolean }> {
+  if (access(ctx) !== "direct") {
+    throw new Error("delete_message needs direct Slack access; the Centaur API does not delete messages");
+  }
+  const channel = args.channel.trim();
+  const ts = args.ts.trim();
+  if (!/^[CDG][A-Z0-9]+$/.test(channel)) throw new Error(`channel must be a Slack conversation ID like C1234567890, not ${JSON.stringify(args.channel)}`);
+  if (!/^\d+\.\d+$/.test(ts)) throw new Error(`ts must be a Slack message timestamp like 1234567890.123456, not ${JSON.stringify(args.ts)}`);
+  try {
+    await slackPost(ctx, "chat.delete", { channel, ts });
+    return { channel, ts, deleted: true };
+  } catch (error) {
+    const code = slackErrorCode(error, "chat.delete");
+    if (code === "message_not_found") return { channel, ts, deleted: false };
+    if (code === "cant_delete_message") {
+      throw new Error("Slack chat.delete failed: cant_delete_message (this token may not delete this message; a bot token deletes only the bot's own messages)");
+    }
+    throw error;
+  }
+}
+
+/**
+ * Write: delete a file from the workspace (`files.delete`, scope `files:write`). Slack decides
+ * what the token may delete. A file that is already deleted, or that the token cannot see, is a
+ * successful no-op (`deleted: false`). Cannot be undone. Direct access only.
+ */
+export async function delete_file(
+  args: { file: string },
+  ctx: Ctx,
+): Promise<{ file: string; deleted: boolean }> {
+  if (access(ctx) !== "direct") {
+    throw new Error("delete_file needs direct Slack access; the Centaur API does not delete files");
+  }
+  const file = args.file.trim();
+  if (!/^F[A-Z0-9]+$/.test(file)) throw new Error(`file must be a Slack file ID like F1234567890, not ${JSON.stringify(args.file)}`);
+  try {
+    await slackPost(ctx, "files.delete", { file });
+    return { file, deleted: true };
+  } catch (error) {
+    const code = slackErrorCode(error, "files.delete");
+    if (code === "file_not_found" || code === "file_deleted") return { file, deleted: false };
+    if (code === "cant_delete_file") {
+      throw new Error("Slack files.delete failed: cant_delete_file (this token may not delete this file)");
+    }
+    throw error;
+  }
+}
+
 /**
  * Write: upload a file from the sandbox (`path`, for example one saved by `download_file` or
  * `files.write`) and share it into `channel`, optionally in a thread. `filename` defaults to the
