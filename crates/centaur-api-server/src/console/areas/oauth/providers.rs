@@ -159,7 +159,23 @@ const PROVIDERS: [ProviderSpec; 10] = [
         display_name: "Google",
         authorization_endpoint: Some("https://accounts.google.com/o/oauth2/v2/auth"),
         token_endpoint: Some("https://oauth2.googleapis.com/token"),
-        api_hosts: &["*.googleapis.com"],
+        // The Workspace hosts the gsuite tool calls, plus Drive. Not
+        // `*.googleapis.com`: that also matches the Google Cloud APIs, which
+        // would then get a Workspace-scoped token (403
+        // ACCESS_TOKEN_SCOPE_INSUFFICIENT) and could displace a principal's
+        // gcp_auth credential in conflict resolution.
+        api_hosts: &[
+            "gmail.googleapis.com",
+            "calendar.googleapis.com",
+            "people.googleapis.com",
+            "www.googleapis.com",
+            "drive.googleapis.com",
+            "docs.googleapis.com",
+            "sheets.googleapis.com",
+            "slides.googleapis.com",
+            "analyticsdata.googleapis.com",
+            "docs.google.com",
+        ],
         identity_scopes: &["openid", "https://www.googleapis.com/auth/userinfo.email"],
         required_scopes: &[],
         separator: " ",
@@ -1654,5 +1670,16 @@ mod tests {
             mercator.validate_result(&result).unwrap_err().reason(),
             "missing_scope"
         );
+    }
+
+    #[test]
+    fn google_tokens_go_only_to_workspace_hosts() {
+        let hosts = Provider::registry("google").unwrap().api_hosts();
+        assert!(hosts.contains(&"gmail.googleapis.com".to_owned()));
+        assert!(hosts.contains(&"www.googleapis.com".to_owned()));
+        assert!(hosts.iter().all(|host| !host.contains('*')), "{hosts:?}");
+        for cloud in ["logging.googleapis.com", "storage.googleapis.com"] {
+            assert!(!hosts.contains(&cloud.to_owned()), "{cloud}");
+        }
     }
 }
