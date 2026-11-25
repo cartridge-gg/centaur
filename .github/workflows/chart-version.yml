@@ -28,7 +28,7 @@ env:
 
 jobs:
   bump:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Require bump token

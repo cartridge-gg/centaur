@@ -9,7 +9,7 @@ on:
 jobs:
   console_changes:
     name: Detect Console CI changes
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     outputs:
       relevant: ${{ steps.filter.outputs.relevant }}
     steps:
@@ -40,7 +40,7 @@ jobs:
 
   web:
     name: Console web (typecheck, lint, test, build)
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
     defaults:
@@ -78,7 +78,7 @@ jobs:
 
   console-ci-success:
     name: Console CI success
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     if: always()
     needs:
       - console_changes
